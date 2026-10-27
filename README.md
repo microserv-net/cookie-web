@@ -19,9 +19,12 @@ cookie-web is a single Rust binary: an HTTP API, a built-in web GUI and a CLI. I
 - **Severity triage** — picks `quick`, `standard` or `deep` from the request (or you force it with `!deep …`).
 - **Tool belt** — `web_search`, `news_search`, `fetch_page` (HTML → clean Markdown, PDFs), `extract_links`,
   `crawl_site` (robots-aware), `wikipedia`.
-- **Search backends** — SearXNG, Brave, Tavily, Ollama web search, plus keyless DuckDuckGo & Mojeek;
+- **Search backends** — SearXNG, Brave, Tavily, Ollama web search, plus keyless DuckDuckGo, Bing & Mojeek;
   fallback or rank-fusion mode.
-- **Real citations** — every claim links to a numbered source; hallucinated citation numbers are removed.
+- **Real citations** — every claim links to a numbered source; citations and links the research never saw are removed.
+- **Built not to fail** — off-topic or empty searches are rephrased, failing search engines rest on a cooldown,
+  dead pages are read from the Wayback Machine, Ollama hiccups are retried, and if the model can't write at all
+  you still get a cited digest of what was found. Every bump on the way is reported in `warnings`.
 - **Small-model friendly** — seeded searches, budgets, query-focused excerpts, deterministic fallbacks,
   JSON tool protocol for models without native tool calling.
 - **Integrates anywhere** — blocking JSON, Server-Sent Events, or async jobs; reports saved as `.md` files.
@@ -76,11 +79,14 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 | `SEARXNG_URL` | — | e.g. `http://localhost:8888` (recommended) |
 | `BRAVE_API_KEY` / `TAVILY_API_KEY` / `OLLAMA_API_KEY` | — | optional search APIs |
 | `COOKIE_SEARCH_MODE` | `fallback` | or `fusion` (query all backends, merge rankings) |
-| `COOKIE_DISABLE_DUCKDUCKGO` | `false` | drop the keyless scrapers |
+| `COOKIE_DISABLE_SCRAPERS` | `false` | drop the keyless scrapers (DuckDuckGo, Bing, Mojeek) |
 | `COOKIE_REPORTS_DIR` | `reports` | where `.md` reports are saved |
 | `COOKIE_API_KEY` | — | require `Authorization: Bearer …` on the API |
 | `COOKIE_MAX_CONCURRENT` | `1` | parallel research jobs (others queue) |
 | `COOKIE_ALLOW_PRIVATE_URLS` | `false` | allow reading LAN/localhost pages |
+| `COOKIE_JOB_TIMEOUT_SECS` | `1800` | hard limit per research job (it fails cleanly instead of hanging) |
+| `COOKIE_TIME_SCALE` | `1.0` | scales the per-depth research time budgets (e.g. `2` on a slow CPU, `0.5` on a GPU) |
+| `COOKIE_ARCHIVE_FALLBACK` | `true` | read dead/blocked pages from the Wayback Machine |
 
 ### Model & hardware
 
@@ -98,11 +104,13 @@ Full reference with examples: **[docs/API.md](docs/API.md)**. In short:
 |----------|---|
 | `POST /api/research` | blocking → `ResearchResult` JSON (or `?format=markdown`) |
 | `POST /api/research/stream` | Server-Sent Events: triage, tool calls, sources, tokens, done |
-| `POST /api/jobs` → `GET /api/jobs/{id}` (+`/events`) | async jobs |
+| `POST /api/jobs` → `GET /api/jobs/{id}` (+`/events?from=n`) · `DELETE /api/jobs/{id}` | async jobs, resumable streams, cancel |
 | `GET /api/reports[/{id}[/markdown]]` | saved reports |
 | `GET /api/health` · `/api/manifest` · `/api/tools` | introspection |
 
-How it works inside: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+Send an `Idempotency-Key` header and a retried request reattaches to the same job instead of starting another.
+
+How it works inside: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (see *Reliability* for every failure mode handled).
 
 ## Development
 

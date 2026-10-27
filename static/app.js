@@ -12,10 +12,13 @@
     activityCount: $("#activity-count"), log: $("#log"), answer: $("#answer"), toolbar: $("#toolbar"),
     stats: $("#stats"), raw: $("#raw-link"), history: $("#history"), status: $("#status"), statusText: $("#status-text"),
     settings: $("#settings"), apiKey: $("#api-key"), model: $("#model"), save: $("#save"), models: $("#models"),
+    notice: $("#notice"), noticeTitle: $("#notice-title"), noticeList: $("#notice-list"),
   };
 
   let current = null; // { markdown, id }
   let controller = null;
+  let running = null; // { jobId } of the job this page is following
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ---------------------------------------------------------------- helpers
   function headers(extra = {}) {
@@ -82,9 +85,28 @@
   }
 
   function setBusy(b) {
-    els.go.disabled = b;
-    els.go.textContent = b ? "Working…" : "Search";
+    els.go.textContent = b ? "Stop" : "Search";
+    els.go.classList.toggle("stop", b);
     els.activity.classList.toggle("running", b);
+  }
+
+  // Cancel the job this page is following (frees the server's slot for the next request).
+  function cancelRunning() {
+    const job = running && running.jobId;
+    running = null;
+    if (controller) controller.abort();
+    if (job) fetch(`/api/jobs/${encodeURIComponent(job)}`, { method: "DELETE", headers: headers() }).catch(() => {});
+  }
+
+  function showNotice(warnings, degraded) {
+    if (!warnings || !warnings.length) { els.notice.hidden = true; return; }
+    els.notice.hidden = false;
+    els.notice.classList.toggle("degraded", !!degraded);
+    els.noticeTitle.textContent = degraded
+      ? "The model could not write this answer — showing what the research found"
+      : `${warnings.length} note${warnings.length > 1 ? "s" : ""} about this answer`;
+    els.noticeList.innerHTML = warnings.map((w) => `<li>${esc(w)}</li>`).join("");
+    els.notice.open = !!degraded;
   }
 
   function resetRun(query) {
@@ -95,6 +117,7 @@
     els.log.innerHTML = "";
     els.answer.innerHTML = "";
     els.toolbar.hidden = true;
+    els.notice.hidden = true;
     els.activity.open = true;
     els.activity.hidden = false;
     els.activityTitle.textContent = "Working";
@@ -115,13 +138,14 @@
       while ((i = buf.indexOf("\n\n")) >= 0) {
         const chunk = buf.slice(0, i);
         buf = buf.slice(i + 2);
-        let event = "message", data = "";
+        let event = "message", data = "", id = null;
         for (const line of chunk.split("\n")) {
           if (line.startsWith("event:")) event = line.slice(6).trim();
           else if (line.startsWith("data:")) data += line.slice(5).trimStart();
+          else if (line.startsWith("id:")) id = parseInt(line.slice(3).trim(), 10);
         }
         if (data) {
-          try { yield { event, data: JSON.parse(data) }; } catch {}
+          try { yield { event, id, data: JSON.parse(data) }; } catch {}
         }
       }
     }
@@ -131,8 +155,9 @@
   async function research(query) {
     query = query.trim();
     if (!query) return;
-    if (controller) controller.abort();
-    controller = new AbortController();
+    cancelRunning();
+    const ctl = (controller = new AbortController());
+    const me = (running = { jobId: null });
     resetRun(query);
     setBusy(true);
     const depth = document.querySelector('input[name="depth"]:checked').value;
@@ -142,60 +167,103 @@
 
     let md = "";
     let pending = false;
+    let lastId = 0;
+    let finished = false;
     const tools = new Map();
-    const flush = () => { pending = false; renderMarkdown(md, true); };
+    const flush = () => { pending = false; if (!finished) renderMarkdown(md, true); };
+
+    const handle = (event, data) => {
+      switch (event) {
+        case "started": me.jobId = data.job_id; break;
+        case "triage": showTriage(data); break;
+        case "status": logLine("status", esc(data.message)); break;
+        case "warning": logLine("warn", "⚠ " + esc(data.message)); break;
+        case "tool_call": tools.set(data.call_id, logLine("tool", `<b>${esc(data.tool)}</b> ${argText(data.args)}`)); break;
+        case "tool_result": {
+          const li = tools.get(data.call_id);
+          if (li) {
+            li.classList.add(data.ok ? "ok" : "fail");
+            li.innerHTML += ` <span class="muted">— ${esc(data.summary)}</span>`;
+          }
+          break;
+        }
+        case "reset":
+          md = "";
+          renderMarkdown("", true);
+          logLine("warn", "↺ " + esc(data.reason));
+          break;
+        case "token":
+          md += data.text;
+          if (!pending) { pending = true; requestAnimationFrame(flush); }
+          break;
+        case "done": {
+          finished = true;
+          const r = data.result;
+          current = { markdown: r.markdown, id: r.id };
+          renderMarkdown(r.markdown);
+          showStats(r);
+          showNotice(r.warnings, r.degraded);
+          els.toolbar.hidden = false;
+          els.raw.hidden = !r.report_path;
+          els.raw.href = `/api/reports/${encodeURIComponent(r.id)}/markdown`;
+          els.activityTitle.textContent = r.degraded ? "Done (degraded)" : "Done";
+          els.activity.open = false;
+          loadHistory();
+          break;
+        }
+        case "error":
+          finished = true;
+          if (data.message === "cancelled") {
+            els.activityTitle.textContent = "Stopped";
+            if (!md) els.answer.innerHTML = '<p class="muted">Stopped.</p>';
+            break;
+          }
+          logLine("error", "Error: " + esc(data.message));
+          els.activityTitle.textContent = "Failed";
+          if (!md) els.answer.innerHTML = `<p class="muted">Something went wrong: ${esc(data.message)}</p>`;
+          break;
+      }
+    };
+
+    const consume = async (resp) => {
+      for await (const { event, id, data } of sse(resp)) {
+        if (id) lastId = id;
+        handle(event, data);
+      }
+    };
 
     try {
       const resp = await api("/api/research/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: controller.signal,
+        signal: ctl.signal,
       });
-      for await (const { event, data } of sse(resp)) {
-        switch (event) {
-          case "triage": showTriage(data); break;
-          case "status": logLine("status", esc(data.message)); break;
-          case "tool_call": tools.set(data.call_id, logLine("tool", `<b>${esc(data.tool)}</b> ${argText(data.args)}`)); break;
-          case "tool_result": {
-            const li = tools.get(data.call_id);
-            if (li) {
-              li.classList.add(data.ok ? "ok" : "fail");
-              li.innerHTML += ` <span class="muted">— ${esc(data.summary)}</span>`;
-            }
-            break;
-          }
-          case "token":
-            md += data.text;
-            if (!pending) { pending = true; requestAnimationFrame(flush); }
-            break;
-          case "done": {
-            const r = data.result;
-            current = { markdown: r.markdown, id: r.id };
-            renderMarkdown(r.markdown);
-            showStats(r);
-            els.toolbar.hidden = false;
-            els.raw.hidden = !r.report_path;
-            els.raw.href = `/api/reports/${encodeURIComponent(r.id)}/markdown`;
-            els.activityTitle.textContent = "Done";
-            els.activity.open = false;
-            loadHistory();
-            break;
-          }
-          case "error":
-            logLine("error", "Error: " + esc(data.message));
-            els.activityTitle.textContent = "Failed";
-            if (!md) els.answer.innerHTML = `<p class="muted">Something went wrong: ${esc(data.message)}</p>`;
-            break;
+      me.jobId = resp.headers.get("x-cookie-job") || me.jobId;
+      try { await consume(resp); } catch (e) { if (e.name === "AbortError") throw e; }
+      // The connection dropped before the job finished (Wi-Fi blip, proxy timeout, laptop sleep):
+      // the job is still running on the server, so pick the stream up where it left off.
+      for (let attempt = 0; !finished && me.jobId && attempt < 6; attempt++) {
+        logLine("status", "Connection lost — reconnecting…");
+        await sleep(Math.min(1000 * 2 ** attempt, 8000));
+        if (ctl.signal.aborted) return;
+        try {
+          const r = await api(`/api/jobs/${encodeURIComponent(me.jobId)}/events?from=${lastId}`, { signal: ctl.signal });
+          await consume(r);
+        } catch (e) {
+          if (e.name === "AbortError") throw e;
+          if (/not found/i.test(e.message)) break; // the server restarted and forgot the job
         }
       }
+      if (!finished) handle("error", { message: "lost the connection to the server" });
     } catch (e) {
       if (e.name !== "AbortError") {
         logLine("error", "Error: " + esc(e.message));
         els.activityTitle.textContent = "Failed";
       }
     } finally {
-      setBusy(false);
+      if (running === me) running = null;
+      if (controller === ctl) setBusy(false);
     }
   }
 
@@ -208,6 +276,7 @@
       current = { markdown: r.markdown, id: r.id };
       renderMarkdown(r.markdown);
       showStats(r);
+      showNotice(r.warnings, r.degraded);
       els.toolbar.hidden = false;
       els.raw.hidden = false;
       els.raw.href = `/api/reports/${encodeURIComponent(r.id)}/markdown`;
@@ -230,13 +299,18 @@
     }
   }
 
+  function searchSummary(h) {
+    const list = h.search_health || (h.search_backends || []).map((name) => ({ name }));
+    return list.map((b) => (b.cooldown_secs ? `${b.name} (resting)` : b.name)).join(", ");
+  }
+
   async function checkHealth() {
     try {
       const h = await (await fetch("/api/health")).json();
       els.status.className = "pill " + (h.status === "ok" ? "ok" : "degraded");
       const m = h.model || {};
       els.statusText.textContent = h.status === "ok"
-        ? `${m.model}${m.supports_tools ? "" : " (no native tools)"} · ${h.search_backends.join(", ")}`
+        ? `${m.model}${m.supports_tools ? "" : " (no native tools)"} · ${searchSummary(h)}`
         : (m.error || "degraded");
       els.models.innerHTML = (m.installed || []).map((x) => `<option value="${esc(x)}">`).join("");
     } catch {
@@ -246,7 +320,16 @@
   }
 
   // ------------------------------------------------------------- wiring
-  els.form.addEventListener("submit", (e) => { e.preventDefault(); research(els.q.value); });
+  els.form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (running) { // the button reads "Stop" while working
+      cancelRunning();
+      setBusy(false);
+      els.activityTitle.textContent = "Stopped";
+      return;
+    }
+    research(els.q.value);
+  });
   els.q.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); research(els.q.value); }
   });
@@ -257,7 +340,8 @@
     if (a) { e.preventDefault(); openReport(a.dataset.id); }
   });
   $("#new-btn").addEventListener("click", () => {
-    if (controller) controller.abort();
+    cancelRunning();
+    setBusy(false);
     els.run.hidden = true; els.welcome.hidden = false; els.q.value = ""; els.q.focus();
     document.body.classList.remove("menu-open");
   });

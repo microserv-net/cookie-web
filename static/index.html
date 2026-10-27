@@ -8,8 +8,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
   <link rel="stylesheet" href="/style.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" defer></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js" defer></script>
+  <script src="/vendor/marked.min.js" defer></script>
+  <script src="/vendor/purify.min.js" defer></script>
 </head>
 <body>
   <aside id="sidebar">
@@ -54,6 +54,10 @@
         <ol id="log"></ol>
       </details>
       <article id="answer" class="md"></article>
+      <details id="notice" hidden>
+        <summary id="notice-title"></summary>
+        <ul id="notice-list"></ul>
+      </details>
       <div id="toolbar" hidden>
         <button id="copy-btn" class="ghost">Copy Markdown</button>
         <button id="dl-btn" class="ghost">Download .md</button>
