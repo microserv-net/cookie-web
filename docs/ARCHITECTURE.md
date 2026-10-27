@@ -140,9 +140,12 @@ silent failure. Each layer has its own fallback:
 | results are empty or off-topic | the request is rephrased and searched again (see *Rescue* above) |
 | a page times out, 429/5xx | retried once after a short pause (honours `Retry-After`) |
 | a page answers 401/403 | retried once with plain browser headers |
+| a page is a bot wall, consent screen or empty JS shell | treated as a failed read, not as content (then the archive is tried) |
+| a Reddit thread (JS-only) | read from old.reddit.com, which serves plain HTML |
 | a page is dead or blocked | the newest Wayback Machine copy is read instead (`COOKIE_ARCHIVE_FALLBACK`) |
 | a page read fails | the page budget is refunded, so the next result gets read |
 | a page in a legacy encoding | decoded from the HTTP or `<meta>` charset |
+| Wikipedia rate-limits | retried once after a pause |
 | a tool hangs or panics | each tool call has a time limit and panics are caught; the model sees an error and moves on |
 | Ollama restarting, loading or busy (connect errors, 5xx, 429) | retried after 1, 3 and 6 s |
 | a malformed native tool call | no retry; the agent switches to the JSON protocol |

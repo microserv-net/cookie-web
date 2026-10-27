@@ -320,6 +320,14 @@ pub fn search_keywords(query: &str) -> String {
         };
         q = q[lead.len()..].trim_start_matches([' ', ',', ':']).to_string();
     }
+    // "write a detailed report on X" → "X": the format words only confuse search engines.
+    static FORMAT_LEAD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)^(?:(?:write|give me|make|create|prepare|do|produce|i need|i want)\s+)?(?:(?:an?|the|me an?)\s+)?(?:(?:detailed|in-depth|in depth|comprehensive|thorough|full|deep|quick|short|brief)\s+)?(?:report|analysis|overview|deep dive|deep-dive|write-up|writeup|summary|breakdown|explanation|guide)\s+(?:on|of|about|into|for)\s+",
+        )
+        .unwrap()
+    });
+    let q = FORMAT_LEAD.replace(&q, "").into_owned();
     let q = q.replace("hint:", " ").replace("Hint:", " ").replace("HINT:", " ");
     let q: String = q.split_whitespace().collect::<Vec<_>>().join(" ");
     let q = q.trim_end_matches(['?', '.', '!', ' ']).replace(" ,", ",");
@@ -508,6 +516,9 @@ mod tests {
         assert_eq!(search_keywords("Please look up the WireGuard docs?"), "the WireGuard docs");
         assert_eq!(search_keywords("who is Ada Lovelace?"), "who is Ada Lovelace");
         assert_eq!(search_keywords("please?"), "please");
+        assert_eq!(search_keywords("write a detailed report on rust async runtimes"), "rust async runtimes");
+        assert_eq!(search_keywords("deep dive into sodium-ion batteries"), "sodium-ion batteries");
+        assert_eq!(search_keywords("report"), "report");
     }
 
     #[test]

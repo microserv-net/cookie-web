@@ -223,7 +223,14 @@ impl Web {
         if let Some(p) = self.pages.get(&key) {
             return Ok(p);
         }
-        let live = self.read_page(raw).await;
+        let live = match readable_mirror(raw) {
+            // Some sites serve a JavaScript shell; their lightweight mirror has the same content as HTML.
+            Some(m) => match self.read_page(&m).await {
+                Ok(p) => Ok(p),
+                Err(_) => self.read_page(raw).await,
+            },
+            None => self.read_page(raw).await,
+        };
         let page = match live {
             Ok(p) => p,
             Err(e) if self.cfg.archive_fallback && worth_archive(&e) => match self.archived(raw).await {
@@ -245,6 +252,9 @@ impl Web {
         let page = bytes_to_page(final_url, ctype, body).await?;
         if page.markdown.trim().is_empty() {
             bail!("no readable content at {raw} (the page may need JavaScript)");
+        }
+        if let Some(why) = blocked_page(&page) {
+            bail!("{raw} returned {why} instead of its content");
         }
         Ok(page)
     }
@@ -281,6 +291,49 @@ impl Web {
         page.title = format!("{} (archived {date})", if page.title.is_empty() { raw } else { &page.title });
         Some(page)
     }
+}
+
+/// Recognise bot walls, consent screens and empty shells that would otherwise count as a "read" page.
+pub fn blocked_page(page: &Page) -> Option<&'static str> {
+    let words = page.markdown.split_whitespace().count();
+    if words >= 300 {
+        return None;
+    }
+    let head = format!("{} {}", page.title, page.markdown.chars().take(800).collect::<String>()).to_lowercase();
+    const WALLS: &[&str] = &[
+        "just a moment",
+        "attention required",
+        "access denied",
+        "verify you are human",
+        "are you a robot",
+        "are you human",
+        "checking your browser",
+        "enable javascript and cookies",
+        "please enable javascript",
+        "request blocked",
+        "unusual traffic",
+        "captcha",
+        "403 forbidden",
+        "before you continue",
+    ];
+    if WALLS.iter().any(|w| head.contains(w)) {
+        return Some("a bot check or consent page");
+    }
+    if words < 25 && page.content_type.contains("html") {
+        return Some("an almost empty page");
+    }
+    None
+}
+
+/// A server-rendered mirror of a page whose normal version needs JavaScript (Reddit → old.reddit.com).
+pub fn readable_mirror(raw: &str) -> Option<String> {
+    let mut u = url::Url::parse(raw).ok()?;
+    let host = u.host_str()?.to_ascii_lowercase();
+    if matches!(host.as_str(), "reddit.com" | "www.reddit.com" | "new.reddit.com" | "np.reddit.com") {
+        u.set_host(Some("old.reddit.com")).ok()?;
+        return Some(u.to_string());
+    }
+    None
 }
 
 /// A browser-like User-Agent for the second attempt after a 401/403.
@@ -374,6 +427,36 @@ mod tests {
         assert!(host_looks_private("192.168.1.5"));
         assert!(!host_looks_private("example.com"));
         assert!(!host_looks_private("8.8.8.8"));
+    }
+
+    #[test]
+    fn spots_bot_walls() {
+        let page = |title: &str, md: &str| Page {
+            url: "https://x.com".into(),
+            title: title.into(),
+            markdown: md.into(),
+            published: None,
+            byline: None,
+            site_name: None,
+            content_type: "text/html".into(),
+            links: vec![],
+        };
+        assert!(blocked_page(&page("Just a moment...", "Checking your browser before accessing x.com.")).is_some());
+        assert!(blocked_page(&page("Welcome to Reddit", "Skip to main content")).is_some());
+        let article = "word ".repeat(400);
+        assert!(blocked_page(&page("How CAPTCHAs work", &article)).is_none());
+        assert!(
+            blocked_page(&page("Short note", &"a real short page with enough words to count ".repeat(5))).is_none()
+        );
+    }
+
+    #[test]
+    fn reddit_reads_from_old_reddit() {
+        assert_eq!(
+            readable_mirror("https://www.reddit.com/r/rust/comments/abc/x/").as_deref(),
+            Some("https://old.reddit.com/r/rust/comments/abc/x/")
+        );
+        assert_eq!(readable_mirror("https://example.com/"), None);
     }
 
     #[test]

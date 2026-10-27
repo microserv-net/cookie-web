@@ -111,9 +111,25 @@ async fn search_round(run: &Run<'_>, queries: &[String], news: bool) -> Vec<Hit>
     v.into_iter().map(|(_, h)| h).collect()
 }
 
-/// Pick up to `n` readable, unseen URLs with at most 2 per domain.
-fn choose(hits: &[Hit], n: usize, seen: &mut HashSet<String>) -> Vec<String> {
-    let mut per_domain: HashMap<String, usize> = HashMap::new();
+/// Pick up to `n` readable, unseen URLs with at most 2 per domain. On-topic hits go first; off-topic
+/// ones (a search engine misreading a query) are only used to reach a minimum of 3 pages — every page
+/// read costs a model call for notes.
+fn choose(hits: &[Hit], n: usize, seen: &mut HashSet<String>, topic: &[String]) -> Vec<String> {
+    let on: Vec<&Hit> =
+        hits.iter().filter(|h| relevant(&format!("{} {} {}", h.title, h.snippet, h.url), topic)).collect();
+    let off: Vec<&Hit> = hits.iter().filter(|h| !on.iter().any(|o| std::ptr::eq(*o, *h))).collect();
+    let mut out = pick(&on, n, seen, &mut HashMap::new());
+    if out.len() < n.min(3) {
+        let mut per_domain = HashMap::new();
+        for u in &out {
+            *per_domain.entry(domain_of(u)).or_default() += 1;
+        }
+        out.extend(pick(&off, n.min(3) - out.len(), seen, &mut per_domain));
+    }
+    out
+}
+
+fn pick(hits: &[&Hit], n: usize, seen: &mut HashSet<String>, per_domain: &mut HashMap<String, usize>) -> Vec<String> {
     let mut out = vec![];
     for h in hits {
         if out.len() >= n {
@@ -239,13 +255,13 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
     }
     let mut seen = HashSet::new();
     let first = p.max_fetches.saturating_sub(3).max(3);
-    let urls = choose(&hits, first, &mut seen);
+    let urls = choose(&hits, first, &mut seen, &topic);
     let (notes, mut read) = read_and_note(run, urls, &plan.sub_questions).await;
     evidence.extend(notes);
     // Dead links and blocked pages: top up from the next-best results.
     if read < first.min(3) && run.ctx.fetches_left() > 0 && !run.out_of_time() {
         let n = (first - read).min(run.ctx.fetches_left() as usize);
-        let urls = choose(&hits, n, &mut seen);
+        let urls = choose(&hits, n, &mut seen, &topic);
         if !urls.is_empty() {
             let (notes, more) = read_and_note(run, urls, &plan.sub_questions).await;
             evidence.extend(notes);
@@ -267,7 +283,7 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
         run.events.status(format!("Filling gaps: {}", follow.join(" · ")));
         let more = search_round(run, &follow, news).await;
         let n = (run.ctx.fetches_left() as usize).min(3);
-        let urls = choose(&more, n, &mut seen);
+        let urls = choose(&more, n, &mut seen, &topic);
         evidence.extend(read_and_note(run, urls, &plan.sub_questions).await.0);
     }
 
