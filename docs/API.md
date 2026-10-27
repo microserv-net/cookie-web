@@ -7,6 +7,7 @@ All request/response bodies are JSON (UTF-8) unless noted. The GUI at `/` uses e
 - [The request object](#the-request-object)
 - [The result object](#the-result-object)
 - [Endpoints](#endpoints)
+- [Follow-ups and source content](#follow-ups-and-source-content)
 - [Streaming events (SSE)](#streaming-events-sse)
 - [Errors](#errors)
 - [Reliability guarantees](#reliability-guarantees)
@@ -37,10 +38,14 @@ Missing/wrong key → `401 {"error":"missing or invalid API key"}`.
 | `query` | string  | —       | **Required.** Natural-language request (1–4000 chars). A leading `!quick`, `!standard` or `!deep` forces the depth. |
 | `depth` | string  | `auto`  | `auto`, `quick`, `standard` or `deep`. Anything else → 400. |
 | `model` | string  | server default | Ollama model for the agent loop and the writer (e.g. `qwen3:4b-instruct`). |
-| `save`  | bool    | `true`  | Persist the report (`.md` + `.json`) to `COOKIE_REPORTS_DIR`. |
+| `save`  | bool    | `true`  | Persist the report (`.md` + `.json`, plus the read pages) to `COOKIE_REPORTS_DIR`. |
+| `report` | string | — | Make this a **follow-up** on that saved report (its `id`). See [Follow-ups](#follow-ups-and-source-content). |
+| `sources` | [int] | — | With `report`: only use these sources of the report. `@3` in the query does the same. |
+| `web` | string | `auto` | With `report`: `auto` (search the web only if the report's sources don't cover the question; never when sources are named), `never` or `always`. |
 
 ```json
 { "query": "VisionQuest", "depth": "auto" }
+{ "query": "what does @3 say about pricing?", "report": "20261028-014512-visionquest-3fa9c1" }
 ```
 
 ### Depth levels
@@ -92,7 +97,8 @@ reasoning in `triage`.
   "warnings": [                                  // [] when everything went to plan
     "removed 1 link(s) the research never visited (likely made up by the model)"
   ],
-  "degraded": false                              // true = the model couldn't write; markdown is a cited digest of the sources
+  "degraded": false,                             // true = the model couldn't write; markdown is a cited digest of the sources
+  "follows": null                                // a follow-up: the id of the report it follows up on
 }
 ```
 
@@ -167,7 +173,12 @@ sends automatically on reconnect) resumes after event `N`.
 | `GET /api/reports?limit=50` | `{"reports":[{id, query, depth, intent, created_at, sources, words}]}` newest first |
 | `GET /api/reports/{id}` | `ResearchResult` (or Markdown with `?format=markdown`) |
 | `GET /api/reports/{id}/markdown` | the saved `.md` file (with front-matter), `text/markdown` |
-| `DELETE /api/reports/{id}` | `204` |
+| `DELETE /api/reports/{id}` | `204` (also deletes its stored pages) |
+| `POST /api/reports/{id}/ask` | a follow-up — see below |
+| `GET /api/reports/{id}/sources` | its numbered sources, with `stored` (full text kept) and image counts |
+| `GET /api/reports/{id}/sources/{n}` | the full content of source `n` |
+| `GET /api/reports/{id}/sources/{n}/images/{k}` | image `k` of source `n` (bytes) |
+| `GET /api/reports/{id}/content` | the content of all its cited/read sources in one document |
 
 ### Introspection
 
@@ -176,6 +187,76 @@ sends automatically on reconnect) resumes after event `N`.
 | `GET /api/health` | `status` (`ok`/`degraded`), Ollama reachability, model availability & capabilities, installed models, tools, search backends with their health (`search_health`: successes, failures, `cooldown_secs`, `last_error`), running and queued jobs |
 | `GET /api/manifest` | machine-readable agent card (name, capabilities, input/output, endpoints) for orchestrators |
 | `GET /api/tools` | the JSON-schema tool specs the model receives |
+
+## Follow-ups and source content
+
+A report is not a dead end. Its sources keep their numbers, and their full text is kept with it, so a caller can
+come back with counter-questions instead of starting a new search — or simply pull the material itself.
+
+### Asking a follow-up
+
+```bash
+# blocking; returns a ResearchResult (?format=markdown works too)
+curl -s localhost:8765/api/reports/$ID/ask -H 'content-type: application/json' \
+  -d '{"question": "what does @3 say about pricing?"}'
+```
+
+Body: `question` (required), `sources` ([int]), `web` (`auto`|`never`|`always`), `depth`, `model`, `save`.
+It is the same as `POST /api/research` (or `/stream`, or `/api/jobs`) with `"report": "<id>"`, so streaming, jobs,
+cancelling and `Idempotency-Key` all work for follow-ups.
+
+How it is answered:
+
+1. **Which sources** — the ones named (`sources`, or `@3` / `@1,4` in the question); otherwise the report's cited and
+   read sources (up to 6).
+2. **Their full text** — the copy stored with the report (pages read while researching are stored automatically);
+   a source that was only a search result is read now, and stored for next time.
+3. **The earlier answer** is given to the model as context, so "explain the second point" works.
+4. **More from the web** — with `web: auto`, only when the sources don't cover the question (and never when sources
+   are named; a `warning` says so if they look off-topic). The follow-up question is rewritten into a standalone
+   search query first ("how old is he?" → "Samuel L. Jackson age").
+5. **The answer** cites with the **same numbers** as the earlier report (`[3]` is the same page in both); new
+   sources from a web search are numbered after the old ones. `result.follows` holds the parent report id, and
+   the follow-up is itself a saved report that can be followed up.
+
+### Getting a source's content
+
+```bash
+curl -s "localhost:8765/api/reports/$ID/sources/3"                       # JSON
+curl -s "localhost:8765/api/reports/$ID/sources/3?format=text"           # plain text
+curl -s "localhost:8765/api/reports/$ID/sources/3?format=markdown&focus=pricing&max_chars=4000"
+curl -s "localhost:8765/api/reports/$ID/sources/3/images/1" -o image.jpg
+curl -s "localhost:8765/api/reports/$ID/content?format=text"             # all cited/read sources
+curl -s "localhost:8765/api/reports/$ID/content?sources=1,3&format=json"
+```
+
+| query parameter | meaning |
+|-----------------|---------|
+| `format` | `json` (default), `markdown` or `text` (also chosen by `Accept: text/markdown` / `text/plain`) |
+| `focus` | only the passages relevant to this (keywords or a question) |
+| `max_chars` | cap the content (default: the whole page up to 60 000 characters; for `/content`, a share of 120 000 per source) |
+| `sources` | `/content` only: which sources (default: the ones the answer cites, plus pages that were read) |
+
+The content is the page's **main text** (navigation, ads and footers removed by the readability extractor), not the
+raw HTML. JSON for one source:
+
+```jsonc
+{
+  "report": "20261028-…", "n": 3,
+  "title": "…", "url": "https://…",            // the source as cited
+  "read_from": "https://…",                    // where it was actually read (e.g. a Wayback Machine copy)
+  "published": "2026-10-01", "byline": "…", "site_name": "…",
+  "words": 1834, "truncated": false,
+  "content": "…Markdown…",
+  "images": [ { "k": 1, "url": "https://…/lead.jpg", "alt": "", "proxy": "/api/reports/…/sources/3/images/1" } ]
+}
+```
+
+Images are the page's lead image (`og:image`) and the images inside its main content (lazy-loading placeholders
+resolved, icons and tracking pixels skipped). The `proxy` URL fetches the bytes through cookie-web (useful when
+the caller has no internet access of its own); only `image/*` responses are passed through.
+
+Errors: unknown report or source → `404`; a page that can't be read now → `502`.
 
 ## Streaming events (SSE)
 
@@ -297,5 +378,8 @@ cookie-web is designed to be one specialist in a larger system:
    `DELETE /api/jobs/{id}` when the answer is no longer needed.
 5. **Consume** — use `result.markdown` for humans and `result.sources` (structured, numbered) for machines.
    Check `result.degraded` (and `warnings`) if the supervisor wants to retry later or ask another agent.
+6. **Come back** — counter-questions go to `POST /api/reports/{id}/ask` (with `@n` for a specific source), and the
+   raw material is at `/api/reports/{id}/sources/{n}` and `/content`. No need to search again or to ask another agent
+   to fetch a link cookie-web already read.
 
 Concurrency: at most `COOKIE_MAX_CONCURRENT` jobs run at once (default 1 — one small model serves one request at a time); others wait in `queued`.

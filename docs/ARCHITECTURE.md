@@ -21,12 +21,13 @@ judgement calls.
 
 | file | role |
 |------|------|
-| `src/main.rs` | CLI: `serve`, `ask`, `doctor`, `tool`, `tools` |
+| `src/main.rs` | CLI: `serve`, `ask` (also `--follow`), `source`, `doctor`, `tool`, `tools` |
 | `src/server.rs` | axum HTTP API, jobs, SSE, auth, embedded GUI |
 | `src/engine.rs` | orchestrates a request; `Run` context; the writer prompt |
 | `src/depth.rs` | triage: depth levels, intents, budgets (`Profile`) |
 | `src/agent.rs` | fenced tool-calling loop for quick/standard |
 | `src/research.rs` | deep pipeline: plan → search → read → notes → gaps |
+| `src/followup.rs` | follow-ups on a saved report; reading a report's source pages |
 | `src/report.rs` | citation linking, Sources section, report storage |
 | `src/sources.rs` | source registry (stable `[n]` numbers, URL de-dup) |
 | `src/llm/` | `ChatModel` trait + Ollama client (native tools, JSON mode, streaming) |
@@ -111,6 +112,23 @@ Configured backends are tried in order (`COOKIE_SEARCH_MODE=fallback`) or all qu
 
 Keyless scraping works from home connections but is often rate-limited from datacenter IPs — use SearXNG
 or an API key on servers.
+
+## Follow-ups
+
+A follow-up (`report` set on a request) skips triage-by-model and searching-first:
+
+```
+parent report ──▶ its sources (same numbers) ──▶ full text: stored copy │ read now & store
+                                               ──▶ excerpts around the question + the earlier answer
+                    covered? ── no (web: auto/always) ──▶ standalone query ──▶ agent loop (new sources numbered after the old)
+                                               ──▶ writer ──▶ citations kept as-is (no renumbering) ──▶ saved, `follows: <parent>`
+```
+
+"Covered" is judged in code: at least one excerpt contains half of the question's distinctive words. Questions
+with no distinctive words ("tell me more", "explain the second point") are about the report itself.
+
+Reports store the pages they read in `<id>.pages.json` (main text + images, written atomically); pages read later
+for `/sources/{n}` are added to it, so content requests and follow-ups survive restarts and dead links.
 
 ## Citations
 

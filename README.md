@@ -28,6 +28,8 @@ cookie-web is a single Rust binary: an HTTP API, a built-in web GUI and a CLI. I
 - **Small-model friendly** — seeded searches, budgets, query-focused excerpts, deterministic fallbacks,
   JSON tool protocol for models without native tool calling.
 - **Integrates anywhere** — blocking JSON, Server-Sent Events, or async jobs; reports saved as `.md` files.
+- **Follow-ups** — ask more about an answer (`@3` = about source 3) without starting over; citation numbers stay the
+  same. Every source's full text (plain text, Markdown or JSON) and images are available from the report.
 
 ## Quick start
 
@@ -72,6 +74,8 @@ From the terminal, without the server:
 cargo run --release -- ask "how do I set up WireGuard on Ubuntu?"
 cargo run --release -- ask --depth deep --out report.md "state of open-weight small LLMs"
 cargo run --release -- doctor     # checks Ollama, the model and every search backend
+cargo run --release -- ask --follow <report-id> "what does @2 say about keys?"
+cargo run --release -- source <report-id> 2 --text   # full text of source [2]
 ```
 
 ### With Docker (Ollama + SearXNG included)
@@ -126,6 +130,8 @@ Full reference with examples: **[docs/API.md](docs/API.md)**. In short:
 | `POST /api/research/stream` | Server-Sent Events: triage, tool calls, sources, tokens, done |
 | `POST /api/jobs` → `GET /api/jobs/{id}` (+`/events?from=n`) · `DELETE /api/jobs/{id}` | async jobs, resumable streams, cancel |
 | `GET /api/reports[/{id}[/markdown]]` | saved reports |
+| `POST /api/reports/{id}/ask` | follow-up question on a report (`@3` = about source 3) |
+| `GET /api/reports/{id}/sources/{n}[/images/{k}]` · `/content` | a source's full content (json/markdown/text) and images; all sources at once |
 | `GET /api/health` · `/api/manifest` · `/api/tools` | introspection |
 
 Send an `Idempotency-Key` header and a retried request reattaches to the same job instead of starting another.
