@@ -17,11 +17,41 @@ pub struct Message {
     /// For `role == "tool"`: the tool whose output this is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// What producing this reply cost (set on replies from the model; never sent to it).
+    #[serde(skip)]
+    pub usage: Usage,
+}
+
+/// The work the model did: tokens read and written, and time spent. On a CPU-only box this is
+/// where nearly all the CPU goes, so it is reported per job.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub output_tokens: u64,
+    /// Wall time inside the model (prompt reading + generation + loading), in milliseconds.
+    pub model_ms: u64,
+}
+
+impl Usage {
+    /// From the counters Ollama returns with a finished reply.
+    pub fn from_ollama(v: &serde_json::Value) -> Self {
+        Self {
+            prompt_tokens: v["prompt_eval_count"].as_u64().unwrap_or(0),
+            output_tokens: v["eval_count"].as_u64().unwrap_or(0),
+            model_ms: v["total_duration"].as_u64().unwrap_or(0) / 1_000_000,
+        }
+    }
 }
 
 impl Message {
     pub fn new(role: &str, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into(), tool_calls: vec![], tool_name: None }
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: vec![],
+            tool_name: None,
+            usage: Usage::default(),
+        }
     }
     pub fn system(c: impl Into<String>) -> Self {
         Self::new("system", c)
@@ -115,11 +145,12 @@ pub struct Completion {
     pub text: String,
     /// The model stopped because it hit `max_tokens` (the text may end mid-sentence).
     pub truncated: bool,
+    pub usage: Usage,
 }
 
 impl Completion {
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into(), truncated: false }
+        Self { text: text.into(), truncated: false, usage: Usage::default() }
     }
 }
 

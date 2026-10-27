@@ -397,17 +397,18 @@ pub fn heuristic(query: &str) -> (Triage, bool) {
 }
 
 /// Full triage: override → confident heuristic → model → heuristic fallback.
-pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> Triage {
+/// Also returns what the model call cost (zero when no call was made).
+pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> (Triage, crate::llm::Usage) {
     let (forced, clean) = split_override(query);
     let (mut h, confident) = heuristic(&clean);
     if let Some(d) = forced {
         h.depth = d;
         h.reason = "set explicitly by the user".into();
         h.decided_by = "user".into();
-        return h;
+        return (h, Default::default());
     }
     if confident {
-        return h;
+        return (h, Default::default());
     }
 
     let schema = json!({
@@ -435,7 +436,9 @@ pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> Triage {
         .json(schema)
         .temperature(0.0)
         .max_tokens(200);
-    match llm.chat(req).await.ok().and_then(|m| parse_json_loose(&m.content)) {
+    let reply = llm.chat(req).await.ok();
+    let usage = reply.as_ref().map(|m| m.usage).unwrap_or_default();
+    let t = match reply.and_then(|m| parse_json_loose(&m.content)) {
         Some(v) => {
             let depth = v["depth"].as_str().and_then(Depth::parse).unwrap_or(h.depth);
             let sq = v["search_query"].as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() < 300);
@@ -448,7 +451,8 @@ pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> Triage {
             }
         }
         None => h,
-    }
+    };
+    (t, usage)
 }
 
 #[cfg(test)]

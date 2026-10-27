@@ -19,7 +19,7 @@ use crate::{
     config::Config,
     depth::{self, Depth, Intent, Profile, Triage},
     events::{Event, Events},
-    llm::{ChatModel, ChatRequest, Completion, Message, Tier},
+    llm::{ChatModel, ChatRequest, Completion, Message, Tier, Usage},
     report::{self, ReportStore},
     research,
     sources::Source,
@@ -73,6 +73,15 @@ pub struct Stats {
     pub pages_read: usize,
     pub llm_calls: usize,
     pub duration_ms: u64,
+    /// Tokens the model read (prompts) — on a CPU this is usually most of the work.
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    /// Tokens the model wrote.
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Time spent inside the model, in milliseconds.
+    #[serde(default)]
+    pub model_ms: u64,
 }
 
 /// The finished answer.
@@ -118,6 +127,19 @@ pub struct Counters {
     pub searches: AtomicUsize,
     pub llm_calls: AtomicUsize,
     next_call_id: AtomicUsize,
+    usage: Mutex<Usage>,
+}
+
+impl Counters {
+    pub fn add_usage(&self, u: Usage) {
+        let mut t = self.usage.lock().unwrap();
+        t.prompt_tokens += u.prompt_tokens;
+        t.output_tokens += u.output_tokens;
+        t.model_ms += u.model_ms;
+    }
+    pub fn usage(&self) -> Usage {
+        *self.usage.lock().unwrap()
+    }
 }
 
 /// Per-request state shared by the gathering strategies.
@@ -172,7 +194,9 @@ impl Run<'_> {
     pub async fn chat(&self, req: ChatRequest) -> anyhow::Result<Message> {
         self.counters.llm_calls.fetch_add(1, Ordering::SeqCst);
         let req = if req.model.is_none() && req.tier == Tier::Main { req.model(self.model.clone()) } else { req };
-        self.engine.llm.chat(req).await
+        let msg = self.engine.llm.chat(req).await?;
+        self.counters.add_usage(msg.usage);
+        Ok(msg)
     }
 }
 
@@ -243,7 +267,7 @@ impl Engine {
         if req.depth.as_deref().is_some_and(|d| !d.eq_ignore_ascii_case("auto")) && forced.is_none() {
             bail!("invalid depth '{}': use auto, quick, standard or deep", req.depth.unwrap_or_default());
         }
-        let mut triage = depth::triage(self.llm.as_ref(), &query, &today).await;
+        let (mut triage, triage_usage) = depth::triage(self.llm.as_ref(), &query, &today).await;
         if let Some(d) = forced {
             triage.depth = d;
             triage.reason = "set explicitly by the caller".into();
@@ -270,6 +294,10 @@ impl Engine {
             context: None,
             title: None,
         };
+        if triage_usage != Usage::default() {
+            run.counters.llm_calls.fetch_add(1, Ordering::SeqCst);
+            run.counters.add_usage(triage_usage);
+        }
 
         // 2. Gather -----------------------------------------------------------
         let evidence = match triage.depth {
@@ -373,6 +401,9 @@ impl Engine {
                 pages_read,
                 llm_calls: run.counters.llm_calls.load(Ordering::SeqCst),
                 duration_ms: started.elapsed().as_millis() as u64,
+                prompt_tokens: run.counters.usage().prompt_tokens,
+                output_tokens: run.counters.usage().output_tokens,
+                model_ms: run.counters.usage().model_ms,
             },
             model,
             created_at,
@@ -381,6 +412,17 @@ impl Engine {
             degraded,
             follows,
         };
+        let st = &result.stats;
+        tracing::info!(
+            "answered \"{}\" ({}): {:.0}s total, {} model calls, {} prompt + {} generated tokens, {:.0}s in the model",
+            result.query.chars().take(60).collect::<String>(),
+            result.depth.as_str(),
+            st.duration_ms as f64 / 1000.0,
+            st.llm_calls,
+            st.prompt_tokens,
+            st.output_tokens,
+            st.model_ms as f64 / 1000.0
+        );
         if req.save {
             match self.store.save(&result).await {
                 Ok(p) => {
@@ -506,13 +548,16 @@ impl Engine {
             .model(run.model.clone());
         run.counters.llm_calls.fetch_add(1, Ordering::SeqCst);
         let events = run.events.clone();
-        self.llm
+        let c = self
+            .llm
             .chat_stream(req, &move |tok: &str| {
                 streamed.store(true, Ordering::SeqCst);
                 events.emit(Event::Token { text: tok.to_string() })
             })
             .await
-            .context("writing the answer failed")
+            .context("writing the answer failed")?;
+        run.counters.add_usage(c.usage);
+        Ok(c)
     }
 }
 

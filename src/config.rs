@@ -38,6 +38,8 @@ pub struct Config {
     pub fast_model: Option<String>,
     pub think: bool,
     pub num_ctx: u32,
+    /// CPU threads Ollama may use for this model (`None` = Ollama's default: all physical cores).
+    pub num_thread: Option<u32>,
     pub temperature: f32,
     /// How long Ollama keeps the model loaded. `-1` = forever (default).
     pub keep_alive: String,
@@ -105,6 +107,7 @@ impl Config {
             fast_model: var("COOKIE_FAST_MODEL"),
             think: flag("COOKIE_THINK", false),
             num_ctx: parse("COOKIE_NUM_CTX", 8192u32).clamp(4096, 262_144),
+            num_thread: var("COOKIE_NUM_THREAD").and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0),
             temperature: parse("COOKIE_TEMPERATURE", 0.3),
             keep_alive: var("COOKIE_KEEP_ALIVE").unwrap_or_else(|| "-1".into()),
             agent_mode: match var("COOKIE_AGENT_MODE").map(|v| v.to_ascii_lowercase()).as_deref() {
@@ -168,6 +171,7 @@ impl Config {
             fast_model: None,
             think: false,
             num_ctx: 8192,
+            num_thread: None,
             temperature: 0.2,
             keep_alive: "5m".into(),
             agent_mode: AgentMode::Auto,

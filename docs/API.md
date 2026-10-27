@@ -91,7 +91,8 @@ reasoning in `triage`.
       "cited": true                              // the answer cites it
     }
   ],
-  "stats": { "tool_calls": 2, "searches": 1, "pages_read": 0, "llm_calls": 1, "duration_ms": 8421 },
+  "stats": { "tool_calls": 2, "searches": 1, "pages_read": 0, "llm_calls": 1, "duration_ms": 8421,
+             "prompt_tokens": 3120, "output_tokens": 214, "model_ms": 6930 },   // the model's work: tokens read/written, time
   "model": "qwen3:4b-instruct",
   "created_at": "2026-10-28T01:45:12.004Z",
   "report_path": "reports/20261028-014512-visionquest-3fa9c1.md",

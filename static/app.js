@@ -130,7 +130,11 @@
 
   function showStats(r) {
     const s = r.stats || {};
-    els.stats.textContent = `${r.sources.length} sources · ${s.pages_read} pages read · ${s.tool_calls} tool calls · ${(s.duration_ms / 1000).toFixed(1)}s · ${r.model}`;
+    const tokens = (s.prompt_tokens || 0) + (s.output_tokens || 0);
+    const model = tokens
+      ? ` · ${(tokens / 1000).toFixed(1)}k tokens, ${Math.round((s.model_ms || 0) / 1000)}s in the model`
+      : "";
+    els.stats.textContent = `${r.sources.length} sources · ${s.pages_read} pages read · ${s.tool_calls} tool calls · ${(s.duration_ms / 1000).toFixed(1)}s${model} · ${r.model}`;
   }
 
   function setBusy(b) {

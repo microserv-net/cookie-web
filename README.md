@@ -97,6 +97,7 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 | `COOKIE_FAST_MODEL` | = `COOKIE_MODEL` | optional smaller model for triage, planning, notes |
 | `COOKIE_THINK` | `false` | let thinking models think while writing (slower, sometimes better) |
 | `COOKIE_NUM_CTX` | `8192` | context window; all prompts are sized to fit it |
+| `COOKIE_NUM_THREAD` | — | CPU threads the model may use (default: all cores; see [why the CPU sits at 100%](docs/HARDWARE.md#why-the-cpu-sits-at-100-and-when-it-shouldnt)) |
 | `COOKIE_KEEP_ALIVE` | `-1` | keep the model loaded forever |
 | `COOKIE_WARMUP` | `true` | load the model when the server starts |
 | `COOKIE_AGENT_MODE` | `auto` | `pipeline` = no model-driven tool rounds (faster on slow CPUs / tiny models) |

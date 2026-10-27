@@ -8,7 +8,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use super::{ChatModel, ChatRequest, Completion, Message, ModelInfo, Tier, strip_thinking};
+use super::{ChatModel, ChatRequest, Completion, Message, ModelInfo, Tier, Usage, strip_thinking};
 use crate::config::Config;
 
 #[derive(Clone, Debug, Default)]
@@ -86,6 +86,9 @@ impl Ollama {
         if let Some(n) = req.max_tokens {
             options["num_predict"] = json!(n);
         }
+        if let Some(t) = self.cfg.num_thread {
+            options["num_thread"] = json!(t);
+        }
         let mut body = json!({
             "model": model,
             "messages": req.messages,
@@ -143,6 +146,15 @@ fn status_failure(status: reqwest::StatusCode, err: &str, model: &str) -> Failur
 }
 
 impl Ollama {
+    /// Options that decide how Ollama loads the model (they must match across requests).
+    fn load_options(&self) -> Value {
+        let mut o = json!({ "num_ctx": self.cfg.num_ctx });
+        if let Some(t) = self.cfg.num_thread {
+            o["num_thread"] = json!(t);
+        }
+        o
+    }
+
     /// Shorter back-off, for tests.
     pub fn with_backoff(mut self, backoff: Vec<Duration>) -> Self {
         self.backoff = backoff;
@@ -174,6 +186,7 @@ impl Ollama {
         let mut msg: Message = serde_json::from_value(v["message"].clone())
             .map_err(|_| Failure::Retry(anyhow!("no message in Ollama reply")))?;
         msg.content = strip_thinking(&msg.content);
+        msg.usage = Usage::from_ollama(&v);
         Ok(msg)
     }
 
@@ -204,6 +217,7 @@ impl Ollama {
         let mut buf: Vec<u8> = Vec::new();
         let mut full = String::new();
         let mut finished: Option<String> = None;
+        let mut usage = Usage::default();
         // Suppress leaked <think> blocks while streaming.
         let mut in_think = false;
         let fail = |emitted: bool, e: anyhow::Error| if emitted { Failure::Fatal(e) } else { Failure::Retry(e) };
@@ -224,6 +238,7 @@ impl Ollama {
                 }
                 if v["done"].as_bool() == Some(true) {
                     finished = Some(v["done_reason"].as_str().unwrap_or("stop").to_string());
+                    usage = Usage::from_ollama(&v);
                 }
                 let delta = v["message"]["content"].as_str().unwrap_or("");
                 if delta.is_empty() {
@@ -243,7 +258,7 @@ impl Ollama {
             }
         }
         match finished {
-            Some(reason) => Ok(Completion { text: strip_thinking(&full), truncated: reason == "length" }),
+            Some(reason) => Ok(Completion { text: strip_thinking(&full), truncated: reason == "length", usage }),
             None => Err(fail(*emitted, anyhow!("the Ollama stream ended before the answer was complete"))),
         }
     }
@@ -305,7 +320,8 @@ impl ChatModel for Ollama {
                 "model": model,
                 "messages": [],
                 "keep_alive": self.cfg.keep_alive_json(),
-                "options": { "num_ctx": self.cfg.num_ctx },
+                // same options as real requests, or Ollama would reload the model on the first one
+                "options": self.load_options(),
             });
             let r = self.http.post(self.url("/api/chat")).json(&body).send().await?;
             if !r.status().is_success() {

@@ -33,17 +33,19 @@ enum Reply {
 struct Fake {
     script: Arc<Vec<Reply>>,
     calls: Arc<AtomicUsize>,
+    bodies: Arc<std::sync::Mutex<Vec<Value>>>,
 }
 
-async fn chat(State(f): State<Fake>, Json(_body): Json<Value>) -> Response {
+async fn chat(State(f): State<Fake>, Json(body): Json<Value>) -> Response {
+    f.bodies.lock().unwrap().push(body);
     let i = f.calls.fetch_add(1, Ordering::SeqCst);
     match f.script.get(i).or(f.script.last()).cloned().unwrap() {
         Reply::Status(code, err) => {
             (StatusCode::from_u16(code).unwrap(), Json(json!({ "error": err }))).into_response()
         }
-        Reply::Chat(text) => {
-            Json(json!({ "message": { "role": "assistant", "content": text }, "done": true })).into_response()
-        }
+        Reply::Chat(text) => Json(json!({ "message": { "role": "assistant", "content": text }, "done": true,
+                         "prompt_eval_count": 1200, "eval_count": 40, "total_duration": 9_500_000_000u64 }))
+        .into_response(),
         Reply::Stream(lines) => {
             let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
             ([("content-type", "application/x-ndjson")], body).into_response()
@@ -56,16 +58,26 @@ async fn show() -> Json<Value> {
 }
 
 async fn fake_ollama(script: Vec<Reply>) -> (Ollama, Arc<AtomicUsize>) {
+    let (o, calls, _) = fake_ollama_with(script, |_| {}).await;
+    (o, calls)
+}
+
+async fn fake_ollama_with(
+    script: Vec<Reply>,
+    tweak: impl FnOnce(&mut Config),
+) -> (Ollama, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Value>>>) {
     let calls = Arc::new(AtomicUsize::new(0));
-    let state = Fake { script: Arc::new(script), calls: calls.clone() };
+    let bodies = Arc::new(std::sync::Mutex::new(vec![]));
+    let state = Fake { script: Arc::new(script), calls: calls.clone(), bodies: bodies.clone() };
     let app = Router::new().route("/api/chat", post(chat)).route("/api/show", post(show)).with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let mut cfg = Config::for_tests("reports".into());
     cfg.ollama_host = format!("http://{addr}");
+    tweak(&mut cfg);
     let o = Ollama::new(Arc::new(cfg)).with_backoff(vec![Duration::from_millis(5); 3]);
-    (o, calls)
+    (o, calls, bodies)
 }
 
 fn req() -> ChatRequest {
@@ -77,7 +89,23 @@ fn token(t: &str) -> Value {
 }
 
 fn done(reason: &str) -> Value {
-    json!({ "message": { "role": "assistant", "content": "" }, "done": true, "done_reason": reason })
+    json!({ "message": { "role": "assistant", "content": "" }, "done": true, "done_reason": reason,
+            "prompt_eval_count": 3000, "eval_count": 2, "total_duration": 61_000_000_000u64 })
+}
+
+#[tokio::test]
+async fn reports_usage_and_passes_the_thread_cap() {
+    let (o, _, bodies) = fake_ollama_with(vec![Reply::Chat("hi")], |c| c.num_thread = Some(3)).await;
+    let m = o.chat(req()).await.unwrap();
+    assert_eq!(m.usage.prompt_tokens, 1200);
+    assert_eq!(m.usage.output_tokens, 40);
+    assert_eq!(m.usage.model_ms, 9_500);
+    assert_eq!(bodies.lock().unwrap()[0]["options"]["num_thread"], 3);
+
+    let (o, _) = fake_ollama(vec![Reply::Stream(vec![token("a"), token("b"), done("stop")])]).await;
+    let c = o.chat_stream(req(), &|_| {}).await.unwrap();
+    assert_eq!(c.usage.prompt_tokens, 3000);
+    assert_eq!(c.usage.model_ms, 61_000);
 }
 
 #[tokio::test]

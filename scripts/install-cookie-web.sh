@@ -19,6 +19,7 @@ NO_KEY=0
 BINARY=""
 OPEN_FIREWALL=0
 OLLAMA_URL=""
+THREADS=""
 
 usage() {
 	cat <<'EOF'
@@ -32,6 +33,7 @@ Usage: install-cookie-web.sh [options]
   --no-key            no API key (anyone on the network can use it — only on trusted networks)
   --binary PATH       install this prebuilt binary instead of compiling (compiling on a small box is slow)
   --ollama URL        where Ollama runs (default http://127.0.0.1:11434)
+  --threads N         CPU threads the model may use (default: all cores; e.g. cores-1 keeps one free)
   --open-firewall     allow the port through ufw if ufw is active
   -h, --help          this help
 EOF
@@ -47,6 +49,7 @@ while [ $# -gt 0 ]; do
 	--no-key) NO_KEY=1; shift ;;
 	--binary) BINARY="${2:?}"; shift 2 ;;
 	--ollama) OLLAMA_URL="${2:?}"; shift 2 ;;
+	--threads) THREADS="${2:?}"; shift 2 ;;
 	--open-firewall) OPEN_FIREWALL=1; shift ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -111,7 +114,8 @@ else
 	fi
 	ok "$(as_builder "$CARGO" --version)"
 	echo "  compiling (a few minutes; much longer on a 4-core mini PC)…"
-	(cd "$REPO" && as_builder "$CARGO" build --release --locked --quiet) || die "the build failed"
+	# low priority: compiling uses every core for several minutes
+	(cd "$REPO" && as_builder nice -n 10 "$CARGO" build --release --locked --quiet) || die "the build failed"
 	BINARY="$REPO/target/release/cookie-web"
 	ok "built $("$BINARY" --version)"
 fi
@@ -144,6 +148,7 @@ fi
 [ -n "$PORT" ] && set_env COOKIE_PORT "$PORT"
 [ -n "$HOST" ] && set_env COOKIE_HOST "$HOST"
 [ -n "$OLLAMA_URL" ] && set_env OLLAMA_HOST "$OLLAMA_URL"
+[ -n "$THREADS" ] && set_env COOKIE_NUM_THREAD "$THREADS"
 [ -z "$(get_env COOKIE_MODEL)" ] && set_env COOKIE_MODEL "qwen3:4b-instruct"
 set_env COOKIE_REPORTS_DIR "$DATA/reports"
 

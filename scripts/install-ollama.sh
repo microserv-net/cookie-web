@@ -188,6 +188,10 @@ if systemd_running; then
 			echo "# Written by cookie-web/scripts/install-ollama.sh — one model, always loaded, half-size KV cache."
 			echo "[Service]"
 			for kv in "${OLLAMA_ENV[@]}"; do echo "Environment=\"$kv\""; done
+			echo "# The model uses every core while it answers; lower priority keeps SSH and cookie-web snappy"
+			echo "# (it still gets all the CPU nothing else wants, so answers are not slower on an idle box)."
+			echo "Nice=10"
+			echo "CPUWeight=50"
 		} | $SUDO tee /etc/systemd/system/ollama.service.d/cookie-web.conf >/dev/null
 		ok "tuning: /etc/systemd/system/ollama.service.d/cookie-web.conf"
 	fi
@@ -204,7 +208,7 @@ else
 	else
 		LOG=/tmp/ollama-serve.log
 		if [ "$TUNE" -eq 1 ]; then
-			nohup env "${OLLAMA_ENV[@]}" ollama serve >"$LOG" 2>&1 &
+			nohup nice -n 10 env "${OLLAMA_ENV[@]}" ollama serve >"$LOG" 2>&1 &
 		else
 			nohup env "OLLAMA_HOST=$LISTEN" ollama serve >"$LOG" 2>&1 &
 		fi
