@@ -12,7 +12,7 @@ use cookie_web::{
 };
 
 fn req(query: &str, depth: Option<&str>) -> ResearchRequest {
-    ResearchRequest { query: query.into(), depth: depth.map(String::from), model: None, save: false }
+    ResearchRequest { depth: depth.map(String::from), save: false, ..ResearchRequest::new(query) }
 }
 
 async fn run_with(

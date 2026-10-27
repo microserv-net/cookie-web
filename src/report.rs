@@ -268,6 +268,82 @@ pub fn further_reading(
     out
 }
 
+/// Plain text from Markdown: citation links become `[n]`, links `text (url)`, images `[image: alt]`;
+/// heading marks, emphasis, quote marks and table rules are dropped. Code keeps its text.
+pub fn md_to_text(md: &str) -> String {
+    static IMG: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r#"!\[([^\]\n]*)\]\([^)\s]+(?:\s+"[^"]*")?\)"#).unwrap());
+    static CITE_LINK: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\[\[(\d+)\]\]\([^)\s]+\)").unwrap());
+    static LINK: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r#"\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)"#).unwrap());
+    static EMPH: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"(\*\*|__)([^*_\n]+)(\*\*|__)").unwrap());
+    static RULE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$").unwrap());
+    let mut out = String::with_capacity(md.len());
+    let mut in_code = false;
+    for line in md.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if RULE.is_match(line) || line.trim() == "---" || line.trim() == "***" {
+            continue;
+        }
+        let l = line.trim_start_matches(['#', '>']).trim_start();
+        let l = if line.trim_start().starts_with('#') || line.trim_start().starts_with('>') { l } else { line };
+        let l = IMG.replace_all(l, |c: &regex::Captures| {
+            if c[1].trim().is_empty() { String::new() } else { format!("[image: {}]", c[1].trim()) }
+        });
+        let l = CITE_LINK.replace_all(&l, "[$1]");
+        let l = LINK.replace_all(
+            &l,
+            |c: &regex::Captures| {
+                if c[1] == c[2] { c[1].to_string() } else { format!("{} ({})", &c[1], &c[2]) }
+            },
+        );
+        let l = EMPH.replace_all(&l, "$2");
+        let l = l.replace('`', "");
+        let l = if l.trim_start().starts_with('|') { l.trim().trim_matches('|').replace(" | ", "  ·  ") } else { l };
+        out.push_str(l.trim_end());
+        out.push('\n');
+    }
+    tidy_blank_lines(&out)
+}
+
+fn tidy_blank_lines(s: &str) -> String {
+    let mut out = String::new();
+    let mut blank = 0;
+    for l in s.lines() {
+        if l.trim().is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
+/// An answer without its generated Sources section, citation links reduced to `[n]`
+/// (compact context for a follow-up).
+pub fn answer_body(md: &str) -> String {
+    static CITE_LINK: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\[\[(\d+)\]\]\([^)\s]+\)").unwrap());
+    let body = md.split("\n---\n\n## Sources").next().unwrap_or(md);
+    CITE_LINK.replace_all(body, "[$1]").trim().to_string()
+}
+
 /// Build the "Sources" section: cited sources first, then a few useful uncited ones
 /// (only those `on_topic` accepts, so off-topic search results don't pad the list).
 pub fn sources_section(
@@ -354,11 +430,13 @@ pub fn to_file(r: &ResearchResult) -> String {
 #[derive(Clone)]
 pub struct ReportStore {
     pub dir: PathBuf,
+    /// Serialises read-modify-write of `<id>.pages.json`.
+    pages_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ReportStore {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self { dir, pages_lock: Default::default() }
     }
 
     fn valid_id(id: &str) -> bool {
@@ -394,7 +472,40 @@ impl ReportStore {
         }
         let a = tokio::fs::remove_file(self.dir.join(format!("{id}.md"))).await.is_ok();
         let b = tokio::fs::remove_file(self.dir.join(format!("{id}.json"))).await.is_ok();
+        let _ = tokio::fs::remove_file(self.dir.join(format!("{id}.pages.json"))).await;
         a || b
+    }
+
+    /// Full text (and images) of a report's sources, by citation number: `<id>.pages.json`.
+    pub async fn pages(&self, id: &str) -> std::collections::HashMap<usize, crate::tools::extract::Page> {
+        if !Self::valid_id(id) {
+            return Default::default();
+        }
+        match tokio::fs::read(self.dir.join(format!("{id}.pages.json"))).await {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+            Err(_) => Default::default(),
+        }
+    }
+
+    pub async fn save_pages(
+        &self,
+        id: &str,
+        pages: &std::collections::HashMap<usize, crate::tools::extract::Page>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(Self::valid_id(id), "invalid report id");
+        let tmp = self.dir.join(format!("{id}.pages.json.tmp"));
+        tokio::fs::write(&tmp, serde_json::to_vec(pages)?).await?;
+        // write-then-rename: a crash never leaves a half-written file behind
+        tokio::fs::rename(&tmp, self.dir.join(format!("{id}.pages.json"))).await?;
+        Ok(())
+    }
+
+    /// Add one page (read later, on request) to a report's stored pages.
+    pub async fn add_page(&self, id: &str, n: usize, page: &crate::tools::extract::Page) -> anyhow::Result<()> {
+        let _guard = self.pages_lock.lock().await;
+        let mut all = self.pages(id).await;
+        all.insert(n, page.clone());
+        self.save_pages(id, &all).await
     }
 
     /// Newest first.
@@ -403,7 +514,8 @@ impl ReportStore {
         let Ok(mut rd) = tokio::fs::read_dir(&self.dir).await else { return out };
         while let Ok(Some(e)) = rd.next_entry().await {
             let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            let name = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            if !name.ends_with(".json") || name.ends_with(".pages.json") {
                 continue;
             }
             if let Ok(bytes) = tokio::fs::read(&p).await
@@ -524,6 +636,24 @@ mod tests {
         let out = finish_truncated(&format!("{body}\nAnd then the model stopped in the mid"));
         assert!(!out.contains("mid"));
         assert!(finish_truncated("```bash\napt install x").ends_with("```"));
+    }
+
+    #[test]
+    fn markdown_to_plain_text() {
+        let md = "# Title\n\nSome **bold** fact [[2]](https://x.com/a) and [a link](https://y.com).\n\n\
+                  ![A cat](https://i/cat.png)\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n> quoted\n\n```\ncode [1]\n```\n";
+        let t = md_to_text(md);
+        assert!(t.starts_with("Title\n\nSome bold fact [2] and a link (https://y.com)."), "{t}");
+        assert!(t.contains("[image: A cat]"));
+        assert!(t.contains("a  ·  b") && !t.contains("---"));
+        assert!(t.contains("\nquoted\n"));
+        assert!(t.contains("code [1]"));
+    }
+
+    #[test]
+    fn answer_body_drops_sources() {
+        let md = "Fact [[1]](https://a.com).\n\n---\n\n## Sources\n\n1. [A](https://a.com)";
+        assert_eq!(answer_body(md), "Fact [1].");
     }
 
     #[test]

@@ -83,6 +83,12 @@ impl ToolCtx {
         n
     }
 
+    /// Use an existing source registry (a follow-up continues its parent's numbering).
+    pub fn with_sources(self, reg: SourceRegistry) -> Self {
+        *self.sources.lock().unwrap() = reg;
+        self
+    }
+
     /// True if this job already read the page at `url` in full.
     pub fn already_read(&self, url: &str) -> bool {
         let key = crate::sources::normalize_url(url);
@@ -141,6 +147,8 @@ pub struct Registry {
     tools: Vec<Arc<dyn Tool>>,
     /// The shared search engine (for health reporting), when the standard tools are used.
     pub search: Option<Arc<search::SearchEngine>>,
+    /// The shared HTTP layer (page cache, reading sources for follow-ups), when the standard tools are used.
+    pub web: Option<Arc<net::Web>>,
 }
 
 impl Registry {
@@ -158,8 +166,9 @@ impl Registry {
         r.add(fetch::FetchPage { web: web.clone() });
         r.add(fetch::ExtractLinks { web: web.clone() });
         r.add(crawl::CrawlSite { web: web.clone() });
-        r.add(wiki::Wikipedia { web });
+        r.add(wiki::Wikipedia { web: web.clone() });
         r.search = Some(engine);
+        r.web = Some(web);
         Ok(r)
     }
 

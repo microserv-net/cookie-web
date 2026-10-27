@@ -13,7 +13,9 @@
     stats: $("#stats"), raw: $("#raw-link"), history: $("#history"), status: $("#status"), statusText: $("#status-text"),
     settings: $("#settings"), apiKey: $("#api-key"), model: $("#model"), save: $("#save"), models: $("#models"),
     notice: $("#notice"), noticeTitle: $("#notice-title"), noticeList: $("#notice-list"),
+    follow: $("#follow"), followWrap: $("#follow-wrap"),
   };
+  const PLACEHOLDER = els.q.placeholder;
 
   let current = null; // { markdown, id }
   let controller = null;
@@ -54,6 +56,53 @@
       if (/^\[\d+\]$/.test(a.textContent.trim())) a.classList.add("cite");
       if (a.href.startsWith("http")) { a.target = "_blank"; a.rel = "noopener"; }
     });
+  }
+
+  // ------------------------------------------------------------ follow-ups
+  // A saved answer can be followed up: the next question is answered from its sources first.
+  function setFollowable(report) {
+    const ok = !!(report && report.saved);
+    els.followWrap.hidden = !ok;
+    if (ok) els.follow.checked = true;
+    updatePlaceholder();
+  }
+
+  function updatePlaceholder() {
+    els.q.placeholder = !els.followWrap.hidden && els.follow.checked
+      ? "Ask a follow-up… (@3 asks about source 3)"
+      : PLACEHOLDER;
+  }
+
+  function sourceUrl(id, n, format) {
+    const key = store.get("apiKey", "");
+    return `/api/reports/${encodeURIComponent(id)}/sources/${n}?format=${format}` +
+      (key ? `&api_key=${encodeURIComponent(key)}` : "");
+  }
+
+  // Next to each entry of the Sources list: "text" opens the source's full content, "ask" starts a
+  // follow-up about that source.
+  function decorateSources(id) {
+    const heading = [...els.answer.querySelectorAll("h2")].find((h) => h.textContent.trim() === "Sources");
+    if (!heading) return;
+    for (let el = heading.nextElementSibling; el && el.tagName !== "H2"; el = el.nextElementSibling) {
+      if (el.tagName !== "OL") continue;
+      const start = parseInt(el.getAttribute("start") || "1", 10);
+      [...el.children].forEach((li, i) => {
+        const n = start + i;
+        const tools = document.createElement("span");
+        tools.className = "src-tools";
+        tools.innerHTML = `<a href="${sourceUrl(id, n, "text")}" target="_blank" rel="noopener" title="Full text of source ${n}">text</a>` +
+          `<button type="button" title="Ask about source ${n}">ask</button>`;
+        tools.querySelector("button").addEventListener("click", () => {
+          els.followWrap.hidden = false;
+          els.follow.checked = true;
+          updatePlaceholder();
+          if (!/@\d/.test(els.q.value)) els.q.value = `@${n} ` + els.q.value;
+          els.q.focus();
+        });
+        li.appendChild(tools);
+      });
+    }
   }
 
   function logLine(cls, html) {
@@ -158,10 +207,15 @@
     cancelRunning();
     const ctl = (controller = new AbortController());
     const me = (running = { jobId: null });
-    resetRun(query);
+    const parent = current && current.saved && !els.followWrap.hidden && els.follow.checked ? current.id : null;
+    resetRun(parent ? `↳ ${query}` : query);
     setBusy(true);
     const depth = document.querySelector('input[name="depth"]:checked').value;
     const body = { query, depth, save: els.save.checked };
+    if (parent) body.report = parent;
+    // the question now shows as the heading; clear the box for the next (follow-up) question
+    els.q.value = "";
+    els.q.style.height = "auto";
     const model = store.get("model", "");
     if (model) body.model = model;
 
@@ -199,8 +253,10 @@
         case "done": {
           finished = true;
           const r = data.result;
-          current = { markdown: r.markdown, id: r.id };
+          current = { markdown: r.markdown, id: r.id, saved: !!r.report_path };
           renderMarkdown(r.markdown);
+          if (current.saved) decorateSources(r.id);
+          setFollowable(current);
           showStats(r);
           showNotice(r.warnings, r.degraded);
           els.toolbar.hidden = false;
@@ -273,8 +329,10 @@
       resetRun(r.query);
       showTriage(r.triage);
       els.activity.hidden = true;
-      current = { markdown: r.markdown, id: r.id };
+      current = { markdown: r.markdown, id: r.id, saved: true };
       renderMarkdown(r.markdown);
+      decorateSources(r.id);
+      setFollowable(current);
       showStats(r);
       showNotice(r.warnings, r.degraded);
       els.toolbar.hidden = false;
@@ -342,6 +400,8 @@
   $("#new-btn").addEventListener("click", () => {
     cancelRunning();
     setBusy(false);
+    current = null;
+    setFollowable(null);
     els.run.hidden = true; els.welcome.hidden = false; els.q.value = ""; els.q.focus();
     document.body.classList.remove("menu-open");
   });
@@ -372,6 +432,7 @@
     loadHistory();
   });
   els.save.checked = store.get("save", "1") === "1";
+  els.follow.addEventListener("change", updatePlaceholder);
 
   checkHealth();
   loadHistory();

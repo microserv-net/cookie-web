@@ -1,7 +1,7 @@
 //! The research engine: triage → gather (agent loop or deep pipeline) → write → cite.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -23,7 +23,10 @@ use crate::{
     report::{self, ReportStore},
     research,
     sources::Source,
-    tools::{Registry, ToolCtx, ToolOutput, extract::truncate_chars},
+    tools::{
+        Registry, ToolCtx, ToolOutput,
+        extract::{Page, truncate_chars},
+    },
 };
 
 /// What a caller asks for.
@@ -40,6 +43,17 @@ pub struct ResearchRequest {
     /// Persist the report to the reports directory (default true).
     #[serde(default = "yes")]
     pub save: bool,
+    /// Follow up on this earlier report (its id): the query is answered from that report's sources
+    /// first, keeping its citation numbers. `@3` in the query is short for `sources: [3]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    /// With `report`: only use these sources of the report (by citation number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<usize>>,
+    /// With `report`: `auto` (default — search the web only if the report's sources don't cover the
+    /// question, never when `sources` is given), `never` or `always`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<String>,
 }
 
 fn yes() -> bool {
@@ -48,7 +62,7 @@ fn yes() -> bool {
 
 impl ResearchRequest {
     pub fn new(query: impl Into<String>) -> Self {
-        Self { query: query.into(), depth: None, model: None, save: true }
+        Self { query: query.into(), depth: None, model: None, save: true, report: None, sources: None, web: None }
     }
 }
 
@@ -86,6 +100,9 @@ pub struct ResearchResult {
     /// sources found instead.
     #[serde(default)]
     pub degraded: bool,
+    /// For a follow-up: the id of the report it follows up on (its sources keep their numbers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follows: Option<String>,
 }
 
 /// A labelled chunk of gathered material handed to the writer.
@@ -115,6 +132,12 @@ pub struct Run<'a> {
     /// Soft deadline for gathering: past it, research stops and the answer is written.
     pub deadline: Instant,
     pub warnings: Mutex<Vec<String>>,
+    /// Full pages known to this run (normalised URL → page), e.g. a parent report's stored pages.
+    pub pages: Mutex<HashMap<String, Arc<Page>>>,
+    /// Extra context for the writer (a follow-up's earlier question).
+    pub context: Option<String>,
+    /// The request as the caller wrote it, when the model sees a rewritten version (follow-ups).
+    pub title: Option<String>,
 }
 
 impl Run<'_> {
@@ -211,6 +234,9 @@ impl Engine {
             bail!("query is too long (max 4000 characters)");
         }
         let today = created_at.format("%A, %B %-d, %Y").to_string();
+        if req.report.is_some() {
+            return crate::followup::run(self, req, events, started, created_at, today).await;
+        }
 
         // 1. Triage ------------------------------------------------------------
         let forced = req.depth.as_deref().filter(|d| !d.eq_ignore_ascii_case("auto")).and_then(Depth::parse);
@@ -240,6 +266,9 @@ impl Engine {
             query: clean_query.clone(),
             deadline: started + gather,
             warnings: Mutex::new(vec![]),
+            pages: Mutex::new(HashMap::new()),
+            context: None,
+            title: None,
         };
 
         // 2. Gather -----------------------------------------------------------
@@ -254,12 +283,31 @@ impl Engine {
             );
         }
 
+        self.finish(&run, triage, &profile, clean_query, &evidence, &req, started, created_at, None).await
+    }
+
+    /// Write, clean up, cite, assemble and save. `follows` = the parent report of a follow-up, whose
+    /// citation numbers are kept (a normal answer is renumbered 1, 2, 3… in citation order instead).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finish(
+        &self,
+        run: &Run<'_>,
+        triage: Triage,
+        profile: &Profile,
+        clean_query: String,
+        evidence: &[Evidence],
+        req: &ResearchRequest,
+        started: Instant,
+        created_at: DateTime<Utc>,
+        follows: Option<String>,
+    ) -> anyhow::Result<ResearchResult> {
+        let events = &run.events;
         // 3. Write ------------------------------------------------------------
         events.status("Writing the answer");
-        let (raw, degraded) = self.write_answer(&run, &triage, &profile, &clean_query, &evidence).await;
+        let (raw, degraded) = self.write_answer(run, &triage, profile, &clean_query, evidence).await;
 
         // 4. Clean up, cite & assemble ------------------------------------------
-        let known = known_urls(&run, &evidence);
+        let known = known_urls(run, evidence);
         let mut body = report::strip_model_sources(&report::normalize_citations(&raw.text));
         let (collapsed, looped) = report::collapse_repeats(&body);
         if looped {
@@ -277,7 +325,7 @@ impl Engine {
         let (markdown, sources) = {
             let mut reg = run.ctx.sources.lock().unwrap();
             // The writer saw only these numbers; anything else it cites is invented.
-            let shown: HashSet<usize> = if degraded { HashSet::new() } else { shown_numbers(&evidence) };
+            let shown: HashSet<usize> = if degraded { HashSet::new() } else { shown_numbers(evidence) };
             let body = report::link_citations(&body, &mut reg, (!degraded).then_some(&shown));
             let extra = match triage.depth {
                 Depth::Quick => 2,
@@ -287,10 +335,15 @@ impl Engine {
             let topic = agent::topic_terms(&clean_query);
             let on_topic = |s: &Source| agent::relevant(&format!("{} {} {}", s.title, s.snippet, s.url), &topic);
             // Number sources 1, 2, 3… in the order the answer cites them, then Further reading.
-            let mut order = report::citation_order(&body);
-            order.extend(report::further_reading(&reg, extra, &on_topic));
-            let map = reg.renumber(&order);
-            let body = report::remap_citations(&body, &map);
+            // A follow-up keeps its parent's numbers, so "[3]" means the same source in both.
+            let body = if follows.is_none() {
+                let mut order = report::citation_order(&body);
+                order.extend(report::further_reading(&reg, extra, &on_topic));
+                let map = reg.renumber(&order);
+                report::remap_citations(&body, &map)
+            } else {
+                body
+            };
             (format!("{}{}", body.trim_end(), report::sources_section(&reg, extra, &on_topic)), reg.all().to_vec())
         };
         if !degraded && !sources.iter().any(|s| s.cited) {
@@ -298,6 +351,7 @@ impl Engine {
         }
 
         let model = req.model.clone().unwrap_or_else(|| self.llm.name());
+        let clean_query = run.title.clone().unwrap_or(clean_query);
         let id = format!(
             "{}-{}-{}",
             created_at.format("%Y%m%d-%H%M%S"),
@@ -325,6 +379,7 @@ impl Engine {
             report_path: None,
             warnings: run.warnings.lock().unwrap().clone(),
             degraded,
+            follows,
         };
         if req.save {
             match self.store.save(&result).await {
@@ -332,11 +387,34 @@ impl Engine {
                     result.report_path = Some(p.display().to_string());
                     // keep the sidecar in sync with the path
                     let _ = self.store.save(&result).await;
+                    // Keep the full text of every page read, for follow-ups and `/sources/{n}`.
+                    let pages = self.pages_of(run, &result.sources);
+                    if !pages.is_empty()
+                        && let Err(e) = self.store.save_pages(&result.id, &pages).await
+                    {
+                        tracing::warn!("could not save source pages: {e:#}");
+                    }
                 }
                 Err(e) => tracing::warn!("could not save report: {e:#}"),
             }
         }
         Ok(result)
+    }
+
+    /// The full pages behind the sources that were read (from this run, or the page cache).
+    fn pages_of(&self, run: &Run<'_>, sources: &[Source]) -> HashMap<usize, Page> {
+        let known = run.pages.lock().unwrap();
+        sources
+            .iter()
+            .filter(|s| s.read)
+            .filter_map(|s| {
+                let page = known
+                    .get(&crate::sources::normalize_url(&s.url))
+                    .cloned()
+                    .or_else(|| self.tools.web.as_ref().and_then(|w| w.cached(&s.url)))?;
+                Some((s.n, (*page).clone()))
+            })
+            .collect()
     }
 
     /// Write the answer, never leaving the caller empty-handed:
@@ -418,8 +496,10 @@ impl Engine {
             target = p.target,
             intent = t.intent.guidance(),
         );
-        let user =
-            format!("Request: {query}\n\n# Research evidence\n\n{evidence}\n---\nWrite the answer to the request now.");
+        let context = run.context.as_deref().map(|c| format!("{c}\n")).unwrap_or_default();
+        let user = format!(
+            "Request: {query}\n{context}\n# Research evidence\n\n{evidence}\n---\nWrite the answer to the request now."
+        );
         let req = ChatRequest::new(vec![Message::system(system), Message::user(user)])
             .max_tokens(p.write_tokens)
             .temperature(temperature)

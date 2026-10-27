@@ -5,25 +5,108 @@ use std::collections::HashSet;
 
 use dom_smoothie::{Config as RConfig, Readability, TextMode};
 use scraper::{Html, Selector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Link {
     pub url: String,
     pub text: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// An image that belongs to a page's main content (or its lead image).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Image {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alt: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Page {
     pub url: String,
     pub title: String,
     pub markdown: String,
+    #[serde(default)]
     pub published: Option<String>,
+    #[serde(default)]
     pub byline: Option<String>,
+    #[serde(default)]
     pub site_name: Option<String>,
+    #[serde(default)]
     pub content_type: String,
     #[serde(skip)]
     pub links: Vec<Link>,
+    /// Images of the main content, lead image first.
+    #[serde(default)]
+    pub images: Vec<Image>,
+}
+
+/// Most images a page keeps (galleries and comment avatars add nothing).
+const MAX_IMAGES: usize = 30;
+
+/// The page's own images: its lead image (`og:image`), then the images inside `content_html`
+/// (the readable main content) — or of the whole page when there is no main content.
+/// Lazy-loading placeholders are resolved to the real `data-src`, tracking pixels and icons skipped.
+pub fn extract_images(full_html: &str, content_html: Option<&str>, base: &str) -> Vec<Image> {
+    let Ok(base) = url::Url::parse(base) else { return vec![] };
+    let mut out: Vec<Image> = vec![];
+    let mut push = |raw: &str, alt: &str| {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.starts_with("data:") || out.len() >= MAX_IMAGES {
+            return;
+        }
+        let Ok(u) = base.join(raw) else { return };
+        if !matches!(u.scheme(), "http" | "https") {
+            return;
+        }
+        let url = u.to_string();
+        let low = url.to_lowercase();
+        if low.contains("blank.gif") || low.contains("spacer.gif") || low.contains("pixel") || low.contains("favicon") {
+            return;
+        }
+        if !out.iter().any(|i| i.url == url) {
+            out.push(Image {
+                url,
+                alt: alt.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect(),
+            });
+        }
+    };
+    let doc = Html::parse_document(full_html);
+    if let Ok(sel) = Selector::parse(r#"meta[property="og:image"], meta[name="twitter:image"]"#)
+        && let Some(m) = doc.select(&sel).next()
+    {
+        push(m.value().attr("content").unwrap_or(""), "");
+    }
+    let body = content_html.map(Html::parse_fragment);
+    let scope = body.as_ref().unwrap_or(&doc);
+    let img = Selector::parse("img").unwrap();
+    for el in scope.select(&img) {
+        let v = el.value();
+        let tiny =
+            |a: &str| v.attr(a).and_then(|x| x.trim_end_matches("px").parse::<u32>().ok()).is_some_and(|n| n <= 32);
+        if tiny("width") || tiny("height") {
+            continue;
+        }
+        let lazy = ["data-src", "data-lazy-src", "data-original", "data-url"].iter().find_map(|a| v.attr(a));
+        let srcset_first = v.attr("srcset").and_then(|s| s.split(',').next()).and_then(|s| s.split_whitespace().next());
+        let src = v.attr("src").filter(|s| !s.starts_with("data:") && !s.contains("blank."));
+        if let Some(u) = lazy.or(src).or(srcset_first) {
+            push(u, v.attr("alt").or(v.attr("title")).unwrap_or(""));
+        }
+    }
+    out
+}
+
+/// Markdown for the model: images become a short `(image: alt)` note (or vanish) — their URLs
+/// cost context and a text model can't look at them anyway.
+pub fn without_images(md: &str) -> String {
+    static IMG: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"!\[([^\]\n]*)\]\([^)\s]+(?:\s+"[^"]*")?\)"#).unwrap());
+    IMG.replace_all(md, |c: &regex::Captures| {
+        let alt = c[1].trim();
+        if alt.is_empty() { String::new() } else { format!("(image: {alt})") }
+    })
+    .into_owned()
 }
 
 const SKIP_TAGS: &[&str] = &[
@@ -45,6 +128,7 @@ pub fn html_to_page(html: &str, url: &str, content_type: &str) -> Page {
 
     match article {
         Some(a) if a.text_content.trim().len() >= 200 => Page {
+            images: extract_images(html, Some(&a.content), url),
             url: url.to_string(),
             title: if a.title.trim().is_empty() { fallback_title() } else { a.title.trim().to_string() },
             markdown: tidy_markdown(&a.text_content),
@@ -58,6 +142,7 @@ pub fn html_to_page(html: &str, url: &str, content_type: &str) -> Page {
             let conv = htmd::HtmlToMarkdown::builder().skip_tags(SKIP_TAGS.to_vec()).build();
             let md = conv.convert(html).unwrap_or_default();
             Page {
+                images: extract_images(html, None, url),
                 url: url.to_string(),
                 title: fallback_title(),
                 markdown: tidy_markdown(&md),
@@ -88,6 +173,7 @@ pub fn pdf_to_page(bytes: &[u8], url: &str) -> Option<Page> {
         site_name: None,
         content_type: "application/pdf".into(),
         links: vec![],
+        images: vec![],
     })
 }
 
@@ -323,6 +409,23 @@ mod tests {
         let ex = focus_excerpt(&md, Some("wireguard handshake"), 600);
         assert!(ex.contains("Noise_IK"));
         assert!(ex.chars().count() <= 700);
+    }
+
+    #[test]
+    fn finds_content_images_and_resolves_lazy_loading() {
+        let html = r#"<html><head><meta property="og:image" content="/lead.jpg"></head><body>
+          <img src="/logo.png" width="24"><article><p>text</p>
+          <img src="https://cdn.x/blank.gif" data-src="/real.jpg" alt="The real one">
+          <img srcset="/a-400.jpg 400w, /a-800.jpg 800w" alt="srcset">
+          <img src="data:image/gif;base64,AAAA"></article></body></html>"#;
+        let imgs = extract_images(html, None, "https://example.com/post");
+        let urls: Vec<&str> = imgs.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://example.com/lead.jpg", "https://example.com/real.jpg", "https://example.com/a-400.jpg"]
+        );
+        assert_eq!(imgs[1].alt, "The real one");
+        assert_eq!(without_images("a ![x y](https://i/1.png \"t\") b ![](https://i/2.png) c"), "a (image: x y) b  c");
     }
 
     #[test]

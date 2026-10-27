@@ -44,6 +44,26 @@ enum Cmd {
         /// Don't save into the reports directory.
         #[arg(long)]
         no_save: bool,
+        /// Follow up on an earlier report (its id); `@3` in the question targets source [3].
+        #[arg(long)]
+        follow: Option<String>,
+        /// With --follow: only these sources, e.g. 1,3
+        #[arg(long, value_delimiter = ',')]
+        sources: Option<Vec<usize>>,
+        /// With --follow: auto | never | always search the web
+        #[arg(long)]
+        web: Option<String>,
+    },
+    /// Print the full content of source N of a saved report (read and stored on first use).
+    Source {
+        report: String,
+        n: usize,
+        /// Only the passages relevant to this
+        #[arg(long)]
+        focus: Option<String>,
+        /// Plain text instead of Markdown
+        #[arg(long)]
+        text: bool,
     },
     /// Check Ollama, the model and the search backends.
     Doctor,
@@ -108,7 +128,22 @@ async fn main() -> anyhow::Result<()> {
             }
             cookie_web::server::serve(engine).await
         }
-        Cmd::Ask { query, depth, model, out, json, no_save } => {
+        Cmd::Source { report, n, focus, text } => {
+            let engine = build_engine(Arc::new(cfg))?;
+            let r = engine.store.get(&report).await.ok_or_else(|| anyhow::anyhow!("no report '{report}'"))?;
+            let page = cookie_web::followup::source_page(&engine, &r, n).await?;
+            let md = match focus.as_deref() {
+                Some(f) => cookie_web::tools::extract::focus_excerpt(&page.markdown, Some(f), 12_000),
+                None => page.markdown.clone(),
+            };
+            let body = format!("# {}\n\nSource [{n}]: {}\n\n{md}", page.title, page.url);
+            println!("{}", if text { cookie_web::report::md_to_text(&body) } else { body });
+            for (i, img) in page.images.iter().enumerate() {
+                eprintln!("image {}: {} {}", i + 1, img.url, img.alt);
+            }
+            Ok(())
+        }
+        Cmd::Ask { query, depth, model, out, json, no_save, follow, sources, web } => {
             let q = query.join(" ");
             if q.trim().is_empty() {
                 anyhow::bail!("usage: cookie-web ask <question>");
@@ -139,7 +174,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             });
-            let req = ResearchRequest { query: q, depth: Some(depth), model, save: !no_save };
+            let req =
+                ResearchRequest { query: q, depth: Some(depth), model, save: !no_save, report: follow, sources, web };
             let result = engine.run(req, Events::new(tx)).await;
             let _ = printer.await;
             let result = result?;

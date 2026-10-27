@@ -135,6 +135,25 @@ impl SourceRegistry {
         n
     }
 
+    /// Start from an earlier report's sources, keeping their numbers (for follow-ups).
+    /// Citation and read marks are cleared: they describe the new answer.
+    pub fn from_sources(sources: &[Source]) -> Self {
+        let mut items: Vec<Source> = sources.to_vec();
+        items.sort_by_key(|s| s.n);
+        for (i, s) in items.iter_mut().enumerate() {
+            s.n = i + 1;
+            s.cited = false;
+            s.read = false;
+        }
+        Self { items }
+    }
+
+    pub fn mark_read(&mut self, n: usize) {
+        if let Some(s) = self.items.get_mut(n.wrapping_sub(1)) {
+            s.read = true;
+        }
+    }
+
     pub fn set_date(&mut self, n: usize, date: Option<String>) {
         if let (Some(s), Some(d)) = (self.items.get_mut(n.wrapping_sub(1)), date) {
             s.date = Some(d);

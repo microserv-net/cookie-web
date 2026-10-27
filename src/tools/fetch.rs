@@ -6,7 +6,11 @@ use anyhow::bail;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolCtx, ToolOutput, extract::focus_excerpt, net::Web};
+use super::{
+    Tool, ToolCtx, ToolOutput,
+    extract::{focus_excerpt, without_images},
+    net::Web,
+};
 use crate::sources::SourceKind;
 
 pub struct FetchPage {
@@ -60,13 +64,16 @@ impl Tool for FetchPage {
             }
         };
         let n = ctx.add_source(&page.title, &page.url, "", SourceKind::Page, page.published.clone());
-        let body = focus_excerpt(&page.markdown, focus, ctx.page_chars);
+        let body = focus_excerpt(&without_images(&page.markdown), focus, ctx.page_chars);
         let mut meta = vec![format!("URL: {}", page.url)];
         if let Some(d) = &page.published {
             meta.push(format!("Published: {d}"));
         }
         if let Some(b) = &page.byline {
             meta.push(format!("By: {b}"));
+        }
+        if !page.images.is_empty() {
+            meta.push(format!("{} images", page.images.len()));
         }
         let text = format!("[{n}] {}\n{}\n\n{}", page.title, meta.join(" | "), body);
         let words = page.markdown.split_whitespace().count();

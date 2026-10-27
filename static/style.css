@@ -211,3 +211,14 @@ dialog menu { padding: 0; margin: 16px 0 0; text-align: right; }
   #menu-btn { display: inline-block; }
   #welcome, #run, #composer { padding-left: 16px; padding-right: 16px; }
 }
+
+/* follow-ups */
+.follow { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px 12px; font-size: 13px; color: var(--muted); cursor: pointer; vertical-align: top; padding-top: 6px; }
+.follow[hidden] { display: none; }
+.follow input { accent-color: var(--accent); margin: 0; }
+.src-tools { margin-left: 8px; font-size: 12px; white-space: nowrap; }
+.src-tools a, .src-tools button {
+  font: 500 11px var(--mono); color: var(--muted); background: var(--chip); border: 0;
+  border-radius: 4px; padding: 1px 6px; margin-left: 4px; cursor: pointer; text-decoration: none;
+}
+.src-tools a:hover, .src-tools button:hover { color: var(--accent); }

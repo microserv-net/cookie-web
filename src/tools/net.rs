@@ -243,8 +243,22 @@ impl Web {
             Err(e) => return Err(e),
         };
         let page = Arc::new(page);
+        let final_key = crate::sources::normalize_url(&page.url);
+        if final_key != key {
+            self.pages.put(final_key, page.clone());
+        }
         self.pages.put(key, page.clone());
         Ok(page)
+    }
+
+    /// A page this process read recently (by requested or final URL), without fetching.
+    pub fn cached(&self, url: &str) -> Option<Arc<Page>> {
+        self.pages.get(&crate::sources::normalize_url(url))
+    }
+
+    /// Put a page (e.g. one stored with a report) into the cache.
+    pub fn remember(&self, url: &str, page: Arc<Page>) {
+        self.pages.put(crate::sources::normalize_url(url), page);
     }
 
     async fn read_page(&self, raw: &str) -> anyhow::Result<Page> {
@@ -409,6 +423,7 @@ async fn bytes_to_page(final_url: String, ctype: String, body: Vec<u8>) -> anyho
             site_name: None,
             content_type: ctype,
             links: vec![],
+            images: vec![],
         });
     }
     bail!("unsupported content type '{ctype}' at {final_url}")
@@ -440,6 +455,7 @@ mod tests {
             site_name: None,
             content_type: "text/html".into(),
             links: vec![],
+            images: vec![],
         };
         assert!(blocked_page(&page("Just a moment...", "Checking your browser before accessing x.com.")).is_some());
         assert!(blocked_page(&page("Welcome to Reddit", "Skip to main content")).is_some());

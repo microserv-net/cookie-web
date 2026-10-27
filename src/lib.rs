@@ -28,6 +28,7 @@ pub mod config;
 pub mod depth;
 pub mod engine;
 pub mod events;
+pub mod followup;
 pub mod llm;
 pub mod report;
 pub mod research;

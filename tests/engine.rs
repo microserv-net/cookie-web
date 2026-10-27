@@ -13,7 +13,15 @@ async fn run(
 ) -> (cookie_web::engine::ResearchResult, Vec<Event>, Vec<String>) {
     let (engine, llm) = common::engine(native, "engine");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let req = ResearchRequest { query: query.into(), depth: depth.map(String::from), model: None, save: true };
+    let req = ResearchRequest {
+        query: query.into(),
+        depth: depth.map(String::from),
+        model: None,
+        save: true,
+        report: None,
+        sources: None,
+        web: None,
+    };
     let result = engine.run(req, Events::new(tx)).await.expect("run ok");
     let mut events = vec![];
     while let Ok(e) = rx.try_recv() {
@@ -87,7 +95,15 @@ async fn bang_prefix_overrides_depth() {
 async fn rejects_bad_input() {
     let (engine, _) = common::engine(true, "bad");
     assert!(engine.run(ResearchRequest::new("   "), Events::none()).await.is_err());
-    let req = ResearchRequest { query: "x".into(), depth: Some("ultra".into()), model: None, save: false };
+    let req = ResearchRequest {
+        query: "x".into(),
+        depth: Some("ultra".into()),
+        model: None,
+        save: false,
+        report: None,
+        sources: None,
+        web: None,
+    };
     assert!(engine.run(req, Events::none()).await.is_err());
 }
 
@@ -101,6 +117,9 @@ async fn pipeline_mode_skips_model_tool_rounds() {
         depth: Some("standard".into()),
         model: None,
         save: false,
+        report: None,
+        sources: None,
+        web: None,
     };
     let r = engine.run(req, Events::none()).await.unwrap();
     let log = llm.log.lock().unwrap().clone();
