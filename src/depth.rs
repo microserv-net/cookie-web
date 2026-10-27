@@ -1,0 +1,377 @@
+//! "Severity" triage: decide how much research a request deserves.
+//!
+//! `VisionQuest` → quick (a short answer + links).
+//! `how do I set up wireguard on ubuntu` → standard.
+//! `write a detailed report comparing open-weight LLMs for coding` → deep.
+//!
+//! Strategy: cheap heuristics first; if they are not confident, ask the
+//! (fast) model for a structured classification; fall back to heuristics.
+
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::llm::{ChatModel, ChatRequest, Message, Tier, parse_json_loose};
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Depth {
+    Quick,
+    #[default]
+    Standard,
+    Deep,
+}
+
+impl Depth {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "quick" | "brief" | "short" | "1" => Some(Self::Quick),
+            "standard" | "normal" | "medium" | "2" => Some(Self::Standard),
+            "deep" | "report" | "research" | "long" | "3" => Some(Self::Deep),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Standard => "standard",
+            Self::Deep => "deep",
+        }
+    }
+    pub fn profile(&self) -> Profile {
+        match self {
+            Self::Quick => Profile {
+                max_steps: 3,
+                max_fetches: 1,
+                results_per_search: 6,
+                page_chars: 4_000,
+                evidence_chars: 9_000,
+                write_tokens: 700,
+                target: "A direct answer in one or two short paragraphs (roughly 60-180 words). \
+                         Then a `**Links**` list with the 3-5 most useful links as `- [Title](url) — why it's useful`. \
+                         No other headings.",
+            },
+            Self::Standard => Profile {
+                max_steps: 6,
+                max_fetches: 4,
+                results_per_search: 8,
+                page_chars: 7_000,
+                evidence_chars: 22_000,
+                write_tokens: 1_800,
+                target: "A well-structured answer of roughly 300-700 words: start with a one-paragraph direct answer, \
+                         then a few `##` sections with bullets where they help. Inline citations throughout.",
+            },
+            Self::Deep => Profile {
+                max_steps: 10,
+                max_fetches: 10,
+                results_per_search: 8,
+                page_chars: 10_000,
+                evidence_chars: 40_000,
+                write_tokens: 4_500,
+                target: "A full research report of roughly 1200-2500 words. Start with `# <Title>`, then a \
+                         `## TL;DR` of 3-5 bullets, then thematic `##` sections, a comparison table if \
+                         things are being compared, and a final `## Caveats & open questions` section. \
+                         Inline citations on every factual claim.",
+            },
+        }
+    }
+}
+
+/// Budgets and output targets for a depth level.
+#[derive(Clone, Debug)]
+pub struct Profile {
+    /// Max agent-loop iterations (model turns that may call tools).
+    pub max_steps: usize,
+    /// Max full-page reads.
+    pub max_fetches: usize,
+    pub results_per_search: usize,
+    /// Max characters of a page handed to the model.
+    pub page_chars: usize,
+    /// Max characters of evidence given to the writer.
+    pub evidence_chars: usize,
+    pub write_tokens: u32,
+    /// Formatting brief for the writer.
+    pub target: &'static str,
+}
+
+/// What kind of request this is; shapes the output format.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Intent {
+    /// A name/term/thing: "VisionQuest", "who is Ada Lovelace".
+    Entity,
+    /// A specific factual question.
+    #[default]
+    Fact,
+    /// Current events / latest news.
+    News,
+    /// Instructions: "how to …".
+    Howto,
+    /// A vs B.
+    Compare,
+    /// Open-ended research / analysis.
+    Research,
+    /// The user wants links/resources/downloads.
+    Links,
+}
+
+impl Intent {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "entity" => Self::Entity,
+            "news" => Self::News,
+            "howto" | "how_to" | "how-to" => Self::Howto,
+            "compare" | "comparison" => Self::Compare,
+            "research" => Self::Research,
+            "links" | "resources" => Self::Links,
+            _ => Self::Fact,
+        }
+    }
+    /// Extra formatting guidance for the writer.
+    pub fn guidance(&self) -> &'static str {
+        match self {
+            Self::Entity => {
+                "Say clearly what the term most likely refers to. If it is ambiguous, list the main meanings briefly."
+            }
+            Self::Fact => "Lead with the exact answer, then the supporting context.",
+            Self::News => {
+                "Lead with the latest developments, always with dates. Prefer the most recent sources and say how recent they are."
+            }
+            Self::Howto => {
+                "Give numbered, copy-pasteable steps (use fenced code blocks for commands). Mention prerequisites and common pitfalls."
+            }
+            Self::Compare => {
+                "Include a Markdown comparison table of the key dimensions, then a short recommendation by use-case."
+            }
+            Self::Research => {
+                "Synthesise across sources, note where they agree or disagree, and quantify where possible."
+            }
+            Self::Links => {
+                "Lead with a curated list of the best links, each as `- [Title](url) — one line on what it is`. Prefer official/primary sources."
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Triage {
+    pub depth: Depth,
+    pub intent: Intent,
+    /// A search-engine-ready version of the request.
+    pub search_query: String,
+    pub reason: String,
+    /// "user", "heuristic" or "model".
+    pub decided_by: String,
+}
+
+const DEEP_MARKERS: &[&str] = &[
+    "report",
+    "research",
+    "in-depth",
+    "in depth",
+    "deep dive",
+    "deep-dive",
+    "comprehensive",
+    "thorough",
+    "detailed",
+    "literature",
+    "analysis",
+    "analyse",
+    "analyze",
+    "landscape",
+    "state of the art",
+    "state-of-the-art",
+    "everything about",
+    "pros and cons",
+    "market",
+    "white paper",
+    "whitepaper",
+    "survey of",
+    "overview of",
+    "explain in detail",
+];
+const COMPARE_MARKERS: &[&str] =
+    &[" vs ", " vs. ", " versus ", "compare", "comparison", "difference between", "better than", "alternatives to"];
+const NEWS_MARKERS: &[&str] =
+    &["news", "latest", "today", "this week", "recent", "announced", "just released", "update on", "current status"];
+const HOWTO_MARKERS: &[&str] = &[
+    "how to",
+    "how do i",
+    "how can i",
+    "how should i",
+    "steps to",
+    "guide",
+    "tutorial",
+    "install",
+    "set up",
+    "setup",
+    "configure",
+    "fix ",
+    "error",
+];
+const LINK_MARKERS: &[&str] = &[
+    "link",
+    "links",
+    "download",
+    "resources",
+    "where can i find",
+    "official site",
+    "documentation for",
+    "docs for",
+    "pdf",
+    "github repo",
+];
+const QUESTION_WORDS: &[&str] =
+    &["what", "who", "when", "where", "which", "why", "how", "is", "are", "does", "do", "can", "should", "will", "did"];
+
+fn has_any(hay: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| hay.contains(n))
+}
+
+/// Explicit user overrides: a leading `!quick`, `!standard` or `!deep` token.
+pub fn split_override(query: &str) -> (Option<Depth>, String) {
+    let q = query.trim();
+    if let Some(rest) = q.strip_prefix('!') {
+        let (word, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        if let Some(d) = Depth::parse(word) {
+            return (Some(d), tail.trim().to_string());
+        }
+    }
+    (None, q.to_string())
+}
+
+/// Fast rule-based triage. Returns `(triage, confident)`.
+pub fn heuristic(query: &str) -> (Triage, bool) {
+    let q = format!(" {} ", query.trim().to_lowercase());
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let n = words.len();
+    let first = words.first().map(|w| w.to_lowercase()).unwrap_or_default();
+    let is_question = query.contains('?') || QUESTION_WORDS.contains(&first.as_str());
+
+    let intent = if has_any(&q, COMPARE_MARKERS) {
+        Intent::Compare
+    } else if has_any(&q, LINK_MARKERS) {
+        Intent::Links
+    } else if has_any(&q, HOWTO_MARKERS) {
+        Intent::Howto
+    } else if has_any(&q, NEWS_MARKERS) {
+        Intent::News
+    } else if has_any(&q, DEEP_MARKERS) {
+        Intent::Research
+    } else if n <= 4 && !is_question {
+        Intent::Entity
+    } else {
+        Intent::Fact
+    };
+
+    let mk = |depth: Depth, reason: &str| Triage {
+        depth,
+        intent,
+        search_query: query.trim().trim_end_matches('?').to_string(),
+        reason: reason.to_string(),
+        decided_by: "heuristic".into(),
+    };
+
+    if has_any(&q, DEEP_MARKERS) || (n >= 25) {
+        return (mk(Depth::Deep, "asks for an in-depth report/analysis"), true);
+    }
+    if n <= 3 && !is_question {
+        return (mk(Depth::Quick, "a bare word/phrase: identify it and point to the best links"), true);
+    }
+    if intent == Intent::Compare {
+        return (mk(Depth::Standard, "a comparison needs several sources"), n >= 4);
+    }
+    if is_question && n <= 8 && matches!(intent, Intent::Fact | Intent::Entity) {
+        return (mk(Depth::Quick, "a short factual question"), false);
+    }
+    (mk(Depth::Standard, "a normal question"), false)
+}
+
+/// Full triage: override → confident heuristic → model → heuristic fallback.
+pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> Triage {
+    let (forced, clean) = split_override(query);
+    let (mut h, confident) = heuristic(&clean);
+    if let Some(d) = forced {
+        h.depth = d;
+        h.reason = "set explicitly by the user".into();
+        h.decided_by = "user".into();
+        return h;
+    }
+    if confident {
+        return h;
+    }
+
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "depth": { "type": "string", "enum": ["quick", "standard", "deep"] },
+            "intent": { "type": "string", "enum": ["entity", "fact", "news", "howto", "compare", "research", "links"] },
+            "search_query": { "type": "string" },
+            "reason": { "type": "string" }
+        },
+        "required": ["depth", "intent", "search_query", "reason"]
+    });
+    let sys = format!(
+        "You triage requests for a web research assistant. Today is {today}.\n\
+         Decide how much research the request deserves:\n\
+         - quick: a word, name, definition or a simple fact. Answer in a few sentences + links.\n\
+         - standard: a normal question, how-to, or small comparison. About one page.\n\
+         - deep: the user explicitly wants a report/analysis, or the topic needs many sources to answer well.\n\
+         Never inflate: short inputs get short answers.\n\
+         Also give the intent and a concise web search query (keywords, no quotes, keep names exact).\n\
+         Reply with JSON only."
+    );
+    let req = ChatRequest::new(vec![Message::system(sys), Message::user(clean.clone())])
+        .tier(Tier::Fast)
+        .json(schema)
+        .temperature(0.0)
+        .max_tokens(200);
+    match llm.chat(req).await.ok().and_then(|m| parse_json_loose(&m.content)) {
+        Some(v) => {
+            let depth = v["depth"].as_str().and_then(Depth::parse).unwrap_or(h.depth);
+            let sq = v["search_query"].as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() < 300);
+            Triage {
+                depth,
+                intent: v["intent"].as_str().map(Intent::parse).unwrap_or(h.intent),
+                search_query: sq.map(String::from).unwrap_or(h.search_query),
+                reason: v["reason"].as_str().unwrap_or("model decision").chars().take(240).collect(),
+                decided_by: "model".into(),
+            }
+        }
+        None => h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_word_is_quick() {
+        let (t, c) = heuristic("VisionQuest");
+        assert_eq!(t.depth, Depth::Quick);
+        assert_eq!(t.intent, Intent::Entity);
+        assert!(c);
+    }
+
+    #[test]
+    fn report_is_deep() {
+        let (t, c) = heuristic("write a detailed report on solid state batteries");
+        assert_eq!(t.depth, Depth::Deep);
+        assert!(c);
+    }
+
+    #[test]
+    fn compare_is_standard() {
+        let (t, _) = heuristic("rust vs go for web servers");
+        assert_eq!(t.intent, Intent::Compare);
+        assert_eq!(t.depth, Depth::Standard);
+    }
+
+    #[test]
+    fn override_prefix() {
+        let (d, q) = split_override("!deep VisionQuest");
+        assert_eq!(d, Some(Depth::Deep));
+        assert_eq!(q, "VisionQuest");
+        assert_eq!(split_override("!bang thing").0, None);
+    }
+}
