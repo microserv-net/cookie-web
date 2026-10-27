@@ -245,6 +245,8 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
         "search_mode": format!("{:?}", st.engine.cfg.search_mode).to_lowercase(),
         "jobs_running": st.jobs.lock().unwrap().values().filter(|j| j.status() == JobStatus::Running).count(),
         "max_concurrent": st.engine.cfg.max_concurrent,
+        "num_ctx": st.engine.cfg.num_ctx,
+        "agent_mode": format!("{:?}", st.engine.cfg.agent_mode).to_lowercase(),
         "auth_required": st.engine.cfg.api_key.is_some(),
     }))
 }

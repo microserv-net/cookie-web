@@ -83,6 +83,29 @@ async fn main() -> anyhow::Result<()> {
             } else if !info.supports_tools {
                 tracing::warn!("model {} has no native tool calling; using the JSON fallback protocol", info.model);
             }
+            if engine.cfg.warmup && info.available {
+                let e = engine.clone();
+                tokio::spawn(async move {
+                    let t = std::time::Instant::now();
+                    match e.llm.warmup().await {
+                        Ok(()) => {
+                            let mem = e
+                                .llm
+                                .info()
+                                .await
+                                .memory_bytes
+                                .map(|b| format!(" — {:.2} GB in memory", b as f64 / 1e9));
+                            tracing::info!(
+                                "model {} loaded in {:.1}s{}",
+                                e.cfg.model,
+                                t.elapsed().as_secs_f64(),
+                                mem.unwrap_or_default()
+                            );
+                        }
+                        Err(err) => tracing::warn!("warm-up failed: {err:#}"),
+                    }
+                });
+            }
             cookie_web::server::serve(engine).await
         }
         Cmd::Ask { query, depth, model, out, json, no_save } => {
@@ -166,6 +189,11 @@ async fn doctor(cfg: Config) -> anyhow::Result<()> {
     println!("  {} reachable", mark(info.reachable));
     println!("  {} model {} pulled", mark(info.available), info.model);
     println!("  {} native tool calling", mark(info.supports_tools));
+    println!("  context {} tokens · keep_alive {} · agent mode {:?}", cfg.num_ctx, cfg.keep_alive, cfg.agent_mode);
+    match (info.loaded, info.memory_bytes) {
+        (true, Some(b)) => println!("  ✓ loaded — {:.2} GB in memory (weights + KV cache)", b as f64 / 1e9),
+        _ => println!("  · not loaded right now (it loads on the first request or at `serve` start)"),
+    }
     if let Some(e) = &info.error {
         println!("  ! {e}");
     }

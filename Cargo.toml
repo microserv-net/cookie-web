@@ -30,3 +30,9 @@ uuid = { version = "1.29.0", features = ["v4"] }
 [dev-dependencies]
 http-body-util = "0.1.5"
 tower = "0.5.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"

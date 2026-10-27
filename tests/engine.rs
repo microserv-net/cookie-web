@@ -90,3 +90,21 @@ async fn rejects_bad_input() {
     let req = ResearchRequest { query: "x".into(), depth: Some("ultra".into()), model: None, save: false };
     assert!(engine.run(req, Events::none()).await.is_err());
 }
+
+#[tokio::test]
+async fn pipeline_mode_skips_model_tool_rounds() {
+    let mut cfg = cookie_web::config::Config::for_tests(common::tmp_dir("pipeline"));
+    cfg.agent_mode = cookie_web::config::AgentMode::Pipeline;
+    let (engine, llm) = common::engine_with(true, cfg);
+    let req = ResearchRequest {
+        query: "how does the fake thing work in practice today".into(),
+        depth: Some("standard".into()),
+        model: None,
+        save: false,
+    };
+    let r = engine.run(req, Events::none()).await.unwrap();
+    let log = llm.log.lock().unwrap().clone();
+    assert!(!log.iter().any(|l| l.starts_with("agent")), "{log:?}");
+    assert!(r.stats.pages_read >= 2, "code still reads the top results");
+    assert!(r.markdown.contains("## Sources"));
+}

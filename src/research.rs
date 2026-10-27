@@ -18,6 +18,10 @@ use crate::{
     tools::{extract::truncate_chars, search::Hit},
 };
 
+/// Page text handed to the note-taker. Kept modest: on CPU-only boxes prompt processing
+/// dominates runtime, and focused excerpts already put the relevant passages first.
+const NOTE_INPUT_CHARS: usize = 6_000;
+
 struct Plan {
     sub_questions: Vec<String>,
     queries: Vec<String>,
@@ -155,7 +159,8 @@ async fn read_and_note(run: &Run<'_>, urls: Vec<String>, sub_questions: &[String
         let sys = "You extract research notes. From the source, list up to 8 concise bullet points of concrete facts \
                    relevant to the research question (keep numbers, dates, names, versions; note the source's own caveats). \
                    No intro, no opinions about the source. If nothing is relevant, reply exactly NONE.";
-        let user = format!("Research question: {}{subs}\n\nSource:\n{}", run.query, truncate_chars(text, 9000));
+        let user =
+            format!("Research question: {}{subs}\n\nSource:\n{}", run.query, truncate_chars(text, NOTE_INPUT_CHARS));
         let req = ChatRequest::new(vec![Message::system(sys), Message::user(user)])
             .tier(Tier::Fast)
             .max_tokens(450)

@@ -87,7 +87,7 @@ impl Ollama {
             "model": model,
             "messages": req.messages,
             "stream": stream,
-            "keep_alive": self.cfg.keep_alive,
+            "keep_alive": self.cfg.keep_alive_json(),
             "options": options,
         });
         if !req.tools.is_empty() && caps.tools {
@@ -189,6 +189,28 @@ impl ChatModel for Ollama {
         Ok(strip_thinking(&full))
     }
 
+    async fn warmup(&self) -> anyhow::Result<()> {
+        // An empty chat loads the model with *our* num_ctx, so the first real request doesn't reload it.
+        let mut models = vec![self.cfg.model.clone()];
+        if self.cfg.fast_model() != self.cfg.model {
+            models.push(self.cfg.fast_model().to_string());
+        }
+        for model in models {
+            let body = json!({
+                "model": model,
+                "messages": [],
+                "keep_alive": self.cfg.keep_alive_json(),
+                "options": { "num_ctx": self.cfg.num_ctx },
+            });
+            let r = self.http.post(self.url("/api/chat")).json(&body).send().await?;
+            if !r.status().is_success() {
+                let v: Value = r.json().await.unwrap_or_default();
+                bail!("could not load {model}: {}", v["error"].as_str().unwrap_or("unknown error"));
+            }
+        }
+        Ok(())
+    }
+
     async fn supports_tools(&self, model: Option<&str>) -> bool {
         let m = model.map(String::from).unwrap_or_else(|| self.cfg.model.clone());
         self.caps(&m).await.tools
@@ -211,6 +233,18 @@ impl ChatModel for Ollama {
                     let c = self.caps(want).await;
                     info.supports_tools = c.tools;
                     info.supports_thinking = c.thinking;
+                    // Actual memory of the loaded model (weights + KV cache + buffers), from /api/ps.
+                    if let Ok(r) = self.http.get(self.url("/api/ps")).timeout(Duration::from_secs(5)).send().await {
+                        let ps: Value = r.json().await.unwrap_or_default();
+                        let full = if want.contains(':') { want.clone() } else { format!("{want}:latest") };
+                        if let Some(m) =
+                            ps["models"].as_array().into_iter().flatten().find(|m| m["name"] == full.as_str())
+                        {
+                            info.loaded = true;
+                            info.memory_bytes = m["size"].as_u64();
+                            info.context_length = m["context_length"].as_u64();
+                        }
+                    }
                 } else {
                     info.error = Some(format!("model '{want}' is not pulled — run: ollama pull {want}"));
                 }

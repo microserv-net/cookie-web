@@ -117,6 +117,13 @@ pub struct ModelInfo {
     pub supports_tools: bool,
     pub supports_thinking: bool,
     pub installed: Vec<String>,
+    /// The model is currently loaded in Ollama.
+    pub loaded: bool,
+    /// Memory used by the loaded model (weights + KV cache + buffers), as reported by Ollama.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -142,6 +149,11 @@ pub trait ChatModel: Send + Sync {
 
     /// Health / capability information.
     async fn info(&self) -> ModelInfo;
+
+    /// Load the model(s) into memory ahead of the first request.
+    async fn warmup(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Strip `<think>…</think>` blocks that some reasoning models leak into content.

@@ -186,7 +186,7 @@ impl Engine {
         }
         let clean_query = depth::split_override(&query).1;
         events.emit(Event::Triage(triage.clone()));
-        let profile: Profile = triage.depth.profile();
+        let profile: Profile = triage.depth.profile().fit_to_context(self.cfg.num_ctx);
 
         let run = Run {
             engine: self,

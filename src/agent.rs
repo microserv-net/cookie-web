@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use crate::{
+    config::AgentMode,
     depth::{Depth, Intent, Profile, Triage},
     engine::{Evidence, Run},
     llm::{ChatRequest, Message, ToolCall, parse_json_loose},
@@ -124,8 +125,8 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
                 text: out.text.clone(),
             });
         }
-        seed_tool_msgs.push(Message::tool(name, truncate_chars(&out.text, 6000)));
-        seed_dump.push_str(&format!("Result of {name} {args}:\n{}\n\n", truncate_chars(&out.text, 6000)));
+        seed_tool_msgs.push(Message::tool(name, truncate_chars(&out.text, p.page_chars)));
+        seed_dump.push_str(&format!("Result of {name} {args}:\n{}\n\n", truncate_chars(&out.text, p.page_chars)));
     }
     if native {
         let mut call_msg = Message::assistant("");
@@ -136,12 +137,17 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
         messages.push(Message::user(seed_dump.clone()));
     }
 
-    // 2. Model-driven rounds.
+    // 2. Model-driven rounds (skipped in pipeline mode).
     let mut use_native = native;
-    for step in 0..p.max_steps {
+    let rounds = if run.engine.cfg.agent_mode == AgentMode::Pipeline { 0 } else { p.max_steps };
+    // Prompt budget for the loop: context minus the reply, tool specs and a safety margin.
+    let loop_budget =
+        (run.engine.cfg.num_ctx.saturating_sub(700 + 1_100) as f64 * crate::depth::CHARS_PER_TOKEN) as usize;
+    for step in 0..rounds {
         if run.ctx.fetches_left() == 0 && step > 0 && t.depth == Depth::Quick {
             break;
         }
+        compact(&mut messages, loop_budget);
         let calls: Vec<(String, Value)> = if use_native {
             let req =
                 ChatRequest::new(messages.clone()).tools(run.engine.tools.specs()).max_tokens(600).temperature(0.2);
@@ -268,6 +274,27 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
     Ok(evidence)
 }
 
+/// Keep the conversation inside the context window: shorten the oldest tool results first
+/// (system prompt, request and the newest result are kept intact).
+pub fn compact(messages: &mut [Message], budget_chars: usize) {
+    let total = |m: &[Message]| m.iter().map(|x| x.content.len() + 40).sum::<usize>();
+    if total(messages) <= budget_chars {
+        return;
+    }
+    let last = messages.len().saturating_sub(1);
+    for keep in [1_200usize, 400] {
+        for i in 2..last {
+            let m = &mut messages[i];
+            if (m.role == "tool" || m.role == "user") && m.content.len() > keep + 100 {
+                m.content = format!("{}\n…[older result shortened to save context]", truncate_chars(&m.content, keep));
+            }
+            if total(messages) <= budget_chars {
+                return;
+            }
+        }
+    }
+}
+
 /// Models sometimes send arguments as a JSON string; normalise to an object.
 fn normalize_args(v: &Value) -> Value {
     match v {
@@ -285,6 +312,23 @@ mod tests {
     fn args_normalised() {
         assert_eq!(normalize_args(&json!("{\"url\":\"https://a\"}"))["url"], "https://a");
         assert_eq!(normalize_args(&json!("plain"))["query"], "plain");
+    }
+
+    #[test]
+    fn compaction_shrinks_oldest_first() {
+        let mut m = vec![
+            Message::system("sys"),
+            Message::user("Request: x"),
+            Message::tool("web_search", "a".repeat(5000)),
+            Message::tool("fetch_page", "b".repeat(5000)),
+            Message::tool("fetch_page", "c".repeat(5000)),
+        ];
+        compact(&mut m, 9_000);
+        let total: usize = m.iter().map(|x| x.content.len() + 40).sum();
+        assert!(total <= 9_000, "{total}");
+        assert!(m[2].content.len() < 1_500);
+        assert_eq!(m[4].content.len(), 5000, "newest result kept intact");
+        assert_eq!(m[0].content, "sys");
     }
 
     #[test]

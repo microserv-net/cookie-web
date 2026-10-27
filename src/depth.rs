@@ -45,7 +45,7 @@ impl Depth {
                 results_per_search: 6,
                 page_chars: 4_000,
                 evidence_chars: 9_000,
-                write_tokens: 700,
+                write_tokens: 600,
                 target: "A direct answer in one or two short paragraphs (roughly 60-180 words). \
                          Then a `**Links**` list with the 3-5 most useful links as `- [Title](url) — why it's useful`. \
                          No other headings.",
@@ -54,9 +54,9 @@ impl Depth {
                 max_steps: 6,
                 max_fetches: 4,
                 results_per_search: 8,
-                page_chars: 7_000,
+                page_chars: 6_000,
                 evidence_chars: 22_000,
-                write_tokens: 1_800,
+                write_tokens: 1_500,
                 target: "A well-structured answer of roughly 300-700 words: start with a one-paragraph direct answer, \
                          then a few `##` sections with bullets where they help. Inline citations throughout.",
             },
@@ -64,15 +64,30 @@ impl Depth {
                 max_steps: 10,
                 max_fetches: 10,
                 results_per_search: 8,
-                page_chars: 10_000,
+                page_chars: 8_000,
                 evidence_chars: 40_000,
-                write_tokens: 4_500,
-                target: "A full research report of roughly 1200-2500 words. Start with `# <Title>`, then a \
+                write_tokens: 3_500,
+                target: "A full research report of roughly 1000-2000 words. Start with `# <Title>`, then a \
                          `## TL;DR` of 3-5 bullets, then thematic `##` sections, a comparison table if \
                          things are being compared, and a final `## Caveats & open questions` section. \
                          Inline citations on every factual claim.",
             },
         }
+    }
+}
+
+/// Rough characters-per-token for web text (conservative, so prompts don't overflow).
+pub const CHARS_PER_TOKEN: f64 = 3.2;
+
+impl Profile {
+    /// Shrink budgets so prompt + answer fit the model's context window (`num_ctx`).
+    /// Ollama silently drops the *start* of an over-long prompt (the instructions!), so this matters.
+    pub fn fit_to_context(mut self, num_ctx: u32) -> Self {
+        self.write_tokens = self.write_tokens.min(num_ctx / 2);
+        let room = num_ctx.saturating_sub(self.write_tokens + 1_000) as f64 * CHARS_PER_TOKEN;
+        self.evidence_chars = self.evidence_chars.min(room as usize).max(3_000);
+        self.page_chars = self.page_chars.min(self.evidence_chars / 2).max(2_000);
+        self
     }
 }
 
@@ -365,6 +380,17 @@ mod tests {
         let (t, _) = heuristic("rust vs go for web servers");
         assert_eq!(t.intent, Intent::Compare);
         assert_eq!(t.depth, Depth::Standard);
+    }
+
+    #[test]
+    fn budgets_fit_small_context() {
+        for d in [Depth::Quick, Depth::Standard, Depth::Deep] {
+            let p = d.profile().fit_to_context(8192);
+            let prompt_tokens = p.evidence_chars as f64 / CHARS_PER_TOKEN + 1_000.0;
+            assert!(prompt_tokens + p.write_tokens as f64 <= 8192.0, "{d:?} overflows: {p:?}");
+        }
+        // a big window keeps the profile's own caps
+        assert_eq!(Depth::Quick.profile().fit_to_context(65536).evidence_chars, 9_000);
     }
 
     #[test]
