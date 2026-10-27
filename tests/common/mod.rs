@@ -122,7 +122,7 @@ impl ChatModel for FakeLlm {
 
     async fn chat_stream(
         &self,
-        _req: ChatRequest,
+        req: ChatRequest,
         on_token: &(dyn for<'t> Fn(&'t str) + Send + Sync),
     ) -> anyhow::Result<Completion> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -142,7 +142,22 @@ impl ChatModel for FakeLlm {
             on_token("Half an ans");
             anyhow::bail!("Ollama stream interrupted (fake)");
         }
-        let answer = self.answer.lock().unwrap().clone();
+        // Like a real writer, cite the numbers the evidence actually shows: [1][2][3] in the scripted
+        // answer stand for the first three numbers in the prompt.
+        let prompt = req.messages.last().map(|m| m.content.clone()).unwrap_or_default();
+        let mut shown: Vec<String> = vec![];
+        for cap in prompt.split('[').skip(1) {
+            if let Some(n) = cap.split(']').next().filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                && !shown.contains(&n.to_string())
+            {
+                shown.push(n.to_string());
+            }
+        }
+        let mut answer = self.answer.lock().unwrap().clone();
+        for (i, n) in shown.iter().take(3).enumerate() {
+            answer = answer.replace(&format!("[{}]", i + 1), &format!("[@{n}]"));
+        }
+        let answer = answer.replace("[@", "[");
         for chunk in answer.split_inclusive(' ') {
             on_token(chunk);
         }

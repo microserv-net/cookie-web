@@ -279,6 +279,53 @@ fn has_any(hay: &str, needles: &[&str]) -> bool {
     })
 }
 
+/// Conversational openers that only hurt as search keywords.
+const LEAD_INS: &[&str] = &[
+    "what can you tell me about",
+    "what do you know about",
+    "can you tell me about",
+    "could you tell me about",
+    "tell me everything about",
+    "tell me about",
+    "i want to know about",
+    "i'd like to know about",
+    "i would like to know about",
+    "give me information on",
+    "give me information about",
+    "give me info on",
+    "give me info about",
+    "find information about",
+    "find information on",
+    "search the web for",
+    "search for",
+    "look up",
+    "find me",
+    "please",
+    "can you",
+    "could you",
+];
+
+/// A search-engine-friendly version of a conversational request (used when the model doesn't
+/// provide one): strips lead-ins like "what can you tell me about", "hint:" labels and the
+/// trailing question mark, keeping names and quoted phrases intact.
+pub fn search_keywords(query: &str) -> String {
+    let mut q = query.trim().to_string();
+    loop {
+        let low = q.to_lowercase();
+        let Some(lead) = LEAD_INS
+            .iter()
+            .find(|l| low.starts_with(*l) && low[l.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric()))
+        else {
+            break;
+        };
+        q = q[lead.len()..].trim_start_matches([' ', ',', ':']).to_string();
+    }
+    let q = q.replace("hint:", " ").replace("Hint:", " ").replace("HINT:", " ");
+    let q: String = q.split_whitespace().collect::<Vec<_>>().join(" ");
+    let q = q.trim_end_matches(['?', '.', '!', ' ']).replace(" ,", ",");
+    if q.trim().is_empty() { query.trim().trim_end_matches('?').to_string() } else { q }
+}
+
 /// Explicit user overrides: a leading `!quick`, `!standard` or `!deep` token.
 pub fn split_override(query: &str) -> (Option<Depth>, String) {
     let q = query.trim();
@@ -318,7 +365,7 @@ pub fn heuristic(query: &str) -> (Triage, bool) {
     let mk = |depth: Depth, reason: &str| Triage {
         depth,
         intent,
-        search_query: query.trim().trim_end_matches('?').to_string(),
+        search_query: search_keywords(query),
         reason: reason.to_string(),
         decided_by: "heuristic".into(),
     };
@@ -450,6 +497,17 @@ mod tests {
         assert!(!confident);
         let (_, confident) = heuristic("give me a detailed report on cancer research funding");
         assert!(confident);
+    }
+
+    #[test]
+    fn conversational_requests_become_keywords() {
+        assert_eq!(
+            search_keywords("what can you tell me about \"stares motherfuckingly\", hint: samuel l jackson"),
+            "\"stares motherfuckingly\", samuel l jackson"
+        );
+        assert_eq!(search_keywords("Please look up the WireGuard docs?"), "the WireGuard docs");
+        assert_eq!(search_keywords("who is Ada Lovelace?"), "who is Ada Lovelace");
+        assert_eq!(search_keywords("please?"), "please");
     }
 
     #[test]

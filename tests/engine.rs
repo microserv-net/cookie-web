@@ -54,7 +54,7 @@ async fn standard_uses_native_tool_calls() {
     assert!(log.contains(&"agent-native".to_string()));
     assert!(r.sources.iter().any(|s| s.url == "https://example.com/a" && s.read), "model-requested page was read");
     assert!(r.stats.pages_read >= 2, "deterministic floor reads at least 2 pages: {:?}", r.stats);
-    assert!(r.sources.iter().any(|s| s.cited));
+    assert!(r.sources.iter().any(|s| s.cited), "{}\n{:?}", r.markdown, r.warnings);
 }
 
 #[tokio::test]

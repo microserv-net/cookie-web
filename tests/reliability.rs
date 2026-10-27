@@ -176,3 +176,61 @@ async fn nothing_found_anywhere_is_a_clear_error() {
     let err = engine.run(req("nothing at all here", Some("quick")), Events::none()).await.unwrap_err();
     assert!(format!("{err}").contains("even after rephrasing"), "{err}");
 }
+
+/// Search that answers conversational queries with junk (like a real engine misreading them)
+/// and the rephrased query with the real thing.
+struct Misreading;
+
+#[async_trait::async_trait]
+impl cookie_web::tools::Tool for Misreading {
+    fn name(&self) -> &'static str {
+        "web_search"
+    }
+    fn description(&self) -> &'static str {
+        "search"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"query":{"type":"string"}}})
+    }
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &cookie_web::tools::ToolCtx,
+    ) -> anyhow::Result<cookie_web::tools::ToolOutput> {
+        let q = args["query"].as_str().unwrap_or("");
+        let hits: Vec<(String, String)> = if q.contains("rescued") {
+            vec![("Glorbix the purple wombat, explained".into(), "https://wiki.example/glorbix".into())]
+        } else {
+            (1..=4).map(|i| (format!("Online design tool {i}"), format!("https://design{i}.example/"))).collect()
+        };
+        let mut text = String::new();
+        let mut data = vec![];
+        for (title, url) in hits {
+            let n = ctx.add_source(&title, &url, "", cookie_web::sources::SourceKind::Search, None);
+            text.push_str(&format!("[{n}] {title}\n"));
+            data.push(serde_json::json!({ "title": title, "url": url, "snippet": "", "engine": "fake" }));
+        }
+        Ok(cookie_web::tools::ToolOutput::new(text, "results").with_data(serde_json::json!({ "hits": data })))
+    }
+}
+
+#[tokio::test]
+async fn off_topic_results_trigger_a_rescue_and_are_set_aside() {
+    let mut tools = Registry::new();
+    tools.add(Misreading);
+    tools.add(FakeFetch(None));
+    let llm = Arc::new(FakeLlm::new(true));
+    let (res, _, log) = run_with(
+        llm,
+        tools,
+        cfg("offtopic"),
+        req("what can you tell me about glorbix the purple wombat", Some("quick")),
+    )
+    .await;
+    let r = res.unwrap();
+    assert!(log.contains(&"rephrase".to_string()), "{log:?}");
+    let further = r.markdown.split("## Sources").nth(1).unwrap();
+    assert!(!further.contains("design1.example"), "off-topic results not listed: {further}");
+    assert!(r.sources.iter().any(|s| s.url == "https://wiki.example/glorbix" && s.cited), "{:?}", r.sources);
+    assert!(!r.sources.iter().any(|s| s.url.contains("design") && s.cited), "off-topic results can't be cited");
+}

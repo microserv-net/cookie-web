@@ -164,7 +164,14 @@ pub fn finish_truncated(md: &str) -> String {
 /// Turn `[3]`, `[1, 2]` and `[1][4]` into clickable `[[3]](url)` links.
 /// Numbers that don't match a source are dropped. Marks used sources as cited.
 /// Existing Markdown links `[text](url)` are untouched.
-pub fn link_citations(md: &str, reg: &mut SourceRegistry) -> String {
+///
+/// With `allowed`, only those numbers are kept: a citation to a source the writer was never shown
+/// is as made up as one to a source that doesn't exist.
+pub fn link_citations(
+    md: &str,
+    reg: &mut SourceRegistry,
+    allowed: Option<&std::collections::HashSet<usize>>,
+) -> String {
     static DIGITS: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r"\d+").unwrap());
     let mut out = String::with_capacity(md.len() + 256);
     let mut in_code = false;
@@ -197,6 +204,9 @@ pub fn link_citations(md: &str, reg: &mut SourceRegistry) -> String {
                 if !seen.insert(n) {
                     continue;
                 }
+                if allowed.is_some_and(|a| !a.contains(&n)) {
+                    continue;
+                }
                 if let Some(s) = reg.get(n) {
                     links.push(format!("[[{n}]]({})", s.url));
                     reg.mark_cited(n);
@@ -211,8 +221,60 @@ pub fn link_citations(md: &str, reg: &mut SourceRegistry) -> String {
     out
 }
 
-/// Build the "Sources" section: cited sources first, then a few useful uncited ones.
-pub fn sources_section(reg: &SourceRegistry, extra: usize) -> String {
+static LINKED: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r"\[\[(\d+)\]\]\(").unwrap());
+
+/// Citation numbers in the order they first appear in linked Markdown (`[[n]](url)`).
+pub fn citation_order(md: &str) -> Vec<usize> {
+    let mut out = vec![];
+    for c in LINKED.captures_iter(md) {
+        if let Ok(n) = c[1].parse::<usize>()
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// Rewrite linked citation numbers with an old → new mapping.
+pub fn remap_citations(md: &str, map: &std::collections::HashMap<usize, usize>) -> String {
+    LINKED
+        .replace_all(md, |c: &regex::Captures| {
+            let n: usize = c[1].parse().unwrap_or(0);
+            format!("[[{}]](", map.get(&n).copied().unwrap_or(n))
+        })
+        .into_owned()
+}
+
+/// The uncited sources worth listing under *Further reading*: pages read and Wikipedia first,
+/// then other on-topic results.
+pub fn further_reading(
+    reg: &SourceRegistry,
+    extra: usize,
+    on_topic: &dyn Fn(&crate::sources::Source) -> bool,
+) -> Vec<usize> {
+    let all = reg.all();
+    let mut out: Vec<usize> = vec![];
+    let first =
+        all.iter().filter(|s| !s.cited && on_topic(s) && (s.read || s.kind == crate::sources::SourceKind::Wiki));
+    for s in first.chain(all.iter().filter(|s| !s.cited && !s.read && on_topic(s))) {
+        if out.len() >= extra {
+            break;
+        }
+        if !out.contains(&s.n) {
+            out.push(s.n);
+        }
+    }
+    out
+}
+
+/// Build the "Sources" section: cited sources first, then a few useful uncited ones
+/// (only those `on_topic` accepts, so off-topic search results don't pad the list).
+pub fn sources_section(
+    reg: &SourceRegistry,
+    extra: usize,
+    on_topic: &dyn Fn(&crate::sources::Source) -> bool,
+) -> String {
     let all = reg.all();
     if all.is_empty() {
         return String::new();
@@ -222,13 +284,8 @@ pub fn sources_section(reg: &SourceRegistry, extra: usize) -> String {
     for s in &cited {
         out.push_str(&line(s));
     }
-    let further: Vec<_> = all
-        .iter()
-        .filter(|s| !s.cited)
-        .filter(|s| s.read || matches!(s.kind, crate::sources::SourceKind::Wiki))
-        .chain(all.iter().filter(|s| !s.cited && !s.read))
-        .take(extra)
-        .collect();
+    let picks = further_reading(reg, extra, on_topic);
+    let further: Vec<_> = picks.iter().filter_map(|n| reg.get(*n)).collect();
     if !further.is_empty() {
         if !cited.is_empty() {
             out.push_str("\n**Further reading**\n\n");
@@ -245,7 +302,15 @@ pub fn sources_section(reg: &SourceRegistry, extra: usize) -> String {
 
 fn line(s: &crate::sources::Source) -> String {
     let title = s.title.replace('[', "(").replace(']', ")");
-    let date = s.date.as_deref().map(|d| format!(" · {}", d.chars().take(10).collect::<String>())).unwrap_or_default();
+    let date = s
+        .date
+        .as_deref()
+        .map(|d| {
+            // ISO timestamps → the date part; human dates ("Sep 30, 2025", "4 days ago") as they are
+            let iso = d.len() >= 10 && d.as_bytes()[..4].iter().all(u8::is_ascii_digit) && d.as_bytes()[4] == b'-';
+            format!(" · {}", if iso { d.chars().take(10).collect::<String>() } else { d.chars().take(24).collect() })
+        })
+        .unwrap_or_default();
     format!("{}. [{title}]({}) — `{}`{date}\n", s.n, s.url, s.domain)
 }
 
@@ -377,7 +442,8 @@ mod tests {
     #[test]
     fn links_citations() {
         let mut r = reg();
-        let out = link_citations("Fact A [1]. Fact B [2, 3]. Bad [9]. Link [x](https://y.z). Pair [1][3].", &mut r);
+        let out =
+            link_citations("Fact A [1]. Fact B [2, 3]. Bad [9]. Link [x](https://y.z). Pair [1][3].", &mut r, None);
         assert!(out.contains("Fact A [[1]](https://one.com)."));
         assert!(out.contains("[[2]](https://two.com)[[3]](https://three.com)"));
         assert!(out.contains("Bad ."));
@@ -389,7 +455,11 @@ mod tests {
     #[test]
     fn skips_code_blocks() {
         let mut r = reg();
-        let out = link_citations("```\nlet x = a[1];\n```\nok [1]", &mut r);
+        let out = link_citations("```\nlet x = a[1];\n```\nok [1]", &mut r, None);
+        assert!(out.contains("let x = a[1];"));
+        let allowed: std::collections::HashSet<usize> = [2].into();
+        let only = link_citations("a [1] b [2]", &mut r, Some(&allowed));
+        assert_eq!(only, "a  b [[2]](https://two.com)");
         assert!(out.contains("let x = a[1];"));
         assert!(out.contains("ok [[1]](https://one.com)"));
     }
@@ -406,7 +476,7 @@ mod tests {
     fn sources_section_lists_cited_first() {
         let mut r = reg();
         r.mark_cited(3);
-        let s = sources_section(&r, 2);
+        let s = sources_section(&r, 2, &|_| true);
         let i3 = s.find("three.com").unwrap();
         let i2 = s.find("two.com").unwrap();
         assert!(i3 < i2);

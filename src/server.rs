@@ -600,6 +600,14 @@ pub fn router(st: AppState) -> Router {
         .route("/app.js", get(|| async { asset(include_str!("../static/app.js"), "text/javascript; charset=utf-8") }))
         .route("/style.css", get(|| async { asset(include_str!("../static/style.css"), "text/css; charset=utf-8") }))
         .route("/favicon.svg", get(|| async { asset(include_str!("../static/favicon.svg"), "image/svg+xml") }))
+        .route(
+            "/vendor/marked.min.js",
+            get(|| async { asset(include_str!("../static/vendor/marked.min.js"), "text/javascript; charset=utf-8") }),
+        )
+        .route(
+            "/vendor/purify.min.js",
+            get(|| async { asset(include_str!("../static/vendor/purify.min.js"), "text/javascript; charset=utf-8") }),
+        )
         .route("/api/health", get(health))
         .route("/api/manifest", get(manifest))
         .route("/api/tools", get(tools))

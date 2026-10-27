@@ -276,13 +276,22 @@ impl Engine {
         }
         let (markdown, sources) = {
             let mut reg = run.ctx.sources.lock().unwrap();
-            let body = report::link_citations(&body, &mut reg);
+            // The writer saw only these numbers; anything else it cites is invented.
+            let shown: HashSet<usize> = if degraded { HashSet::new() } else { shown_numbers(&evidence) };
+            let body = report::link_citations(&body, &mut reg, (!degraded).then_some(&shown));
             let extra = match triage.depth {
                 Depth::Quick => 2,
                 Depth::Standard => 4,
                 Depth::Deep => 6,
             };
-            (format!("{}{}", body.trim_end(), report::sources_section(&reg, extra)), reg.all().to_vec())
+            let topic = agent::topic_terms(&clean_query);
+            let on_topic = |s: &Source| agent::relevant(&format!("{} {} {}", s.title, s.snippet, s.url), &topic);
+            // Number sources 1, 2, 3… in the order the answer cites them, then Further reading.
+            let mut order = report::citation_order(&body);
+            order.extend(report::further_reading(&reg, extra, &on_topic));
+            let map = reg.renumber(&order);
+            let body = report::remap_citations(&body, &map);
+            (format!("{}{}", body.trim_end(), report::sources_section(&reg, extra, &on_topic)), reg.all().to_vec())
         };
         if !degraded && !sources.iter().any(|s| s.cited) {
             run.warn("the answer does not cite its sources inline; see the Sources list");
@@ -425,6 +434,16 @@ impl Engine {
             .await
             .context("writing the answer failed")
     }
+}
+
+/// Citation numbers that appear (as `[n]`) in the evidence handed to the writer.
+fn shown_numbers(evidence: &[Evidence]) -> HashSet<usize> {
+    static N: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\[(\d{1,4})\]").unwrap());
+    evidence
+        .iter()
+        .flat_map(|e| N.captures_iter(&e.text).chain(N.captures_iter(&e.label)).filter_map(|c| c[1].parse().ok()))
+        .collect()
 }
 
 /// Every URL the research actually saw (sources and URLs inside evidence), normalised,

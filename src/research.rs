@@ -10,7 +10,7 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 
 use crate::{
-    agent::{readable, rephrase},
+    agent::{readable, relevant, rephrase, topic_terms},
     depth::{Intent, Profile, Triage},
     engine::{Evidence, Run},
     llm::{ChatRequest, Message, Tier, parse_json_loose},
@@ -227,7 +227,9 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
 
     run.events.status(format!("Running {} searches", plan.queries.len()));
     let mut hits = search_round(run, &plan.queries, news).await;
-    if hits.len() < 3 {
+    let topic = topic_terms(&run.query);
+    let on_topic = hits.iter().filter(|h| relevant(&format!("{} {} {}", h.title, h.snippet, h.url), &topic)).count();
+    if on_topic < 3 {
         run.events.status("Few results — trying other phrasings");
         let alts = rephrase(run, &plan.queries).await;
         hits.extend(search_round(run, &alts, news).await);
