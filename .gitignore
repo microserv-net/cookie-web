@@ -1,0 +1,5 @@
+/target
+/reports
+.env
+*.swp
+.DS_Store
