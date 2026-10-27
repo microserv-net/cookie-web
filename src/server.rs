@@ -942,12 +942,28 @@ pub async fn serve(engine: Arc<Engine>) -> anyhow::Result<()> {
         }
     });
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e} (is the port in use? set COOKIE_PORT)"))?;
+    let all = matches!(cfg.host.as_str(), "0.0.0.0" | "::" | "[::]");
     tracing::info!(
-        "cookie-web {VERSION} listening on http://{addr}  (model: {}, ollama: {})",
+        "cookie-web {VERSION} listening on http://{addr}{}  (model: {}, ollama: {})",
+        if all {
+            " — all interfaces, reachable at http://<this machine's IP>:".to_string() + &cfg.port.to_string()
+        } else {
+            String::new()
+        },
         cfg.model,
         cfg.ollama_host
     );
+    let loopback = matches!(cfg.host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]");
+    if !loopback && cfg.api_key.is_none() {
+        tracing::warn!(
+            "no COOKIE_API_KEY is set and cookie-web is reachable from the network: anyone who can reach port {} \
+             can use it. Set COOKIE_API_KEY (or COOKIE_HOST=127.0.0.1 to keep it local).",
+            cfg.port
+        );
+    }
     axum::serve(listener, router(st)).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
 }

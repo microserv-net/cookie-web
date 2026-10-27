@@ -58,10 +58,10 @@ Useful options: `--model NAME`, `--fast-model NAME`, `--local` (this machine onl
 ollama pull qwen3:4b-instruct   # 2.5 GB — see docs/HARDWARE.md
 
 # 2. Build & run
-cargo run --release             # serves http://127.0.0.1:8765
+cargo run --release             # serves on port 8765 on all interfaces (0.0.0.0)
 ```
 
-Open **http://127.0.0.1:8765** for the GUI, or:
+Open **http://127.0.0.1:8765** (or `http://<server-ip>:8765` from another machine) for the GUI, or:
 
 ```bash
 curl -s localhost:8765/api/research -H 'content-type: application/json' \
@@ -91,7 +91,7 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 
 | variable | default | |
 |----------|---------|---|
-| `COOKIE_HOST` / `COOKIE_PORT` | `127.0.0.1` / `8765` | listen address |
+| `COOKIE_HOST` / `COOKIE_PORT` | `0.0.0.0` / `8765` | listen address (`0.0.0.0` = reachable from the network; `127.0.0.1` = this machine only). On a VPS, also set `COOKIE_API_KEY` |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | |
 | `COOKIE_MODEL` | `qwen3:4b-instruct` | main model (agent + writer) |
 | `COOKIE_FAST_MODEL` | = `COOKIE_MODEL` | optional smaller model for triage, planning, notes |

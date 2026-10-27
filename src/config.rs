@@ -93,7 +93,8 @@ impl Config {
             _ => SearchMode::Fallback,
         };
         Self {
-            host: var("COOKIE_HOST").unwrap_or_else(|| "127.0.0.1".into()),
+            // All interfaces by default: cookie-web runs on its own box and is used over the network.
+            host: var("COOKIE_HOST").unwrap_or_else(|| "0.0.0.0".into()),
             port: parse("COOKIE_PORT", 8765),
             ollama_host: var("OLLAMA_HOST")
                 .map(|h| if h.starts_with("http") { h } else { format!("http://{h}") })

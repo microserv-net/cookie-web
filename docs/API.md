@@ -1,6 +1,7 @@
 # cookie-web HTTP API
 
-Base URL: `http://<COOKIE_HOST>:<COOKIE_PORT>` (default `http://127.0.0.1:8765`).
+Base URL: `http://<server>:<COOKIE_PORT>` — cookie-web listens on all interfaces (`COOKIE_HOST=0.0.0.0`, port 8765)
+by default, so other machines reach it at `http://<its IP>:8765`.
 All request/response bodies are JSON (UTF-8) unless noted. The GUI at `/` uses exactly these endpoints.
 
 - [Authentication](#authentication)

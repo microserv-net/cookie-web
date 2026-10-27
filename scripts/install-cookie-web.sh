@@ -165,7 +165,7 @@ $SUDO chmod 640 "$ENV_FILE"
 PORT="$(get_env COOKIE_PORT)"
 PORT="${PORT:-8765}"
 HOST="$(get_env COOKIE_HOST)"
-ok "model $(get_env COOKIE_MODEL) · listening on ${HOST:-127.0.0.1}:$PORT"
+ok "model $(get_env COOKIE_MODEL) · listening on ${HOST:-0.0.0.0}:$PORT"
 
 OLLAMA="$(get_env OLLAMA_HOST)"
 if ! curl -fsS --max-time 3 "${OLLAMA:-http://127.0.0.1:11434}/api/tags" >/dev/null 2>&1; then
@@ -218,12 +218,14 @@ if [ "$OPEN_FIREWALL" -eq 1 ] && command -v ufw >/dev/null && $SUDO ufw status |
 fi
 
 step "Done"
-if [ "${HOST:-127.0.0.1}" = "127.0.0.1" ]; then
-	echo "  GUI:      http://127.0.0.1:$PORT"
+if [ "${HOST:-0.0.0.0}" = "127.0.0.1" ]; then
+	echo "  GUI:      http://127.0.0.1:$PORT   (this machine only — rerun without --local to open it up)"
 else
 	for ip in $(hostname -I 2>/dev/null); do
 		case "$ip" in *:*) ;; *) echo "  GUI:      http://$ip:$PORT" ;; esac
 	done
+	echo "            (on a VPS: http://<public IP>:$PORT — allow TCP $PORT in the firewall / security group;"
+	echo "             --open-firewall does it for ufw)"
 fi
 if [ -n "$API_KEY" ]; then
 	echo "  API key:  $API_KEY   (GUI: ⚙ Settings → API key · API: Authorization: Bearer <key>)"
