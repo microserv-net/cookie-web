@@ -32,19 +32,33 @@ impl Tool for FetchPage {
             "required": ["url"]
         })
     }
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(90)
+    }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
         let url = args["url"].as_str().unwrap_or("").trim();
         if url.is_empty() {
             bail!("`url` is required");
         }
-        if !ctx.take_fetch() {
+        // Re-reading a page this job already read costs nothing (it is cached).
+        let already = ctx.already_read(url);
+        if !already && !ctx.take_fetch() {
             return Ok(ToolOutput::new(
                 "Page-reading budget exhausted. Answer with the information you already have.",
                 "budget exhausted",
             ));
         }
         let focus = args["focus"].as_str().map(str::trim).filter(|s| !s.is_empty());
-        let page = self.web.page(url).await?;
+        let page = match self.web.page(url).await {
+            Ok(p) => p,
+            Err(e) => {
+                // A failed read must not eat the budget, or one dead link can leave a quick answer with no page.
+                if !already {
+                    ctx.refund_fetch();
+                }
+                return Err(e);
+            }
+        };
         let n = ctx.add_source(&page.title, &page.url, "", SourceKind::Page, page.published.clone());
         let body = focus_excerpt(&page.markdown, focus, ctx.page_chars);
         let mut meta = vec![format!("URL: {}", page.url)];

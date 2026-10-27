@@ -13,10 +13,73 @@ use crate::{
     config::AgentMode,
     depth::{Depth, Intent, Profile, Triage},
     engine::{Evidence, Run},
-    llm::{ChatRequest, Message, ToolCall, parse_json_loose},
+    llm::{ChatRequest, Message, Tier, ToolCall, parse_json_loose},
     sources::{SourceKind, domain_of},
-    tools::extract::truncate_chars,
+    tools::{
+        ToolOutput,
+        extract::{terms, truncate_chars},
+        search::relax_query,
+    },
 };
+
+/// Number of search hits in a tool result (0 for non-search tools or failures).
+pub fn hit_count(ok: bool, out: &ToolOutput) -> usize {
+    if ok { out.data["hits"].as_array().map_or(0, Vec::len) } else { 0 }
+}
+
+/// New search queries for a request whose searches found (almost) nothing.
+/// Asks the fast model for rephrasings (synonyms, likely names, using any hints the user gave);
+/// falls back to mechanical loosening if the model is unavailable.
+pub async fn rephrase(run: &Run<'_>, tried: &[String]) -> Vec<String> {
+    let schema = json!({
+        "type": "object",
+        "properties": { "queries": { "type": "array", "items": { "type": "string" } } },
+        "required": ["queries"]
+    });
+    let sys = format!(
+        "You help a web search that found nothing useful. Today is {}.\n\
+         Write 3 different web search queries likely to find what the user wants: use synonyms and simpler keywords, \
+         drop or replace unusual words, try the likely proper names or titles involved, and use any hints the user \
+         gave. Keywords only, no quotes. Reply with JSON only.",
+        run.today
+    );
+    let user =
+        format!("Request: {}\nQueries already tried (avoid repeating them):\n- {}", run.query, tried.join("\n- "));
+    let req = ChatRequest::new(vec![Message::system(sys), Message::user(user)])
+        .tier(Tier::Fast)
+        .json(schema)
+        .temperature(0.5)
+        .max_tokens(200);
+    let mut out: Vec<String> = run
+        .chat(req)
+        .await
+        .ok()
+        .and_then(|m| parse_json_loose(&m.content))
+        .map(|v| {
+            v["queries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|q| q.as_str().map(|s| s.trim().trim_matches('"').to_string()))
+                .filter(|q| !q.is_empty() && q.len() < 200)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Mechanical fallbacks: loosened phrasing, then the bare keywords.
+    for q in tried.iter().chain(std::iter::once(&run.query)) {
+        if let Some(r) = relax_query(q) {
+            out.push(r);
+        }
+        let kw = terms(q);
+        if kw.len() >= 2 {
+            out.push(kw.into_iter().take(6).collect::<Vec<_>>().join(" "));
+        }
+    }
+    let mut seen: HashSet<String> = tried.iter().map(|q| q.to_lowercase()).collect();
+    out.retain(|q| seen.insert(q.to_lowercase()));
+    out.truncate(3);
+    out
+}
 
 /// Domains that rarely yield readable text without JavaScript or a login.
 pub const UNREADABLE: &[&str] = &[
@@ -110,9 +173,31 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
 
     // 1. Seed searches (always run — the system must use its tools).
     run.events.status("Searching the web");
-    let seed_calls = seeds(t, p);
-    let seed_results =
+    let mut seed_calls = seeds(t, p);
+    let mut seed_results =
         futures::future::join_all(seed_calls.iter().map(|(name, args)| run.tool(name, args.clone()))).await;
+    let wiki_found = seed_calls
+        .iter()
+        .zip(&seed_results)
+        .any(|((name, _), (ok, out))| *name == "wikipedia" && *ok && !out.summary.contains("no article"));
+
+    // 1b. Rescue: if the searches came back (nearly) empty, rephrase and search again before
+    // the model ever sees an empty page — small models give up too easily.
+    let hits: usize = seed_results.iter().map(|(ok, out)| hit_count(*ok, out)).sum();
+    if hits < 3 && !run.out_of_time() {
+        run.events.status("Few results — trying other phrasings");
+        let alts = rephrase(run, std::slice::from_ref(&t.search_query)).await;
+        let extra: Vec<(&'static str, Value)> =
+            alts.into_iter().map(|q| ("web_search", json!({ "query": q }))).collect();
+        let extra_results =
+            futures::future::join_all(extra.iter().map(|(name, args)| run.tool(name, args.clone()))).await;
+        let more: usize = extra_results.iter().map(|(ok, out)| hit_count(*ok, out)).sum();
+        if hits + more == 0 && !wiki_found {
+            run.warn("the web searches found almost nothing for this request, even after rephrasing");
+        }
+        seed_calls.extend(extra);
+        seed_results.extend(extra_results);
+    }
     let mut messages =
         vec![Message::system(agent_system(run, t, p, native)), Message::user(format!("Request: {}", run.query))];
     let mut seed_dump = String::new();
@@ -139,12 +224,19 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
 
     // 2. Model-driven rounds (skipped in pipeline mode).
     let mut use_native = native;
+    let mut switched = false;
+    // Everything gathered so far as plain text, used if we must switch to the JSON protocol mid-way.
+    let mut all_dump = seed_dump.clone();
     let rounds = if run.engine.cfg.agent_mode == AgentMode::Pipeline { 0 } else { p.max_steps };
     // Prompt budget for the loop: context minus the reply, tool specs and a safety margin.
     let loop_budget =
         (run.engine.cfg.num_ctx.saturating_sub(700 + 1_100) as f64 * crate::depth::CHARS_PER_TOKEN) as usize;
     for step in 0..rounds {
         if run.ctx.fetches_left() == 0 && step > 0 && t.depth == Depth::Quick {
+            break;
+        }
+        if run.out_of_time() {
+            run.warn("the time budget for research ran out; answering with what was found");
             break;
         }
         compact(&mut messages, loop_budget);
@@ -167,13 +259,18 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
                     messages.push(m);
                     calls
                 }
-                Err(e) if step == 0 => {
-                    tracing::warn!("native tool calling failed ({e:#}); switching to JSON protocol");
+                Err(e) if !switched => {
+                    // Small models sometimes emit malformed tool calls; the JSON protocol is more forgiving.
+                    tracing::warn!("native tool calling failed ({e:#}); switching to the JSON protocol");
                     use_native = false;
-                    messages[0] = Message::system(agent_system(run, t, p, false));
-                    // replace native seed messages with a plain dump
-                    messages.truncate(2);
-                    messages.push(Message::user(seed_dump.clone()));
+                    switched = true;
+                    messages = vec![
+                        Message::system(agent_system(run, t, p, false)),
+                        Message::user(format!("Request: {}", run.query)),
+                        Message::user(format!(
+                            "{all_dump}Next tool call as JSON, or {{\"tool\":\"done\",\"args\":{{}}}}."
+                        )),
+                    ];
                     continue;
                 }
                 Err(e) => {
@@ -227,6 +324,7 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
                 let label = args["url"].as_str().or(args["query"].as_str()).or(args["topic"].as_str()).unwrap_or("");
                 evidence.push(Evidence { label: format!("{name}: {label}"), text: out.text.clone() });
             }
+            all_dump.push_str(&format!("Result of {name}:\n{}\n\n", truncate_chars(&out.text, 1_500)));
             if use_native {
                 messages.push(Message::tool(name, truncate_chars(&out.text, p.page_chars)));
             } else {
@@ -241,7 +339,8 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
 
     // 3. Deterministic floor: make sure some pages were actually read.
     let want = match (t.depth, t.intent) {
-        (Depth::Quick, Intent::Entity | Intent::Links) => 0,
+        // a Wikipedia summary + snippets is enough to identify a name; otherwise read one page
+        (Depth::Quick, Intent::Entity | Intent::Links) if wiki_found => 0,
         (Depth::Quick, _) => 1,
         _ => p.max_fetches.min(2),
     };
@@ -253,7 +352,7 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
                 .iter()
                 .filter(|s| !s.read && matches!(s.kind, SourceKind::Search | SourceKind::News) && readable(&s.url))
                 .map(|s| s.url.clone())
-                .take((want - read) + 2)
+                .take((want - read) + 4)
                 .collect()
         };
         if !candidates.is_empty() {
@@ -269,6 +368,9 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
                 evidence.push(Evidence { label: format!("fetch_page: {url}"), text: out.text });
                 got += 1;
             }
+        }
+        if got < want {
+            run.warn(format!("could only read {got} of the {want} pages wanted; the answer leans on search snippets"));
         }
     }
     Ok(evidence)

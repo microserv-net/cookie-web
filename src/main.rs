@@ -132,6 +132,9 @@ async fn main() -> anyhow::Result<()> {
                         Event::ToolResult { ok, summary, .. } => {
                             let _ = writeln!(err, "    {} {summary}", if ok { "✓" } else { "✗" });
                         }
+                        Event::Warning { message } => {
+                            let _ = writeln!(err, "! {message}");
+                        }
                         _ => {}
                     }
                 }
@@ -148,6 +151,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 println!("{}", result.markdown);
+            }
+            if result.degraded {
+                eprintln!("! degraded: the model could not write the answer; printed a digest of the sources");
             }
             eprintln!(
                 "» {} sources · {} tool calls · {:.1}s{}",

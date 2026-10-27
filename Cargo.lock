@@ -496,6 +496,7 @@ dependencies = [
  "clap",
  "dom_smoothie",
  "dotenvy",
+ "encoding_rs",
  "futures",
  "htmd",
  "http-body-util",

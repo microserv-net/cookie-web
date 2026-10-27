@@ -1,11 +1,19 @@
 //! Web & news search with pluggable backends.
 //!
-//! Keyless: DuckDuckGo (HTML + lite endpoints) and Mojeek.
+//! Keyless: DuckDuckGo (HTML + lite endpoints), Bing and Mojeek.
 //! Optional: SearXNG (self-hosted, recommended), Brave, Tavily, Ollama web search.
-//! Mode `fallback` tries backends in order; `fusion` queries all of them in
-//! parallel and merges rankings with reciprocal-rank fusion.
+//! Mode `fallback` tries backends in order until enough results are found; `fusion`
+//! queries all of them in parallel and merges rankings with reciprocal-rank fusion.
+//!
+//! Reliability: every backend call is time-limited; a backend that keeps failing (rate limits,
+//! captchas, outages) is put on a growing cooldown and skipped; if every backend fails, the whole
+//! search is retried once; empty results are never cached.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
@@ -152,12 +160,114 @@ impl Backend for DuckDuckGo {
             .send()
             .await?
             .error_for_status()?;
+        // 202 + an "anomaly" page is DuckDuckGo's bot challenge.
+        let mut limited = resp.status().as_u16() == 202;
         let html = resp.text().await?;
+        limited |= html.contains("anomaly-modal") || html.contains("challenge-form");
         let mut hits = parse_ddg_html(&html);
         if hits.is_empty() {
             // The HTML endpoint sometimes serves a bot challenge; the lite one often still works.
             let resp = web.client.post("https://lite.duckduckgo.com/lite/").form(&form).send().await?;
+            limited |= resp.status().as_u16() == 202;
             hits = parse_ddg_lite(&resp.text().await?);
+        }
+        if hits.is_empty() && limited {
+            bail!("rate-limited by DuckDuckGo (bot challenge)");
+        }
+        hits.truncate(q.max);
+        Ok(hits)
+    }
+}
+
+// --------------------------------------------------------------------- Bing
+
+pub struct Bing;
+
+/// Decode unpadded URL-safe (or standard) base64.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut buf, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        } as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Bing wraps result links as `https://www.bing.com/ck/a?…&u=a1<base64url(target)>`.
+pub fn bing_unwrap(href: &str) -> Option<String> {
+    let u = url::Url::parse(href).ok()?;
+    let host = u.host_str().unwrap_or("");
+    if host == "bing.com" || host.ends_with(".bing.com") {
+        let enc = u.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned())?;
+        let target = String::from_utf8(b64_decode(enc.strip_prefix("a1").unwrap_or(&enc))?).ok()?;
+        return target.starts_with("http").then_some(target);
+    }
+    matches!(u.scheme(), "http" | "https").then(|| href.to_string())
+}
+
+pub fn parse_bing(html: &str) -> Vec<Hit> {
+    let doc = Html::parse_document(html);
+    let mut out = vec![];
+    for li in doc.select(&sel("li.b_algo")) {
+        let Some(a) = li.select(&sel("h2 a")).next() else { continue };
+        let Some(url) = a.value().attr("href").and_then(bing_unwrap) else { continue };
+        let date = li.select(&sel(".news_dt")).next().map(|d| clean(&d.text().collect::<String>()));
+        let mut snippet = li
+            .select(&sel(".b_caption p"))
+            .next()
+            .or_else(|| li.select(&sel("p")).next())
+            .map(|p| clean(&p.text().collect::<String>()))
+            .unwrap_or_default();
+        if let Some(d) = date.as_deref().filter(|d| snippet.starts_with(*d)) {
+            snippet = snippet[d.len()..].trim_start_matches(|c: char| c.is_whitespace() || c == '·').to_string();
+        }
+        out.push(Hit { title: clean(&a.text().collect::<String>()), url, snippet, engine: "bing".into(), date });
+    }
+    out
+}
+
+#[async_trait]
+impl Backend for Bing {
+    fn name(&self) -> &'static str {
+        "bing"
+    }
+    async fn search(&self, web: &Web, q: &Query) -> anyhow::Result<Vec<Hit>> {
+        let mut text = q.text.clone();
+        let mut range = q.time_range.clone();
+        if q.kind == Kind::News {
+            text.push_str(" news");
+            range.get_or_insert_with(|| "month".into());
+        }
+        let mut params = vec![("q", text), ("setlang", "en".to_string()), ("count", q.max.clamp(5, 20).to_string())];
+        let filter = match range.as_deref() {
+            Some("day") => Some("ex1:\"ez1\""),
+            Some("week") => Some("ex1:\"ez2\""),
+            Some("month") => Some("ex1:\"ez3\""),
+            _ => None,
+        };
+        if let Some(f) = filter {
+            params.push(("filters", f.to_string()));
+        }
+        let resp = web.client.get("https://www.bing.com/search").query(&params).send().await?.error_for_status()?;
+        let html = resp.text().await?;
+        let mut hits = parse_bing(&html);
+        if hits.is_empty() && (html.contains("captcha") || html.contains("/challenge")) {
+            bail!("rate-limited by Bing (captcha)");
         }
         hits.truncate(q.max);
         Ok(hits)
@@ -405,12 +515,47 @@ impl Backend for OllamaWeb {
 
 // ------------------------------------------------------------------- Engine
 
+/// One backend call may take at most this long.
+const BACKEND_TIMEOUT: Duration = Duration::from_secs(15);
+/// In fallback mode, keep asking further backends until this many results are in hand.
+const ENOUGH_RESULTS: usize = 4;
+/// Longest cooldown for a failing backend.
+const MAX_COOLDOWN: Duration = Duration::from_secs(600);
+
+#[derive(Default)]
+struct Health {
+    ok: u64,
+    failures: u64,
+    consecutive: u32,
+    until: Option<Instant>,
+    last_error: Option<String>,
+}
+
+/// Public view of a backend's health (`/api/health`, `doctor`).
+#[derive(Clone, Debug, Serialize)]
+pub struct BackendStatus {
+    pub name: &'static str,
+    pub ok: u64,
+    pub failures: u64,
+    /// Seconds until the backend is tried again (0 = available).
+    pub cooldown_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 pub struct SearchEngine {
     pub backends: Vec<Box<dyn Backend>>,
     pub mode: SearchMode,
+    health: Mutex<HashMap<&'static str, Health>>,
+    /// Pause before the second pass when every backend failed.
+    pub retry_pause: Duration,
 }
 
 impl SearchEngine {
+    pub fn new(backends: Vec<Box<dyn Backend>>, mode: SearchMode) -> Self {
+        Self { backends, mode, health: Mutex::new(HashMap::new()), retry_pause: Duration::from_millis(1500) }
+    }
+
     pub fn from_config(cfg: &Config) -> Self {
         let mut backends: Vec<Box<dyn Backend>> = vec![];
         if let Some(u) = &cfg.searxng_url {
@@ -427,13 +572,83 @@ impl SearchEngine {
         }
         if !cfg.disable_duckduckgo {
             backends.push(Box::new(DuckDuckGo));
+            backends.push(Box::new(Bing));
             backends.push(Box::new(Mojeek));
         }
-        Self { backends, mode: cfg.search_mode.clone() }
+        Self::new(backends, cfg.search_mode.clone())
     }
 
     pub fn names(&self) -> Vec<&'static str> {
         self.backends.iter().map(|b| b.name()).collect()
+    }
+
+    pub fn status(&self) -> Vec<BackendStatus> {
+        let h = self.health.lock().unwrap();
+        self.backends
+            .iter()
+            .map(|b| {
+                let s = h.get(b.name());
+                BackendStatus {
+                    name: b.name(),
+                    ok: s.map_or(0, |s| s.ok),
+                    failures: s.map_or(0, |s| s.failures),
+                    cooldown_secs: s
+                        .and_then(|s| s.until)
+                        .map(|u| u.saturating_duration_since(Instant::now()).as_secs())
+                        .unwrap_or(0),
+                    last_error: s.and_then(|s| s.last_error.clone()),
+                }
+            })
+            .collect()
+    }
+
+    fn cooling(&self, name: &str) -> bool {
+        let h = self.health.lock().unwrap();
+        h.get(name).and_then(|s| s.until).is_some_and(|u| u > Instant::now())
+    }
+
+    fn record(&self, name: &'static str, result: Result<(), &str>) {
+        let mut h = self.health.lock().unwrap();
+        let s = h.entry(name).or_default();
+        match result {
+            Ok(()) => {
+                s.ok += 1;
+                s.consecutive = 0;
+                s.until = None;
+            }
+            Err(e) => {
+                s.failures += 1;
+                s.consecutive += 1;
+                s.last_error = Some(e.chars().take(200).collect());
+                if s.consecutive >= 2 {
+                    let secs = 30u64.saturating_mul(1 << (s.consecutive - 2).min(5));
+                    s.until = Some(Instant::now() + Duration::from_secs(secs).min(MAX_COOLDOWN));
+                }
+            }
+        }
+    }
+
+    /// Backends to try, in order: healthy ones first; cooling-down ones only if nothing else is left.
+    fn order(&self, include_cooling: bool) -> Vec<&dyn Backend> {
+        let (warm, cold): (Vec<&dyn Backend>, Vec<&dyn Backend>) =
+            self.backends.iter().map(|b| b.as_ref()).partition(|b| !self.cooling(b.name()));
+        if warm.is_empty() || include_cooling { warm.into_iter().chain(cold).collect() } else { warm }
+    }
+
+    /// One time-limited backend call, with health accounting.
+    async fn ask(&self, b: &dyn Backend, web: &Web, q: &Query) -> anyhow::Result<Vec<Hit>> {
+        let res = match tokio::time::timeout(BACKEND_TIMEOUT, b.search(web, q)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!("timed out after {}s", BACKEND_TIMEOUT.as_secs())),
+        };
+        match &res {
+            Ok(_) => self.record(b.name(), Ok(())),
+            Err(e) => {
+                tracing::warn!("search backend {} failed: {e:#}", b.name());
+                self.record(b.name(), Err(&format!("{e:#}")));
+            }
+        }
+        res
     }
 
     pub async fn search(&self, web: &Web, q: &Query) -> anyhow::Result<Vec<Hit>> {
@@ -444,39 +659,75 @@ impl SearchEngine {
         if let Some(h) = web.search_cache.get(&key) {
             return Ok(h);
         }
-        let hits = match self.mode {
-            SearchMode::Fallback => {
-                let mut errors = vec![];
-                let mut found = vec![];
-                for b in &self.backends {
-                    match b.search(web, q).await {
-                        Ok(h) if !h.is_empty() => {
-                            found = h;
-                            break;
-                        }
-                        Ok(_) => errors.push(format!("{}: no results", b.name())),
-                        Err(e) => {
-                            tracing::warn!("search backend {} failed: {e:#}", b.name());
-                            errors.push(format!("{}: {e}", b.name()));
-                        }
+        let mut errors = vec![];
+        let mut hits = vec![];
+        for pass in 0..2 {
+            if pass == 1 {
+                tokio::time::sleep(self.retry_pause).await;
+            }
+            errors.clear();
+            let (lists, had_answer) = match self.mode {
+                SearchMode::Fallback => self.fallback(web, q, pass == 1, &mut errors).await,
+                SearchMode::Fusion => self.fusion(web, q, pass == 1, &mut errors).await,
+            };
+            hits = fuse(lists, q.max);
+            // Retry only when every backend *failed*; "no results" is an answer.
+            if !hits.is_empty() || had_answer {
+                break;
+            }
+        }
+        if hits.is_empty() && !errors.is_empty() && errors.iter().all(|e| !e.ends_with("no results")) {
+            bail!("all search backends failed: {}", errors.join("; "));
+        }
+        if !hits.is_empty() {
+            web.search_cache.put(key, hits.clone());
+        }
+        Ok(hits)
+    }
+
+    async fn fallback(&self, web: &Web, q: &Query, all: bool, errors: &mut Vec<String>) -> (Vec<Vec<Hit>>, bool) {
+        let mut lists = vec![];
+        let mut got = 0;
+        let mut answered = false;
+        for b in self.order(all) {
+            match self.ask(b, web, q).await {
+                Ok(h) if !h.is_empty() => {
+                    answered = true;
+                    got += h.len();
+                    lists.push(h);
+                    if got >= ENOUGH_RESULTS.min(q.max) {
+                        break;
                     }
                 }
-                if found.is_empty() && !errors.is_empty() && errors.iter().all(|e| !e.ends_with("no results")) {
-                    bail!("all search backends failed: {}", errors.join("; "));
+                Ok(_) => {
+                    answered = true;
+                    errors.push(format!("{}: no results", b.name()));
                 }
-                found
+                Err(e) => errors.push(format!("{}: {e}", b.name())),
             }
-            SearchMode::Fusion => {
-                let results = futures::future::join_all(self.backends.iter().map(|b| b.search(web, q))).await;
-                let lists: Vec<Vec<Hit>> = results.into_iter().filter_map(Result::ok).collect();
-                if lists.iter().all(Vec::is_empty) {
-                    bail!("no search backend returned results");
+        }
+        (lists, answered)
+    }
+
+    async fn fusion(&self, web: &Web, q: &Query, all: bool, errors: &mut Vec<String>) -> (Vec<Vec<Hit>>, bool) {
+        let order = self.order(all);
+        let results = futures::future::join_all(order.iter().map(|b| self.ask(*b, web, q))).await;
+        let mut lists = vec![];
+        let mut answered = false;
+        for (b, r) in order.iter().zip(results) {
+            match r {
+                Ok(h) => {
+                    answered = true;
+                    if h.is_empty() {
+                        errors.push(format!("{}: no results", b.name()));
+                    } else {
+                        lists.push(h);
+                    }
                 }
-                fuse(lists, q.max)
+                Err(e) => errors.push(format!("{}: {e}", b.name())),
             }
-        };
-        web.search_cache.put(key, hits.clone());
-        Ok(hits)
+        }
+        (lists, answered)
     }
 }
 
@@ -521,6 +772,32 @@ fn time_range_arg(args: &Value) -> Option<String> {
         .filter(|s| matches!(s.as_str(), "day" | "week" | "month" | "year"))
 }
 
+/// A looser version of a query that matched nothing: no quotes, brackets or search operators.
+/// `None` if loosening would not change it.
+pub fn relax_query(q: &str) -> Option<String> {
+    let words: Vec<String> = q
+        .split_whitespace()
+        .filter(|w| {
+            let l = w.to_ascii_lowercase();
+            !(l.starts_with("site:")
+                || l.starts_with("intitle:")
+                || l.starts_with("inurl:")
+                || l.starts_with("filetype:"))
+                && !(w.starts_with('-') && w.len() > 1)
+        })
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '.' && c != '+' && c != '#'))
+        .map(|w| w.trim_matches('\'').to_string())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let relaxed = words.join(" ");
+    let site = q.split_whitespace().find(|w| w.to_ascii_lowercase().starts_with("site:"));
+    let relaxed = match site {
+        Some(s) if !relaxed.is_empty() => format!("{relaxed} {s}"),
+        _ => relaxed,
+    };
+    (!relaxed.is_empty() && relaxed != q.trim()).then_some(relaxed)
+}
+
 /// Format hits for the model and register them as sources.
 pub fn render_hits(ctx: &ToolCtx, header: &str, hits: &[Hit], kind: SourceKind) -> String {
     let mut out = format!("{header}\n");
@@ -553,6 +830,9 @@ impl Tool for WebSearchTool {
             }
         }
     }
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(100)
+    }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
@@ -577,15 +857,34 @@ impl Tool for WebSearchTool {
             );
         }
         let max = args["max_results"].as_u64().map(|n| n.clamp(1, 10) as usize).unwrap_or(ctx.results_per_search);
-        let q = Query { text: text.clone(), max, time_range: time_range_arg(&args), kind: self.kind };
-        let hits = self.engine.search(&self.web, &q).await?;
+        let mut q = Query { text: text.clone(), max, time_range: time_range_arg(&args), kind: self.kind };
+        let mut hits = self.engine.search(&self.web, &q).await?;
+        let mut header = format!("Results for \"{text}\":");
+        // Exact phrases and odd punctuation often match nothing: retry once with plain keywords,
+        // and if a time filter emptied the results, once without it.
+        if hits.is_empty()
+            && let Some(relaxed) = relax_query(&text)
+        {
+            q.text = relaxed.clone();
+            hits = self.engine.search(&self.web, &q).await.unwrap_or_default();
+            header = format!("No results for \"{text}\"; results for \"{relaxed}\" instead:");
+        }
+        if hits.is_empty() && q.time_range.is_some() {
+            q.time_range = None;
+            hits = self.engine.search(&self.web, &q).await.unwrap_or_default();
+            header = format!("No recent results; results from any time for \"{}\":", q.text);
+        }
         let kind = if self.kind == Kind::News { SourceKind::News } else { SourceKind::Search };
         if hits.is_empty() {
-            return Ok(ToolOutput::new(format!("No results for \"{text}\". Try different keywords."), "no results"));
+            return Ok(ToolOutput::new(
+                format!("No results for \"{text}\". Try different, simpler or more general keywords."),
+                "no results",
+            )
+            .with_data(json!({ "hits": [] })));
         }
         let engines: Vec<&str> =
             hits.iter().map(|h| h.engine.as_str()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-        let body = render_hits(ctx, &format!("Results for \"{text}\":"), &hits, kind);
+        let body = render_hits(ctx, &header, &hits, kind);
         Ok(ToolOutput::new(body, format!("{} results via {}", hits.len(), engines.join(", ")))
             .with_data(json!({ "hits": hits })))
     }
@@ -624,6 +923,130 @@ mod tests {
         let hits = parse_mojeek(html);
         assert_eq!(hits[0].title, "Title X");
         assert_eq!(hits[0].snippet, "Snippet x");
+    }
+
+    #[test]
+    fn parses_bing_and_unwraps_redirects() {
+        let html = r#"<ol id="b_results"><li class="b_algo"><div class="b_tpcn"><a class="tilk" href="https://www.bing.com/ck/a?!&amp;&amp;p=x&amp;u=a1aHR0cHM6Ly93d3cubGVhcm5yZWxpZ2lvbnMuY29tL3NhbXVlbC1sYXN0LW9mLXRoZS1qdWRnZXMtNzAxMTYx&amp;ntb=1">site</a></div>
+          <h2><a href="https://www.bing.com/ck/a?!&amp;&amp;p=x&amp;u=a1aHR0cHM6Ly93d3cubGVhcm5yZWxpZ2lvbnMuY29tL3NhbXVlbC1sYXN0LW9mLXRoZS1qdWRnZXMtNzAxMTYx&amp;ntb=1">Who Was <strong>Samuel</strong>? - Learn Religions</a></h2>
+          <div class="b_caption"><p class="b_lineclamp2"><span class="news_dt">Jun 18, 2024</span>&nbsp;&#0183;&#32;In the Bible, Samuel was a prophet.</p></div></li>
+          <li class="b_algo"><h2><a href="https://example.org/direct">Direct link</a></h2><div class="b_caption"><p>Plain snippet.</p></div></li>
+          <li class="b_algo"><h2><a href="https://www.bing.com/images/search?q=x">Bing internal</a></h2></li></ol>"#;
+        let hits = parse_bing(html);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].url, "https://www.learnreligions.com/samuel-last-of-the-judges-701161");
+        assert_eq!(hits[0].title, "Who Was Samuel? - Learn Religions");
+        assert_eq!(hits[0].date.as_deref(), Some("Jun 18, 2024"));
+        assert_eq!(hits[0].snippet, "In the Bible, Samuel was a prophet.");
+        assert_eq!(hits[1].url, "https://example.org/direct");
+        assert_eq!(hits[1].snippet, "Plain snippet.");
+    }
+
+    #[test]
+    fn relaxes_queries() {
+        assert_eq!(relax_query("\"stares motherfuckingly\" samuel").as_deref(), Some("stares motherfuckingly samuel"));
+        assert_eq!(relax_query("rust async -tokio site:docs.rs").as_deref(), Some("rust async site:docs.rs"));
+        assert_eq!(relax_query("plain words"), None);
+    }
+
+    // ---- engine behaviour with scripted backends
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Scripted {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+        /// per-call results: Some(n) = n hits, None = error; the last entry repeats
+        script: Vec<Option<usize>>,
+    }
+
+    #[async_trait]
+    impl Backend for Scripted {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn search(&self, _web: &Web, q: &Query) -> anyhow::Result<Vec<Hit>> {
+            let i = self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.script.get(i).or(self.script.last()).copied().flatten() {
+                None => bail!("HTTP 429 Too Many Requests"),
+                Some(n) => Ok((0..n)
+                    .map(|k| Hit {
+                        title: format!("{} {k}", self.name),
+                        url: format!("https://{}.example/{}/{k}", self.name, q.text.replace(' ', "-")),
+                        snippet: String::new(),
+                        engine: self.name.into(),
+                        date: None,
+                    })
+                    .collect()),
+            }
+        }
+    }
+
+    fn scripted(name: &'static str, script: Vec<Option<usize>>) -> (Box<dyn Backend>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (Box::new(Scripted { name, calls: calls.clone(), script }), calls)
+    }
+
+    fn web() -> Web {
+        Web::new(Arc::new(Config::for_tests("reports".into()))).unwrap()
+    }
+
+    fn q(text: &str) -> Query {
+        Query { text: text.into(), max: 8, time_range: None, kind: Kind::Web }
+    }
+
+    #[tokio::test]
+    async fn fallback_tops_up_from_the_next_backend() {
+        let (a, _) = scripted("a", vec![Some(2)]);
+        let (b, b_calls) = scripted("b", vec![Some(3)]);
+        let (c, c_calls) = scripted("c", vec![Some(3)]);
+        let e = SearchEngine::new(vec![a, b, c], SearchMode::Fallback);
+        let hits = e.search(&web(), &q("x")).await.unwrap();
+        assert_eq!(hits.len(), 5, "2 from a + 3 from b");
+        assert_eq!(b_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(c_calls.load(Ordering::SeqCst), 0, "enough results already");
+    }
+
+    #[tokio::test]
+    async fn failing_backend_cools_down_and_is_skipped() {
+        let (a, a_calls) = scripted("a", vec![None]);
+        let (b, _) = scripted("b", vec![Some(5)]);
+        let e = SearchEngine::new(vec![a, b], SearchMode::Fallback);
+        let w = web();
+        for i in 0..4 {
+            e.search(&w, &q(&format!("query {i}"))).await.unwrap();
+        }
+        assert_eq!(a_calls.load(Ordering::SeqCst), 2, "skipped after two failures in a row");
+        let st = e.status();
+        assert!(st[0].cooldown_secs > 0 && st[0].failures == 2, "{st:?}");
+        assert_eq!(st[1].ok, 4);
+    }
+
+    #[tokio::test]
+    async fn retries_once_when_every_backend_fails() {
+        let (a, a_calls) = scripted("a", vec![None, Some(4)]);
+        let mut e = SearchEngine::new(vec![a], SearchMode::Fallback);
+        e.retry_pause = std::time::Duration::from_millis(1);
+        let hits = e.search(&web(), &q("x")).await.unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(a_calls.load(Ordering::SeqCst), 2);
+
+        let (b, _) = scripted("b", vec![None]);
+        let mut e = SearchEngine::new(vec![b], SearchMode::Fusion);
+        e.retry_pause = std::time::Duration::from_millis(1);
+        let err = e.search(&web(), &q("y")).await.unwrap_err();
+        assert!(format!("{err}").contains("all search backends failed"));
+    }
+
+    #[tokio::test]
+    async fn empty_results_are_not_cached() {
+        let (a, a_calls) = scripted("a", vec![Some(0), Some(3)]);
+        let e = SearchEngine::new(vec![a], SearchMode::Fallback);
+        let w = web();
+        assert!(e.search(&w, &q("x")).await.unwrap().is_empty());
+        assert_eq!(e.search(&w, &q("x")).await.unwrap().len(), 3, "asked again, not served an empty cache entry");
+        assert_eq!(e.search(&w, &q("x")).await.unwrap().len(), 3);
+        assert_eq!(a_calls.load(Ordering::SeqCst), 2, "non-empty result was cached");
     }
 
     #[test]

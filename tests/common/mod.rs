@@ -1,16 +1,19 @@
 //! Test doubles: a scripted LLM and offline web tools.
 #![allow(dead_code)]
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use cookie_web::{
     config::Config,
     engine::Engine,
-    llm::{ChatModel, ChatRequest, Message, ModelInfo, ToolCall},
+    llm::{ChatModel, ChatRequest, Completion, Message, ModelInfo, ToolCall},
     sources::SourceKind,
     tools::{Registry, Tool, ToolCtx, ToolOutput},
 };
@@ -23,11 +26,33 @@ pub struct FakeLlm {
     pub native_tools: bool,
     pub calls: AtomicUsize,
     pub log: Mutex<Vec<String>>,
+    /// Fail this many writing attempts (after streaming a few tokens) before succeeding.
+    pub write_failures: AtomicUsize,
+    /// Native tool-calling rounds return an error (like a malformed tool call).
+    pub native_broken: AtomicBool,
+    /// Every call fails, as if Ollama were down.
+    pub down: AtomicBool,
+    /// Writing panics.
+    pub panic_on_write: AtomicBool,
+    /// Writing takes this long.
+    pub write_delay: Mutex<Duration>,
+    /// The writer's reply.
+    pub answer: Mutex<String>,
 }
 
 impl FakeLlm {
     pub fn new(native_tools: bool) -> Self {
-        Self { native_tools, calls: AtomicUsize::new(0), log: Mutex::new(vec![]) }
+        Self {
+            native_tools,
+            calls: AtomicUsize::new(0),
+            log: Mutex::new(vec![]),
+            write_failures: AtomicUsize::new(0),
+            native_broken: AtomicBool::new(false),
+            down: AtomicBool::new(false),
+            panic_on_write: AtomicBool::new(false),
+            write_delay: Mutex::new(Duration::ZERO),
+            answer: Mutex::new(ANSWER.to_string()),
+        }
     }
     fn note(&self, s: &str) {
         self.log.lock().unwrap().push(s.to_string());
@@ -42,7 +67,14 @@ impl ChatModel for FakeLlm {
 
     async fn chat(&self, req: ChatRequest) -> anyhow::Result<Message> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.down.load(Ordering::SeqCst) {
+            anyhow::bail!("cannot reach Ollama (fake outage)");
+        }
         let sys = req.messages.first().map(|m| m.content.clone()).unwrap_or_default();
+        if sys.contains("You help a web search that found nothing") {
+            self.note("rephrase");
+            return Ok(Message::assistant(r#"{"queries":["rescued query","another angle"]}"#));
+        }
         if sys.contains("You triage") {
             self.note("triage");
             return Ok(Message::assistant(
@@ -68,6 +100,9 @@ impl ChatModel for FakeLlm {
                 .any(|m| m.content.contains("Result of fetch_page") || m.tool_name.as_deref() == Some("fetch_page"));
             if !req.tools.is_empty() {
                 self.note("agent-native");
+                if self.native_broken.load(Ordering::SeqCst) {
+                    anyhow::bail!("Ollama error (500): error parsing tool call");
+                }
                 if fetched {
                     return Ok(Message::assistant("DONE"));
                 }
@@ -89,13 +124,29 @@ impl ChatModel for FakeLlm {
         &self,
         _req: ChatRequest,
         on_token: &(dyn for<'t> Fn(&'t str) + Send + Sync),
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Completion> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.note("write");
-        for chunk in ANSWER.split_inclusive(' ') {
+        let delay = *self.write_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if self.panic_on_write.load(Ordering::SeqCst) {
+            panic!("fake writer panic");
+        }
+        if self.down.load(Ordering::SeqCst) {
+            anyhow::bail!("cannot reach Ollama (fake outage)");
+        }
+        if self.write_failures.load(Ordering::SeqCst) > 0 {
+            self.write_failures.fetch_sub(1, Ordering::SeqCst);
+            on_token("Half an ans");
+            anyhow::bail!("Ollama stream interrupted (fake)");
+        }
+        let answer = self.answer.lock().unwrap().clone();
+        for chunk in answer.split_inclusive(' ') {
             on_token(chunk);
         }
-        Ok(ANSWER.to_string())
+        Ok(Completion::new(answer))
     }
 
     async fn supports_tools(&self, _model: Option<&str>) -> bool {
@@ -128,7 +179,11 @@ impl Tool for FakeSearch {
         json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
-        let q = args["query"].as_str().unwrap_or("").replace(' ', "-");
+        let raw = args["query"].as_str().unwrap_or("");
+        if raw.contains("nothing") {
+            return Ok(ToolOutput::new("No results.", "no results").with_data(json!({ "hits": [] })));
+        }
+        let q = raw.replace(' ', "-");
         let hits: Vec<Value> = (1..=3)
             .map(|i| json!({ "title": format!("{q} result {i}"), "url": format!("https://site{i}.example/{q}"), "snippet": format!("snippet {i}"), "engine": "fake" }))
             .collect();
@@ -147,7 +202,8 @@ impl Tool for FakeSearch {
     }
 }
 
-pub struct FakeFetch;
+/// Offline page reader; URLs containing `.0` (if set) fail like dead links.
+pub struct FakeFetch(pub Option<&'static str>);
 
 #[async_trait]
 impl Tool for FakeFetch {
@@ -165,6 +221,10 @@ impl Tool for FakeFetch {
             return Ok(ToolOutput::new("budget exhausted", "budget exhausted"));
         }
         let url = args["url"].as_str().unwrap_or("");
+        if self.0.is_some_and(|bad| url.contains(bad)) {
+            ctx.refund_fetch();
+            anyhow::bail!("HTTP 404 for {url}");
+        }
         let n = ctx.add_source("Fetched page", url, "", SourceKind::Page, None);
         Ok(ToolOutput::new(format!("[{n}] Fetched page\nURL: {url}\n\nLots of useful content."), format!("read [{n}]")))
     }
@@ -199,9 +259,32 @@ pub fn fake_registry() -> Registry {
     let mut r = Registry::new();
     r.add(FakeSearch("web_search"));
     r.add(FakeSearch("news_search"));
-    r.add(FakeFetch);
+    r.add(FakeFetch(None));
     r.add(FakeWiki);
     r
+}
+
+/// A tool that panics, to prove one broken tool can't take a job down.
+pub struct PanicTool(pub &'static str);
+
+#[async_trait]
+impl Tool for PanicTool {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+    fn description(&self) -> &'static str {
+        "panics"
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{}})
+    }
+    async fn call(&self, _args: Value, _ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
+        panic!("tool exploded")
+    }
+}
+
+pub fn engine_custom(llm: Arc<FakeLlm>, tools: Registry, cfg: Config) -> Arc<Engine> {
+    Arc::new(Engine::new(Arc::new(cfg), llm, Arc::new(tools)))
 }
 
 pub fn tmp_dir(name: &str) -> std::path::PathBuf {

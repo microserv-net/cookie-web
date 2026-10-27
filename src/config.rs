@@ -50,6 +50,7 @@ pub struct Config {
     pub brave_api_key: Option<String>,
     pub tavily_api_key: Option<String>,
     pub ollama_api_key: Option<String>,
+    /// Drop the keyless scraping backends (DuckDuckGo, Bing, Mojeek).
     pub disable_duckduckgo: bool,
 
     pub reports_dir: PathBuf,
@@ -60,6 +61,13 @@ pub struct Config {
     pub fetch_timeout: Duration,
     pub max_page_bytes: usize,
     pub cors_origins: Vec<String>,
+
+    /// Hard limit for one research job; it fails with a clear error instead of hanging.
+    pub job_timeout: Duration,
+    /// Multiplies the per-depth gathering time budgets (raise on slow CPUs, lower on GPUs).
+    pub time_scale: f64,
+    /// When a page can't be fetched (dead link, 403, timeout), try its Wayback Machine copy.
+    pub archive_fallback: bool,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -108,7 +116,7 @@ impl Config {
             brave_api_key: var("BRAVE_API_KEY"),
             tavily_api_key: var("TAVILY_API_KEY"),
             ollama_api_key: var("OLLAMA_API_KEY"),
-            disable_duckduckgo: flag("COOKIE_DISABLE_DUCKDUCKGO", false),
+            disable_duckduckgo: flag("COOKIE_DISABLE_SCRAPERS", false) || flag("COOKIE_DISABLE_DUCKDUCKGO", false),
             reports_dir: PathBuf::from(var("COOKIE_REPORTS_DIR").unwrap_or_else(|| "reports".into())),
             api_key: var("COOKIE_API_KEY"),
             // One model instance serves one request at a time on small boxes; queue the rest.
@@ -124,6 +132,9 @@ impl Config {
             cors_origins: var("COOKIE_CORS_ORIGINS")
                 .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
                 .unwrap_or_else(|| vec!["*".into()]),
+            job_timeout: Duration::from_secs(parse("COOKIE_JOB_TIMEOUT_SECS", 1800u64).max(30)),
+            time_scale: parse("COOKIE_TIME_SCALE", 1.0f64).clamp(0.1, 20.0),
+            archive_fallback: flag("COOKIE_ARCHIVE_FALLBACK", true),
         }
     }
 
@@ -174,6 +185,9 @@ impl Config {
             fetch_timeout: Duration::from_secs(5),
             max_page_bytes: 1024 * 1024,
             cors_origins: vec!["*".into()],
+            job_timeout: Duration::from_secs(120),
+            time_scale: 1.0,
+            archive_fallback: false,
         }
     }
 }

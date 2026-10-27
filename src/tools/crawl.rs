@@ -75,6 +75,9 @@ impl Tool for CrawlSite {
          relevant excerpt of each page. Use for documentation sites, blogs or when an answer is spread across \
          several pages of one site. Costly: prefer fetch_page for a single page."
     }
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(150)
+    }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
@@ -103,7 +106,7 @@ impl Tool for CrawlSite {
                 "budget exhausted",
             ));
         }
-        let _ = ctx.take_fetch();
+        let second = ctx.take_fetch();
 
         let robots_url = format!("{}://{}/robots.txt", start_url.scheme(), start_url.host_str().unwrap_or(""));
         let rules = match self.web.get_bytes(&robots_url).await {
@@ -155,6 +158,10 @@ impl Tool for CrawlSite {
             }
         }
         if pages.is_empty() {
+            ctx.refund_fetch();
+            if second {
+                ctx.refund_fetch();
+            }
             bail!("could not read any page from {start}");
         }
         let mut text = format!("Crawled {} pages on {host}:\n", pages.len());

@@ -46,6 +46,7 @@ impl Depth {
                 page_chars: 4_000,
                 evidence_chars: 9_000,
                 write_tokens: 600,
+                gather_secs: 120,
                 target: "A direct answer in one or two short paragraphs (roughly 60-180 words). \
                          Then a `**Links**` list with the 3-5 most useful links as `- [Title](url) — why it's useful`. \
                          No other headings.",
@@ -57,6 +58,7 @@ impl Depth {
                 page_chars: 6_000,
                 evidence_chars: 22_000,
                 write_tokens: 1_500,
+                gather_secs: 300,
                 target: "A well-structured answer of roughly 300-700 words: start with a one-paragraph direct answer, \
                          then a few `##` sections with bullets where they help. Inline citations throughout.",
             },
@@ -67,6 +69,7 @@ impl Depth {
                 page_chars: 8_000,
                 evidence_chars: 40_000,
                 write_tokens: 3_500,
+                gather_secs: 900,
                 target: "A full research report of roughly 1000-2000 words. Start with `# <Title>`, then a \
                          `## TL;DR` of 3-5 bullets, then thematic `##` sections, a comparison table if \
                          things are being compared, and a final `## Caveats & open questions` section. \
@@ -104,6 +107,9 @@ pub struct Profile {
     /// Max characters of evidence given to the writer.
     pub evidence_chars: usize,
     pub write_tokens: u32,
+    /// Soft time budget for gathering (seconds, before `COOKIE_TIME_SCALE`); when it runs out,
+    /// cookie-web stops researching and writes with what it has.
+    pub gather_secs: u64,
     /// Formatting brief for the writer.
     pub target: &'static str,
 }
@@ -178,9 +184,9 @@ pub struct Triage {
     pub decided_by: String,
 }
 
+/// Unmistakable requests for a long answer.
 const DEEP_MARKERS: &[&str] = &[
     "report",
-    "research",
     "in-depth",
     "in depth",
     "deep dive",
@@ -188,24 +194,42 @@ const DEEP_MARKERS: &[&str] = &[
     "comprehensive",
     "thorough",
     "detailed",
-    "literature",
+    "literature review",
+    "state of the art",
+    "state-of-the-art",
+    "everything about",
+    "white paper",
+    "whitepaper",
+    "explain in detail",
+    "write up",
+    "write-up",
+];
+/// Words that *often* mean "go deep" but also appear in ordinary questions
+/// ("who funds cancer research?"): they lean deep, but the model gets the final say.
+const DEEP_HINTS: &[&str] = &[
+    "research",
     "analysis",
     "analyse",
     "analyze",
     "landscape",
-    "state of the art",
-    "state-of-the-art",
-    "everything about",
     "pros and cons",
     "market",
-    "white paper",
-    "whitepaper",
     "survey of",
     "overview of",
-    "explain in detail",
+    "literature",
 ];
-const COMPARE_MARKERS: &[&str] =
-    &[" vs ", " vs. ", " versus ", "compare", "comparison", "difference between", "better than", "alternatives to"];
+const COMPARE_MARKERS: &[&str] = &[
+    " vs ",
+    " vs. ",
+    " versus ",
+    "compare",
+    "compared",
+    "comparing",
+    "comparison",
+    "difference between",
+    "better than",
+    "alternatives to",
+];
 const NEWS_MARKERS: &[&str] =
     &["news", "latest", "today", "this week", "recent", "announced", "just released", "update on", "current status"];
 const HOWTO_MARKERS: &[&str] = &[
@@ -217,11 +241,14 @@ const HOWTO_MARKERS: &[&str] = &[
     "guide",
     "tutorial",
     "install",
+    "installing",
+    "guides",
     "set up",
     "setup",
     "configure",
     "fix ",
     "error",
+    "errors",
 ];
 const LINK_MARKERS: &[&str] = &[
     "link",
@@ -238,8 +265,18 @@ const LINK_MARKERS: &[&str] = &[
 const QUESTION_WORDS: &[&str] =
     &["what", "who", "when", "where", "which", "why", "how", "is", "are", "does", "do", "can", "should", "will", "did"];
 
+/// Does `hay` contain any of the phrases as whole words? ("link" must not match "Linkin Park",
+/// "error" must not match "terror".) Phrases starting/ending with a space keep their own boundary.
 fn has_any(hay: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|n| hay.contains(n))
+    needles.iter().any(|n| {
+        let n = n.trim();
+        hay.match_indices(n).any(|(i, _)| {
+            let before = hay[..i].chars().next_back();
+            let after = hay[i + n.len()..].chars().next();
+            let edge = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+            edge(before) && edge(after)
+        })
+    })
 }
 
 /// Explicit user overrides: a leading `!quick`, `!standard` or `!deep` token.
@@ -270,7 +307,7 @@ pub fn heuristic(query: &str) -> (Triage, bool) {
         Intent::Howto
     } else if has_any(&q, NEWS_MARKERS) {
         Intent::News
-    } else if has_any(&q, DEEP_MARKERS) {
+    } else if has_any(&q, DEEP_MARKERS) || has_any(&q, DEEP_HINTS) {
         Intent::Research
     } else if n <= 4 && !is_question {
         Intent::Entity
@@ -286,8 +323,11 @@ pub fn heuristic(query: &str) -> (Triage, bool) {
         decided_by: "heuristic".into(),
     };
 
-    if has_any(&q, DEEP_MARKERS) || (n >= 25) {
+    if has_any(&q, DEEP_MARKERS) {
         return (mk(Depth::Deep, "asks for an in-depth report/analysis"), true);
+    }
+    if has_any(&q, DEEP_HINTS) || n >= 25 {
+        return (mk(Depth::Deep, "looks like it wants a thorough answer"), false);
     }
     if n <= 3 && !is_question {
         return (mk(Depth::Quick, "a bare word/phrase: identify it and point to the best links"), true);
@@ -391,6 +431,25 @@ mod tests {
         }
         // a big window keeps the profile's own caps
         assert_eq!(Depth::Quick.profile().fit_to_context(65536).evidence_chars, 9_000);
+    }
+
+    #[test]
+    fn markers_match_whole_words() {
+        let (t, _) = heuristic("Linkin Park");
+        assert_eq!(t.intent, Intent::Entity, "'link' must not match 'Linkin'");
+        let (t, _) = heuristic("what is the terror bird");
+        assert_ne!(t.intent, Intent::Howto, "'error' must not match 'terror'");
+        let (t, _) = heuristic("download links for ubuntu 24.04");
+        assert_eq!(t.intent, Intent::Links);
+    }
+
+    #[test]
+    fn ambiguous_deep_words_defer_to_the_model() {
+        let (t, confident) = heuristic("who funds most cancer research in europe");
+        assert_eq!(t.depth, Depth::Deep);
+        assert!(!confident);
+        let (_, confident) = heuristic("give me a detailed report on cancer research funding");
+        assert!(confident);
     }
 
     #[test]

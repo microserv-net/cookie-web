@@ -109,6 +109,20 @@ impl ChatRequest {
     }
 }
 
+/// The result of a streamed completion.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Completion {
+    pub text: String,
+    /// The model stopped because it hit `max_tokens` (the text may end mid-sentence).
+    pub truncated: bool,
+}
+
+impl Completion {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into(), truncated: false }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ModelInfo {
     pub reachable: bool,
@@ -137,12 +151,12 @@ pub trait ChatModel: Send + Sync {
     async fn chat(&self, req: ChatRequest) -> anyhow::Result<Message>;
 
     /// Streaming completion; `on_token` is called with each content delta.
-    /// Returns the full text.
+    /// Returns the full text and whether it was cut off by the token limit.
     async fn chat_stream(
         &self,
         req: ChatRequest,
         on_token: &(dyn for<'t> Fn(&'t str) + Send + Sync),
-    ) -> anyhow::Result<String>;
+    ) -> anyhow::Result<Completion>;
 
     /// Whether the given model (or the main one) supports native tool calling.
     async fn supports_tools(&self, model: Option<&str>) -> bool;

@@ -40,6 +40,7 @@ pub enum JobStatus {
     Running,
     Done,
     Error,
+    Cancelled,
 }
 
 pub struct Job {
@@ -52,10 +53,14 @@ pub struct Job {
     result: Mutex<Option<ResearchResult>>,
     error: Mutex<Option<String>>,
     tick: watch::Sender<usize>,
+    /// Aborts the running task (`DELETE /api/jobs/{id}`).
+    abort: Mutex<Option<tokio::task::AbortHandle>>,
+    /// The caller's `Idempotency-Key`, if any.
+    key: Option<String>,
 }
 
 impl Job {
-    fn new(query: &str) -> Arc<Self> {
+    fn new(query: &str, key: Option<String>) -> Arc<Self> {
         let (tick, _) = watch::channel(0);
         Arc::new(Self {
             id: format!("job_{}", uuid::Uuid::new_v4().simple()),
@@ -67,6 +72,8 @@ impl Job {
             result: Mutex::new(None),
             error: Mutex::new(None),
             tick,
+            abort: Mutex::new(None),
+            key,
         })
     }
 
@@ -75,7 +82,24 @@ impl Job {
     }
 
     fn finished(&self) -> bool {
-        matches!(self.status(), JobStatus::Done | JobStatus::Error)
+        matches!(self.status(), JobStatus::Done | JobStatus::Error | JobStatus::Cancelled)
+    }
+
+    /// Stop the job if it is still queued or running. Returns false if it had already finished.
+    pub fn cancel(&self) -> bool {
+        {
+            let mut st = self.status.lock().unwrap();
+            if matches!(*st, JobStatus::Done | JobStatus::Error | JobStatus::Cancelled) {
+                return false;
+            }
+            *st = JobStatus::Cancelled;
+        }
+        *self.error.lock().unwrap() = Some("cancelled".into());
+        if let Some(h) = self.abort.lock().unwrap().as_ref() {
+            h.abort();
+        }
+        self.tick.send_modify(|_| {});
+        true
     }
 
     fn push(&self, e: Event) {
@@ -99,7 +123,10 @@ impl Job {
             ev.len()
         };
         if let Some(s) = finished_now {
-            *self.status.lock().unwrap() = s;
+            let mut st = self.status.lock().unwrap();
+            if *st != JobStatus::Cancelled {
+                *st = s;
+            }
         }
         self.tick.send_replace(len);
     }
@@ -145,9 +172,25 @@ impl AppState {
         Self { engine, jobs: Arc::new(Mutex::new(HashMap::new())), slots }
     }
 
-    /// Start a research job in the background.
-    pub fn spawn(&self, req: ResearchRequest) -> Arc<Job> {
-        let job = Job::new(req.query.trim());
+    /// Start a research job in the background. With an idempotency `key`, a request that repeats
+    /// the key of a job still queued, running or done returns that job instead of starting another.
+    pub fn spawn(&self, req: ResearchRequest, key: Option<String>) -> Arc<Job> {
+        if let Some(k) = key.as_deref() {
+            let existing = self
+                .jobs
+                .lock()
+                .unwrap()
+                .values()
+                .find(|j| {
+                    j.key.as_deref() == Some(k)
+                        && matches!(j.status(), JobStatus::Queued | JobStatus::Running | JobStatus::Done)
+                })
+                .cloned();
+            if let Some(j) = existing {
+                return j;
+            }
+        }
+        let job = Job::new(req.query.trim(), key);
         self.jobs.lock().unwrap().insert(job.id.clone(), job.clone());
         let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
         let events = Events::new(tx);
@@ -162,20 +205,62 @@ impl AppState {
 
         let st = self.clone();
         let j = job.clone();
-        tokio::spawn(async move {
-            let Ok(_permit) = st.slots.clone().acquire_owned().await else { return };
-            *j.status.lock().unwrap() = JobStatus::Running;
+        let ev = events.clone();
+        let work = tokio::spawn(async move {
+            let permit = match st.slots.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    let ahead = st.queued_before(&j);
+                    ev.status(match ahead {
+                        0 => "Queued — waiting for the current job to finish".to_string(),
+                        n => format!("Queued — {n} job(s) ahead of this one"),
+                    });
+                    st.slots.clone().acquire_owned().await.map_err(|_| anyhow::anyhow!("server is shutting down"))?
+                }
+            };
+            {
+                let mut s = j.status.lock().unwrap();
+                if *s == JobStatus::Queued {
+                    *s = JobStatus::Running;
+                }
+            }
             j.tick.send_modify(|_| {});
-            let res = st.engine.run(req, events.clone()).await;
-            match res {
-                Ok(r) => events.emit(Event::Done { result: Box::new(r) }),
-                Err(e) => {
+            let res = st.engine.run(req, ev).await;
+            drop(permit);
+            res
+        });
+        *job.abort.lock().unwrap() = Some(work.abort_handle());
+
+        // Whatever happens to the work — success, error, cancellation, even a panic — the job ends
+        // with exactly one `done` or `error` event, so no client is ever left waiting.
+        let j = job.clone();
+        tokio::spawn(async move {
+            match work.await {
+                Ok(Ok(r)) => events.emit(Event::Done { result: Box::new(r) }),
+                Ok(Err(e)) => {
                     tracing::warn!("job {} failed: {e:#}", j.id);
                     events.emit(Event::Error { message: format!("{e:#}") });
+                }
+                Err(e) if e.is_cancelled() => {
+                    events.emit(Event::Error { message: "cancelled".into() });
+                }
+                Err(e) => {
+                    tracing::error!("job {} crashed: {e}", j.id);
+                    events.emit(Event::Error { message: format!("internal error: the job crashed ({e})") });
                 }
             }
         });
         job
+    }
+
+    /// Jobs queued before `job` (for the "waiting" message).
+    fn queued_before(&self, job: &Job) -> usize {
+        self.jobs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|j| j.id != job.id && j.created < job.created && j.status() == JobStatus::Queued)
+            .count()
     }
 
     fn get(&self, id: &str) -> Option<Arc<Job>> {
@@ -222,6 +307,14 @@ fn validate(req: &ResearchRequest) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    match headers.get("idempotency-key").map(|v| v.to_str()) {
+        None => Ok(None),
+        Some(Ok(k)) if !k.trim().is_empty() && k.len() <= 200 => Ok(Some(k.trim().to_string())),
+        Some(_) => Err(bad("`Idempotency-Key` must be 1-200 visible characters")),
+    }
+}
+
 // ---------------------------------------------------------------- handlers
 
 async fn index() -> Html<&'static str> {
@@ -235,15 +328,19 @@ fn asset(body: &'static str, ctype: &'static str) -> Response {
 async fn health(State(st): State<AppState>) -> Json<Value> {
     let info = st.engine.llm.info().await;
     let ok = info.reachable && info.available;
+    let search = st.engine.tools.search.as_ref().map(|s| s.status()).unwrap_or_default();
+    let backends: Vec<&str> = search.iter().map(|b| b.name).collect();
     Json(json!({
         "status": if ok { "ok" } else { "degraded" },
         "version": VERSION,
         "model": info,
         "fast_model": st.engine.cfg.fast_model(),
         "tools": st.engine.tools.names(),
-        "search_backends": crate::tools::search::SearchEngine::from_config(&st.engine.cfg).names(),
+        "search_backends": backends,
+        "search_health": search,
         "search_mode": format!("{:?}", st.engine.cfg.search_mode).to_lowercase(),
         "jobs_running": st.jobs.lock().unwrap().values().filter(|j| j.status() == JobStatus::Running).count(),
+        "jobs_queued": st.jobs.lock().unwrap().values().filter(|j| j.status() == JobStatus::Queued).count(),
         "max_concurrent": st.engine.cfg.max_concurrent,
         "num_ctx": st.engine.cfg.num_ctx,
         "agent_mode": format!("{:?}", st.engine.cfg.agent_mode).to_lowercase(),
@@ -268,13 +365,19 @@ pub fn manifest_json(st: &AppState) -> Value {
             "model": "string (optional) — Ollama model override",
             "save": "bool (default true) — persist the Markdown report"
         },
-        "output": "ResearchResult { id, query, depth, intent, triage, markdown, sources[], stats, model, created_at, report_path }",
+        "output": "ResearchResult { id, query, depth, intent, triage, markdown, sources[], stats, model, created_at, report_path, warnings[], degraded }",
+        "reliability": {
+            "idempotency": "send an Idempotency-Key header to make retried POSTs reattach to the same job",
+            "resume": "reconnect to /api/jobs/{id}/events with ?from=<last event id> (or Last-Event-ID)",
+            "degraded": "if the model fails, the answer is a digest of the sources and degraded=true"
+        },
         "endpoints": {
             "research": { "method": "POST", "path": "/api/research", "returns": "ResearchResult (JSON) or text/markdown" },
             "stream": { "method": "POST", "path": "/api/research/stream", "returns": "text/event-stream" },
             "submit_job": { "method": "POST", "path": "/api/jobs", "returns": "202 Job" },
             "job": { "method": "GET", "path": "/api/jobs/{id}" },
-            "job_events": { "method": "GET", "path": "/api/jobs/{id}/events", "returns": "text/event-stream (replays from start)" },
+            "job_events": { "method": "GET", "path": "/api/jobs/{id}/events?from={n}", "returns": "text/event-stream (replays from event n, default the start)" },
+            "cancel_job": { "method": "DELETE", "path": "/api/jobs/{id}" },
             "reports": { "method": "GET", "path": "/api/reports" },
             "report": { "method": "GET", "path": "/api/reports/{id}" },
             "report_markdown": { "method": "GET", "path": "/api/reports/{id}/markdown" },
@@ -315,7 +418,7 @@ async fn research(
     Json(req): Json<ResearchRequest>,
 ) -> Result<Response, ApiError> {
     validate(&req)?;
-    let job = st.spawn(req);
+    let job = st.spawn(req, idempotency_key(&headers)?);
     job.wait().await;
     if let Some(r) = job.result.lock().unwrap().clone() {
         if wants_markdown(&fq, &headers) {
@@ -329,10 +432,11 @@ async fn research(
     Err(ApiError(StatusCode::BAD_GATEWAY, err))
 }
 
-fn sse_for(job: Arc<Job>) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+/// SSE view of a job, starting after event number `from` (0 = from the beginning).
+fn sse_for(job: Arc<Job>, from: usize) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let stream = async_stream::stream! {
         let mut rx = job.tick.subscribe();
-        let mut idx = 0usize;
+        let mut idx = from.min(job.events.lock().unwrap().len());
         loop {
             let batch: Vec<Event> = {
                 let ev = job.events.lock().unwrap();
@@ -354,18 +458,26 @@ fn sse_for(job: Arc<Job>) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
-async fn research_stream(State(st): State<AppState>, Json(req): Json<ResearchRequest>) -> Result<Response, ApiError> {
+async fn research_stream(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ResearchRequest>,
+) -> Result<Response, ApiError> {
     validate(&req)?;
-    let job = st.spawn(req);
-    let mut resp = sse_for(job.clone()).into_response();
+    let job = st.spawn(req, idempotency_key(&headers)?);
+    let mut resp = sse_for(job.clone(), 0).into_response();
     resp.headers_mut().insert("x-cookie-job", HeaderValue::from_str(&job.id).unwrap());
     resp.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
     Ok(resp)
 }
 
-async fn submit_job(State(st): State<AppState>, Json(req): Json<ResearchRequest>) -> Result<Response, ApiError> {
+async fn submit_job(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ResearchRequest>,
+) -> Result<Response, ApiError> {
     validate(&req)?;
-    let job = st.spawn(req);
+    let job = st.spawn(req, idempotency_key(&headers)?);
     let mut body = job.snapshot(false);
     body["status_url"] = json!(format!("/api/jobs/{}", job.id));
     Ok((StatusCode::ACCEPTED, [(header::LOCATION, format!("/api/jobs/{}", job.id))], Json(body)).into_response())
@@ -382,9 +494,30 @@ async fn get_job(State(st): State<AppState>, Path(id): Path<String>) -> Result<J
     st.get(&id).map(|j| Json(j.snapshot(true))).ok_or_else(|| not_found("job"))
 }
 
-async fn job_events(State(st): State<AppState>, Path(id): Path<String>) -> Result<Response, ApiError> {
+#[derive(Deserialize)]
+struct FromQ {
+    from: Option<usize>,
+}
+
+async fn job_events(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<FromQ>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     let job = st.get(&id).ok_or_else(|| not_found("job"))?;
-    Ok(sse_for(job).into_response())
+    let last_id = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
+    let mut resp = sse_for(job, q.from.or(last_id).unwrap_or(0)).into_response();
+    resp.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+    Ok(resp)
+}
+
+async fn cancel_job(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let job = st.get(&id).ok_or_else(|| not_found("job"))?;
+    if job.cancel() {
+        tracing::info!("job {id} cancelled by the client");
+    }
+    Ok(Json(job.snapshot(false)))
 }
 
 #[derive(Deserialize)]
@@ -473,7 +606,7 @@ pub fn router(st: AppState) -> Router {
         .route("/api/research", post(research))
         .route("/api/research/stream", post(research_stream))
         .route("/api/jobs", post(submit_job).get(list_jobs))
-        .route("/api/jobs/{id}", get(get_job))
+        .route("/api/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/api/jobs/{id}/events", get(job_events))
         .route("/api/reports", get(list_reports))
         .route("/api/reports/{id}", get(get_report).delete(delete_report))
@@ -501,10 +634,33 @@ pub async fn serve(engine: Arc<Engine>) -> anyhow::Result<()> {
         cfg.model,
         cfg.ollama_host
     );
-    axum::serve(listener, router(st))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    axum::serve(listener, router(st)).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
+}
+
+/// Ctrl-C or SIGTERM (systemd, Docker). Open SSE streams get 10 s to finish, then the process exits.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term => {},
+    }
+    tracing::info!("shutting down");
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        std::process::exit(0);
+    });
 }
