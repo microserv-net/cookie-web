@@ -184,6 +184,7 @@ if systemd_running; then
 	$SUDO systemctl enable --quiet cookie-web
 	$SUDO systemctl restart cookie-web
 	MANAGED="systemd (starts on boot, restarts if it stops)"
+	LOG=""
 else
 	warn "systemd is not running here, so cookie-web won't start on boot"
 	pkill -x cookie-web 2>/dev/null || true
@@ -193,7 +194,9 @@ else
 		# shellcheck disable=SC1090
 		. <($SUDO cat "$ENV_FILE")
 		set +a
-		cd "$DATA" && nohup /usr/local/bin/cookie-web serve >"$LOG" 2>&1 &
+		cd "$DATA"
+		# fully detached, so nothing holds this script's output open
+		nohup /usr/local/bin/cookie-web serve >"$LOG" 2>&1 </dev/null &
 	)
 	MANAGED="a background process (log: $LOG)"
 fi
@@ -227,4 +230,4 @@ if [ -n "$API_KEY" ]; then
 	echo "            stored in $ENV_FILE"
 fi
 echo "  Check:    sudo bash -c 'set -a; . $ENV_FILE; cookie-web doctor'"
-echo "  Logs:     journalctl -u cookie-web -f"
+if [ -n "${LOG:-}" ]; then echo "  Logs:     $LOG"; else echo "  Logs:     journalctl -u cookie-web -f"; fi
