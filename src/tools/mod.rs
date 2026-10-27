@@ -91,7 +91,14 @@ impl ToolCtx {
 
     /// Consume one unit of the page-reading budget. Returns false if exhausted.
     pub fn take_fetch(&self) -> bool {
-        self.fetches_left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n > 0).then_some(n - 1)).is_ok()
+        let mut n = self.fetches_left.load(Ordering::SeqCst);
+        while n > 0 {
+            match self.fetches_left.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
     }
 
     pub fn fetches_left(&self) -> isize {
