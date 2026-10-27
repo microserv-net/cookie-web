@@ -35,7 +35,7 @@ Missing/wrong key → `401 {"error":"missing or invalid API key"}`.
 |---------|---------|---------|---------|
 | `query` | string  | —       | **Required.** Natural-language request (1–4000 chars). A leading `!quick`, `!standard` or `!deep` forces the depth. |
 | `depth` | string  | `auto`  | `auto`, `quick`, `standard` or `deep`. Anything else → 400. |
-| `model` | string  | server default | Ollama model for the agent loop and the writer (e.g. `qwen3:4b`). |
+| `model` | string  | server default | Ollama model for the agent loop and the writer (e.g. `qwen3:4b-instruct`). |
 | `save`  | bool    | `true`  | Persist the report (`.md` + `.json`) to `COOKIE_REPORTS_DIR`. |
 
 ```json
@@ -85,7 +85,7 @@ reasoning in `triage`.
     }
   ],
   "stats": { "tool_calls": 2, "searches": 1, "pages_read": 0, "llm_calls": 1, "duration_ms": 8421 },
-  "model": "qwen3:8b",
+  "model": "qwen3:4b-instruct",
   "created_at": "2026-10-28T01:45:12.004Z",
   "report_path": "reports/20261028-014512-visionquest-3fa9c1.md"
 }
@@ -246,4 +246,4 @@ cookie-web is designed to be one specialist in a larger system:
 4. **Observe** — subscribe to `/api/jobs/{id}/events` to relay progress.
 5. **Consume** — use `result.markdown` for humans and `result.sources` (structured, numbered) for machines.
 
-Concurrency: at most `COOKIE_MAX_CONCURRENT` jobs run at once (default 2); others wait in `queued`.
+Concurrency: at most `COOKIE_MAX_CONCURRENT` jobs run at once (default 1 — one small model serves one request at a time); others wait in `queued`.

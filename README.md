@@ -30,7 +30,7 @@ cookie-web is a single Rust binary: an HTTP API, a built-in web GUI and a CLI. I
 
 ```bash
 # 1. A model (any Ollama model works; tool-calling ones work best)
-ollama pull qwen3:8b            # or qwen3:4b on lighter hardware
+ollama pull qwen3:4b-instruct   # 2.5 GB — see docs/HARDWARE.md
 
 # 2. Build & run
 cargo run --release             # serves http://127.0.0.1:8765
@@ -55,7 +55,7 @@ cargo run --release -- doctor     # checks Ollama, the model and every search ba
 
 ```bash
 docker compose up -d
-docker compose exec ollama ollama pull qwen3:8b
+docker compose exec ollama ollama pull qwen3:4b-instruct
 ```
 
 ## Configuration
@@ -66,25 +66,29 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 |----------|---------|---|
 | `COOKIE_HOST` / `COOKIE_PORT` | `127.0.0.1` / `8765` | listen address |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | |
-| `COOKIE_MODEL` | `qwen3:8b` | main model (agent + writer) |
+| `COOKIE_MODEL` | `qwen3:4b-instruct` | main model (agent + writer) |
 | `COOKIE_FAST_MODEL` | = `COOKIE_MODEL` | optional smaller model for triage, planning, notes |
 | `COOKIE_THINK` | `false` | let thinking models think while writing (slower, sometimes better) |
-| `COOKIE_NUM_CTX` | `16384` | context window requested from Ollama |
+| `COOKIE_NUM_CTX` | `8192` | context window; all prompts are sized to fit it |
+| `COOKIE_KEEP_ALIVE` | `-1` | keep the model loaded forever |
+| `COOKIE_WARMUP` | `true` | load the model when the server starts |
+| `COOKIE_AGENT_MODE` | `auto` | `pipeline` = no model-driven tool rounds (faster on slow CPUs / tiny models) |
 | `SEARXNG_URL` | — | e.g. `http://localhost:8888` (recommended) |
 | `BRAVE_API_KEY` / `TAVILY_API_KEY` / `OLLAMA_API_KEY` | — | optional search APIs |
 | `COOKIE_SEARCH_MODE` | `fallback` | or `fusion` (query all backends, merge rankings) |
 | `COOKIE_DISABLE_DUCKDUCKGO` | `false` | drop the keyless scrapers |
 | `COOKIE_REPORTS_DIR` | `reports` | where `.md` reports are saved |
 | `COOKIE_API_KEY` | — | require `Authorization: Bearer …` on the API |
-| `COOKIE_MAX_CONCURRENT` | `2` | parallel research jobs |
+| `COOKIE_MAX_CONCURRENT` | `1` | parallel research jobs (others queue) |
 | `COOKIE_ALLOW_PRIVATE_URLS` | `false` | allow reading LAN/localhost pages |
 
-### Choosing a model
+### Model & hardware
 
-Pick an Ollama model with **tool support** (`ollama show <model>` lists `tools` under capabilities).
-`qwen3:8b` is a good default; `qwen3:4b` or `llama3.2:3b` for low-end machines (pair a bigger `COOKIE_MODEL`
-with a tiny `COOKIE_FAST_MODEL` to save time on deep reports). Models without native tool calling still work
-through the JSON protocol, just less smoothly.
+Default model: **`qwen3:4b-instruct`** (Qwen3-4B-Instruct-2507, Q4_K_M, 2.5 GB) — the smallest model that
+still does reliable tool calling and cited writing. Always loaded with an 8K context it uses about
+**3.5 GB** in Ollama; cookie-web itself uses ~16 MB. **Minimum box: 8 GB RAM, 4-core AVX2 x86-64 CPU,
+32 GB SSD, no GPU.** Full reasoning, alternatives, speed expectations, Ollama tuning and a systemd setup:
+**[docs/HARDWARE.md](docs/HARDWARE.md)**.
 
 ## API
 

@@ -56,7 +56,11 @@ news leads with dated developments, link requests lead with a curated link list.
    It says `DONE` when it has enough.
 3. **Deterministic floor** — if the model read too little (standard: <2 pages; quick fact questions: 0), code reads
    the top readable results itself.
-4. **No native tool calling?** — models without Ollama `tools` support use a JSON protocol
+4. **Context fitting** — before each round, older tool results are shortened so the conversation stays inside
+   `COOKIE_NUM_CTX` (Ollama would otherwise silently drop the start of the prompt — the instructions).
+5. **Pipeline mode** (`COOKIE_AGENT_MODE=pipeline`) skips step 2 entirely: code searches and reads the top
+   results, the model only triages and writes. For slow CPUs or very small models.
+6. **No native tool calling?** — models without Ollama `tools` support use a JSON protocol
    (`{"tool": "...", "args": {...}}` with Ollama structured output). If native calling errors at runtime, the loop
    switches to the JSON protocol automatically.
 
@@ -112,8 +116,8 @@ and gets a stable number shown to the model as `[n]`. The writer cites with `[n]
 
 - **SSRF guard** — `fetch_page`/`crawl_site` refuse non-http(s) URLs and anything resolving to private,
   loopback or link-local addresses (also checked on redirects). Override with `COOKIE_ALLOW_PRIVATE_URLS=true`.
-- **Limits** — page bodies capped (`COOKIE_MAX_PAGE_BYTES`), fetch timeouts, per-depth budgets, evidence
-  shrunk to fit the context window.
+- **Limits** — page bodies capped (`COOKIE_MAX_PAGE_BYTES`), fetch timeouts, per-depth budgets derived from the
+  context window (`Profile::fit_to_context`), evidence shrunk to fit.
 - **Caching** — pages (30 min) and searches (15 min) are cached in memory.
 - **Concurrency** — `COOKIE_MAX_CONCURRENT` jobs at a time; the rest queue.
 
