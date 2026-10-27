@@ -1,0 +1,45 @@
+services:
+  cookie-web:
+    build: .
+    ports:
+      - "8765:8765"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      SEARXNG_URL: http://searxng:8080
+      COOKIE_MODEL: ${COOKIE_MODEL:-qwen3:4b-instruct}
+      # COOKIE_API_KEY: change-me
+    volumes:
+      - reports:/data/reports
+    depends_on:
+      - ollama
+      - searxng
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_KEEP_ALIVE: "-1"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+    # NVIDIA GPU: uncomment
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-change-me-please}
+    volumes:
+      - ./searxng:/etc/searxng
+    restart: unless-stopped
+
+volumes:
+  ollama:
+  reports:

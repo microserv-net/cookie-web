@@ -1,0 +1,14 @@
+# Minimal SearXNG config for cookie-web: enables the JSON API it needs.
+use_default_settings: true
+
+server:
+  # overridden by the SEARXNG_SECRET environment variable in docker-compose.yml
+  secret_key: "change-me-please"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
