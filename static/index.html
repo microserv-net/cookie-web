@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cookie-web</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js" defer></script>
+</head>
+<body>
+  <aside id="sidebar">
+    <div class="brand">
+      <img src="/favicon.svg" alt="" width="28" height="28">
+      <span>cookie<b>-web</b></span>
+    </div>
+    <button id="new-btn" class="ghost">＋ New research</button>
+    <div class="side-label">History</div>
+    <ul id="history"><li class="muted">No reports yet</li></ul>
+    <div class="side-foot">
+      <a href="/api/manifest" target="_blank">manifest</a> ·
+      <a href="/api/tools" target="_blank">tools</a> ·
+      <a href="/api/health" target="_blank">health</a>
+    </div>
+  </aside>
+
+  <main>
+    <header id="topbar">
+      <button id="menu-btn" class="ghost icon" aria-label="Menu">☰</button>
+      <div id="status" class="pill"><span class="dot"></span><span id="status-text">checking…</span></div>
+      <button id="settings-btn" class="ghost icon" aria-label="Settings">⚙</button>
+    </header>
+
+    <section id="welcome">
+      <h1>What should I look up?</h1>
+      <p class="muted">A word gets a quick answer and links. A question gets a page. Ask for a report and you get a report.
+        Prefix with <code>!quick</code>, <code>!standard</code> or <code>!deep</code> to decide yourself.</p>
+      <div class="examples">
+        <button class="chip example">VisionQuest</button>
+        <button class="chip example">how do I set up WireGuard on Ubuntu?</button>
+        <button class="chip example">latest open-weight LLM releases this month</button>
+        <button class="chip example">detailed report on sodium-ion vs lithium-ion batteries</button>
+      </div>
+    </section>
+
+    <section id="run" hidden>
+      <h2 id="run-query"></h2>
+      <div id="triage" class="chips"></div>
+      <details id="activity" open>
+        <summary><span id="activity-title">Working</span> <span id="activity-count" class="muted"></span></summary>
+        <ol id="log"></ol>
+      </details>
+      <article id="answer" class="md"></article>
+      <div id="toolbar" hidden>
+        <button id="copy-btn" class="ghost">Copy Markdown</button>
+        <button id="dl-btn" class="ghost">Download .md</button>
+        <a id="raw-link" class="ghost btn" target="_blank">Raw</a>
+        <span id="stats" class="muted"></span>
+      </div>
+    </section>
+
+    <form id="composer">
+      <div class="depth" role="radiogroup" aria-label="Depth">
+        <label><input type="radio" name="depth" value="auto" checked><span>Auto</span></label>
+        <label><input type="radio" name="depth" value="quick"><span>Quick</span></label>
+        <label><input type="radio" name="depth" value="standard"><span>Standard</span></label>
+        <label><input type="radio" name="depth" value="deep"><span>Deep</span></label>
+      </div>
+      <div class="input-row">
+        <textarea id="q" rows="1" placeholder="Ask anything… (Enter to send, Shift+Enter for a new line)" autofocus></textarea>
+        <button id="go" type="submit">Search</button>
+      </div>
+    </form>
+  </main>
+
+  <dialog id="settings">
+    <form method="dialog">
+      <h3>Settings</h3>
+      <label>API key <small class="muted">(only if the server sets COOKIE_API_KEY)</small>
+        <input id="api-key" type="password" autocomplete="off"></label>
+      <label>Model override <small class="muted">(blank = server default)</small>
+        <input id="model" list="models" autocomplete="off"><datalist id="models"></datalist></label>
+      <label class="row"><input id="save" type="checkbox" checked> Save reports on the server</label>
+      <menu><button value="ok">Done</button></menu>
+    </form>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
