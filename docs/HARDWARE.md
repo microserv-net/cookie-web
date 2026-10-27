@@ -94,6 +94,20 @@ doesn't pay the load time.
 
 ## Bare-metal install (no Docker)
 
+On Ubuntu/Debian the scripts do all of this (and are safe to re-run):
+
+```bash
+./scripts/setup-ubuntu.sh                       # = install-ollama.sh + install-cookie-web.sh
+./scripts/install-ollama.sh --model qwen3:4b-instruct --fast-model qwen3:1.7b
+./scripts/install-cookie-web.sh --binary ./cookie-web    # binary built on a faster machine
+```
+
+`install-ollama.sh` writes the tuning above as a systemd drop-in
+(`/etc/systemd/system/ollama.service.d/cookie-web.conf`), so Ollama upgrades don't undo it. Compiling cookie-web
+takes a while on a 4-core mini PC; building once elsewhere (same CPU architecture) and passing `--binary` is quicker.
+
+By hand, the same steps are:
+
 ```bash
 # 1. Ollama + model
 curl -fsSL https://ollama.com/install.sh | sh

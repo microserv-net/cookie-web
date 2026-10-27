@@ -31,6 +31,26 @@ cookie-web is a single Rust binary: an HTTP API, a built-in web GUI and a CLI. I
 
 ## Quick start
 
+### Ubuntu, one command
+
+```bash
+git clone https://github.com/microserv-net/cookie-web && cd cookie-web
+./scripts/setup-ubuntu.sh            # Ollama + qwen3:4b-instruct, then cookie-web as a service
+```
+
+That installs and tunes Ollama, pulls the model, builds cookie-web and starts it under systemd on port 8765
+with a generated API key (printed at the end). The two halves also run on their own:
+
+| script | what it does |
+|--------|--------------|
+| `scripts/install-ollama.sh` | checks the machine (RAM, disk, AVX2), installs Ollama, applies the memory tuning, pulls the model(s) with retries, verifies tool calling, test-loads the model |
+| `scripts/install-cookie-web.sh` | builds (or takes `--binary`), creates the `cookie` user, `/etc/cookie-web.env` and the systemd service, starts it and checks `/api/health` |
+
+Useful options: `--model NAME`, `--fast-model NAME`, `--local` (this machine only, no key), `--port N`,
+`--binary PATH` (skip compiling on a slow box), `--open-firewall`. All scripts are safe to re-run; `--help` lists everything.
+
+### Manually
+
 ```bash
 # 1. A model (any Ollama model works; tool-calling ones work best)
 ollama pull qwen3:4b-instruct   # 2.5 GB — see docs/HARDWARE.md
