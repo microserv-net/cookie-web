@@ -17,6 +17,28 @@ pub struct Wikipedia {
     pub web: Arc<Web>,
 }
 
+impl Wikipedia {
+    /// GET JSON from Wikimedia, retrying once on rate limits, server errors and network trouble.
+    async fn get_json(&self, url: &str, query: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let mut last = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            }
+            let res = self.web.client.get(url).header(reqwest::header::USER_AGENT, WIKI_UA).query(query).send().await;
+            match res {
+                Ok(r) if r.status().is_success() => return Ok(r.json().await?),
+                Ok(r) if r.status().as_u16() == 429 || r.status().is_server_error() => {
+                    last = Some(anyhow::anyhow!("Wikipedia returned {}", r.status()))
+                }
+                Ok(r) => anyhow::bail!("Wikipedia returned {}", r.status()),
+                Err(e) => last = Some(e.into()),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("Wikipedia request failed")))
+    }
+}
+
 #[async_trait]
 impl Tool for Wikipedia {
     fn name(&self) -> &'static str {
@@ -50,32 +72,14 @@ impl Tool for Wikipedia {
             .collect();
         let lang = if lang.is_empty() { "en".to_string() } else { lang };
         let base = format!("https://{lang}.wikipedia.org");
-        let found: Value = self
-            .web
-            .client
-            .get(format!("{base}/w/rest.php/v1/search/page"))
-            .header(reqwest::header::USER_AGENT, WIKI_UA)
-            .query(&[("q", topic), ("limit", "5")])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let found =
+            self.get_json(&format!("{base}/w/rest.php/v1/search/page"), &[("q", topic), ("limit", "5")]).await?;
         let pages = found["pages"].as_array().cloned().unwrap_or_default();
         let Some(top) = pages.first() else {
             return Ok(ToolOutput::new(format!("No Wikipedia article found for \"{topic}\"."), "no article"));
         };
         let key = top["key"].as_str().unwrap_or("");
-        let summary: Value = self
-            .web
-            .client
-            .get(format!("{base}/api/rest_v1/page/summary/{}", urlencode(key)))
-            .header(reqwest::header::USER_AGENT, WIKI_UA)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let summary = self.get_json(&format!("{base}/api/rest_v1/page/summary/{}", urlencode(key)), &[]).await?;
         let title = summary["title"].as_str().unwrap_or(key);
         let url = summary["content_urls"]["desktop"]["page"]
             .as_str()

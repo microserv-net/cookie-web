@@ -144,3 +144,118 @@ async fn gui_and_manifest_are_served() {
     assert_eq!(v["name"], "cookie-web");
     assert!(v["endpoints"]["stream"]["path"].is_string());
 }
+
+// ------------------------------------------------------------ reliability
+
+fn slow_app(delay_ms: u64, max_concurrent: usize) -> (axum::Router, std::sync::Arc<common::FakeLlm>) {
+    let mut cfg = Config::for_tests(common::tmp_dir("slow"));
+    cfg.max_concurrent = max_concurrent;
+    let llm = std::sync::Arc::new(common::FakeLlm::new(true));
+    *llm.write_delay.lock().unwrap() = std::time::Duration::from_millis(delay_ms);
+    let engine = common::engine_custom(llm.clone(), common::fake_registry(), cfg);
+    (server::router(server::AppState::new(engine)), llm)
+}
+
+async fn get_json(a: &axum::Router, uri: &str) -> Value {
+    let r = a.clone().oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+    serde_json::from_str(&body_string(r).await).unwrap()
+}
+
+async fn wait_status(a: &axum::Router, id: &str, want: &str) -> Value {
+    for _ in 0..200 {
+        let v = get_json(a, &format!("/api/jobs/{id}")).await;
+        if v["status"] == want {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("job {id} never reached {want}");
+}
+
+#[tokio::test]
+async fn jobs_can_be_cancelled() {
+    let (a, _) = slow_app(10_000, 1);
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": "VisionQuest" }))).await.unwrap();
+    let id = serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string();
+    wait_status(&a, &id, "running").await;
+    let r = a.clone().oneshot(Request::delete(format!("/api/jobs/{id}")).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v = wait_status(&a, &id, "cancelled").await;
+    assert_eq!(v["error"], "cancelled");
+    // the slot is free again: a new job runs (and is cancelled) right away
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": "VisionQuest" }))).await.unwrap();
+    let id2 = serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string();
+    wait_status(&a, &id2, "running").await;
+    a.oneshot(Request::delete(format!("/api/jobs/{id2}")).body(Body::empty()).unwrap()).await.unwrap();
+}
+
+#[tokio::test]
+async fn idempotency_key_reattaches_to_the_same_job() {
+    let a = app();
+    let mut ids = vec![];
+    for _ in 0..2 {
+        let mut req = post("/api/jobs", json!({ "query": "VisionQuest" }));
+        req.headers_mut().insert("idempotency-key", "supervisor-task-42".parse().unwrap());
+        let r = a.clone().oneshot(req).await.unwrap();
+        ids.push(serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(ids[0], ids[1]);
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": "VisionQuest" }))).await.unwrap();
+    let other = serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string();
+    assert_ne!(other, ids[0], "no key, new job");
+}
+
+#[tokio::test]
+async fn event_stream_resumes_where_the_client_left_off() {
+    let a = app();
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": "VisionQuest" }))).await.unwrap();
+    let id = serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string();
+    wait_status(&a, &id, "done").await;
+    let r = a
+        .clone()
+        .oneshot(Request::get(format!("/api/jobs/{id}/events?from=3")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = body_string(r).await;
+    let ids: Vec<usize> = body.lines().filter_map(|l| l.strip_prefix("id: ")).map(|n| n.parse().unwrap()).collect();
+    assert_eq!(ids.first(), Some(&4));
+    assert!(body.contains("event: done"));
+    let mut req = Request::get(format!("/api/jobs/{id}/events")).body(Body::empty()).unwrap();
+    req.headers_mut().insert("last-event-id", "5".parse().unwrap());
+    let body = body_string(a.oneshot(req).await.unwrap()).await;
+    assert!(body.lines().find_map(|l| l.strip_prefix("id: ")) == Some("6"));
+}
+
+#[tokio::test]
+async fn a_crashing_job_reports_an_error_instead_of_hanging() {
+    let (a, llm) = slow_app(0, 1);
+    llm.panic_on_write.store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        a.oneshot(post("/api/research", json!({ "query": "VisionQuest" }))),
+    )
+    .await
+    .expect("no hang")
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+    assert!(body_string(r).await.contains("internal error"));
+}
+
+#[tokio::test]
+async fn queued_jobs_say_they_are_waiting() {
+    let (a, _) = slow_app(300, 1);
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": "VisionQuest" }))).await.unwrap();
+    let first = serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string();
+    wait_status(&a, &first, "running").await;
+    let r = a.clone().oneshot(post("/api/research/stream", json!({ "query": "VisionQuest" }))).await.unwrap();
+    let body = body_string(r).await;
+    assert!(body.contains("Queued"), "{body}");
+    assert!(body.contains("event: done"));
+}
+
+#[tokio::test]
+async fn health_reports_search_backend_state() {
+    let v = get_json(&app(), "/api/health").await;
+    assert!(v["search_health"].is_array());
+    assert!(v["jobs_queued"].is_number());
+}

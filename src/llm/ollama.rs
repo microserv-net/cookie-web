@@ -2,13 +2,13 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use super::{ChatModel, ChatRequest, Message, ModelInfo, Tier, strip_thinking};
+use super::{ChatModel, ChatRequest, Completion, Message, ModelInfo, Tier, Usage, strip_thinking};
 use crate::config::Config;
 
 #[derive(Clone, Debug, Default)]
@@ -21,6 +21,8 @@ pub struct Ollama {
     http: reqwest::Client,
     cfg: Arc<Config>,
     caps: Mutex<HashMap<String, Caps>>,
+    /// Waits between retries of a failed call (its length is the retry count).
+    backoff: Vec<Duration>,
 }
 
 impl Ollama {
@@ -34,7 +36,8 @@ impl Ollama {
             b = b.no_proxy();
         }
         let http = b.build().expect("http client");
-        Self { http, cfg, caps: Mutex::new(HashMap::new()) }
+        let backoff = [1, 3, 6].map(Duration::from_secs).to_vec();
+        Self { http, cfg, caps: Mutex::new(HashMap::new()), backoff }
     }
 
     fn url(&self, path: &str) -> String {
@@ -83,6 +86,9 @@ impl Ollama {
         if let Some(n) = req.max_tokens {
             options["num_predict"] = json!(n);
         }
+        if let Some(t) = self.cfg.num_thread {
+            options["num_thread"] = json!(t);
+        }
         let mut body = json!({
             "model": model,
             "messages": req.messages,
@@ -105,60 +111,119 @@ impl Ollama {
     }
 }
 
-#[async_trait]
-impl ChatModel for Ollama {
-    fn name(&self) -> String {
-        self.cfg.model.clone()
+/// One failed attempt: either worth retrying (Ollama restarting, loading, overloaded, a network blip)
+/// or not (bad request, unknown model, a malformed tool call the caller should handle).
+enum Failure {
+    Retry(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+fn send_failure(e: reqwest::Error, host: &str) -> Failure {
+    // A timeout of the whole request means generation hung for minutes: retrying would only hang again.
+    let hung = e.is_timeout() && !e.is_connect();
+    let err = anyhow::Error::new(e).context(format!("cannot reach Ollama at {host}"));
+    if hung { Failure::Fatal(err) } else { Failure::Retry(err) }
+}
+
+/// Turn a non-2xx Ollama reply into a [`Failure`] with a helpful message.
+fn status_failure(status: reqwest::StatusCode, err: &str, model: &str) -> Failure {
+    let low = err.to_lowercase();
+    if status == reqwest::StatusCode::NOT_FOUND || (low.contains("model") && low.contains("not found")) {
+        return Failure::Fatal(anyhow!(
+            "model '{model}' is not available in Ollama ({err}) — run: ollama pull {model}"
+        ));
+    }
+    let e = anyhow!("Ollama error ({status}) for model {model}: {err}");
+    // A tool call the model formatted badly: retrying the same prompt rarely helps; the agent switches protocol.
+    if low.contains("tool call") || low.contains("does not support tools") {
+        return Failure::Fatal(e);
+    }
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        Failure::Retry(e)
+    } else {
+        Failure::Fatal(e)
+    }
+}
+
+impl Ollama {
+    /// Options that decide how Ollama loads the model (they must match across requests).
+    fn load_options(&self) -> Value {
+        let mut o = json!({ "num_ctx": self.cfg.num_ctx });
+        if let Some(t) = self.cfg.num_thread {
+            o["num_thread"] = json!(t);
+        }
+        o
     }
 
-    async fn chat(&self, req: ChatRequest) -> anyhow::Result<Message> {
-        let (model, body) = self.body(&req, false).await;
+    /// Shorter back-off, for tests.
+    pub fn with_backoff(mut self, backoff: Vec<Duration>) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    async fn chat_once(&self, model: &str, body: &Value) -> Result<Message, Failure> {
         let resp = self
             .http
             .post(self.url("/api/chat"))
-            .json(&body)
+            .json(body)
             .send()
             .await
-            .with_context(|| format!("cannot reach Ollama at {}", self.cfg.ollama_host))?;
+            .map_err(|e| send_failure(e, &self.cfg.ollama_host))?;
         let status = resp.status();
-        let v: Value = resp.json().await.context("invalid JSON from Ollama")?;
+        let text = resp.text().await.map_err(|e| Failure::Retry(anyhow!("reading Ollama reply failed: {e}")))?;
+        let v: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) if status.is_success() => return Err(Failure::Retry(anyhow!("invalid JSON from Ollama"))),
+            Err(_) => Value::Null,
+        };
         if !status.is_success() {
-            let err = v["error"].as_str().unwrap_or("unknown error");
+            let err = v["error"].as_str().map(String::from).unwrap_or_else(|| text.chars().take(200).collect());
             if err.contains("does not support tools") {
-                self.caps.lock().await.insert(model.clone(), Caps { tools: false, thinking: false });
+                self.caps.lock().await.insert(model.to_string(), Caps { tools: false, thinking: false });
             }
-            bail!("Ollama error ({status}) for model {model}: {err}");
+            return Err(status_failure(status, &err, model));
         }
-        let mut msg: Message = serde_json::from_value(v["message"].clone()).context("no message in reply")?;
+        let mut msg: Message = serde_json::from_value(v["message"].clone())
+            .map_err(|_| Failure::Retry(anyhow!("no message in Ollama reply")))?;
         msg.content = strip_thinking(&msg.content);
+        msg.usage = Usage::from_ollama(&v);
         Ok(msg)
     }
 
-    async fn chat_stream(
+    /// One streaming attempt. `emitted` is set once any token reached the caller,
+    /// after which the attempt can no longer be retried transparently.
+    async fn stream_once(
         &self,
-        req: ChatRequest,
+        model: &str,
+        body: &Value,
         on_token: &(dyn for<'t> Fn(&'t str) + Send + Sync),
-    ) -> anyhow::Result<String> {
-        let (model, body) = self.body(&req, true).await;
+        emitted: &mut bool,
+    ) -> Result<Completion, Failure> {
         let resp = self
             .http
             .post(self.url("/api/chat"))
-            .json(&body)
+            .json(body)
             .send()
             .await
-            .with_context(|| format!("cannot reach Ollama at {}", self.cfg.ollama_host))?;
+            .map_err(|e| send_failure(e, &self.cfg.ollama_host))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let v: Value = resp.json().await.unwrap_or_default();
-            bail!("Ollama error ({status}) for model {model}: {}", v["error"].as_str().unwrap_or("unknown"));
+            let text = resp.text().await.unwrap_or_default();
+            let v: Value = serde_json::from_str(&text).unwrap_or_default();
+            let err = v["error"].as_str().map(String::from).unwrap_or_else(|| text.chars().take(200).collect());
+            return Err(status_failure(status, &err, model));
         }
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut full = String::new();
+        let mut finished: Option<String> = None;
+        let mut usage = Usage::default();
         // Suppress leaked <think> blocks while streaming.
         let mut in_think = false;
+        let fail = |emitted: bool, e: anyhow::Error| if emitted { Failure::Fatal(e) } else { Failure::Retry(e) };
         while let Some(chunk) = stream.next().await {
-            buf.extend_from_slice(&chunk?);
+            let chunk = chunk.map_err(|e| fail(*emitted, anyhow!("Ollama stream interrupted: {e}")))?;
+            buf.extend_from_slice(&chunk);
             while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line);
@@ -166,9 +231,14 @@ impl ChatModel for Ollama {
                 if line.is_empty() {
                     continue;
                 }
-                let v: Value = serde_json::from_str(line).map_err(|e| anyhow!("bad stream line: {e}"))?;
+                let v: Value =
+                    serde_json::from_str(line).map_err(|e| fail(*emitted, anyhow!("bad stream line: {e}")))?;
                 if let Some(e) = v["error"].as_str() {
-                    bail!("Ollama stream error: {e}");
+                    return Err(fail(*emitted, anyhow!("Ollama stream error: {e}")));
+                }
+                if v["done"].as_bool() == Some(true) {
+                    finished = Some(v["done_reason"].as_str().unwrap_or("stop").to_string());
+                    usage = Usage::from_ollama(&v);
                 }
                 let delta = v["message"]["content"].as_str().unwrap_or("");
                 if delta.is_empty() {
@@ -179,6 +249,7 @@ impl ChatModel for Ollama {
                 }
                 if !in_think {
                     on_token(delta);
+                    *emitted = true;
                 }
                 full.push_str(delta);
                 if delta.contains("</think>") {
@@ -186,7 +257,56 @@ impl ChatModel for Ollama {
                 }
             }
         }
-        Ok(strip_thinking(&full))
+        match finished {
+            Some(reason) => Ok(Completion { text: strip_thinking(&full), truncated: reason == "length", usage }),
+            None => Err(fail(*emitted, anyhow!("the Ollama stream ended before the answer was complete"))),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatModel for Ollama {
+    fn name(&self) -> String {
+        self.cfg.model.clone()
+    }
+
+    async fn chat(&self, req: ChatRequest) -> anyhow::Result<Message> {
+        let (model, body) = self.body(&req, false).await;
+        let mut attempt = 0;
+        loop {
+            match self.chat_once(&model, &body).await {
+                Ok(m) => return Ok(m),
+                Err(Failure::Fatal(e)) => return Err(e),
+                Err(Failure::Retry(e)) => {
+                    let Some(wait) = self.backoff.get(attempt) else { return Err(e) };
+                    tracing::warn!("Ollama call failed ({e:#}); retrying in {:.1}s", wait.as_secs_f64());
+                    tokio::time::sleep(*wait).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn chat_stream(
+        &self,
+        req: ChatRequest,
+        on_token: &(dyn for<'t> Fn(&'t str) + Send + Sync),
+    ) -> anyhow::Result<Completion> {
+        let (model, body) = self.body(&req, true).await;
+        let mut attempt = 0;
+        loop {
+            let mut emitted = false;
+            match self.stream_once(&model, &body, on_token, &mut emitted).await {
+                Ok(c) => return Ok(c),
+                Err(Failure::Fatal(e)) => return Err(e),
+                Err(Failure::Retry(e)) => {
+                    let Some(wait) = self.backoff.get(attempt) else { return Err(e) };
+                    tracing::warn!("Ollama stream failed ({e:#}); retrying in {:.1}s", wait.as_secs_f64());
+                    tokio::time::sleep(*wait).await;
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -200,7 +320,8 @@ impl ChatModel for Ollama {
                 "model": model,
                 "messages": [],
                 "keep_alive": self.cfg.keep_alive_json(),
-                "options": { "num_ctx": self.cfg.num_ctx },
+                // same options as real requests, or Ollama would reload the model on the first one
+                "options": self.load_options(),
             });
             let r = self.http.post(self.url("/api/chat")).json(&body).send().await?;
             if !r.status().is_success() {

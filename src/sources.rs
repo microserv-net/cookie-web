@@ -37,21 +37,49 @@ pub struct SourceRegistry {
     items: Vec<Source>,
 }
 
+fn is_tracking_param(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    k.starts_with("utm_")
+        || matches!(
+            k.as_str(),
+            "fbclid"
+                | "gclid"
+                | "dclid"
+                | "msclkid"
+                | "msockid"
+                | "ref"
+                | "ref_src"
+                | "mc_cid"
+                | "mc_eid"
+                | "igshid"
+                | "yclid"
+        )
+}
+
+/// Remove tracking parameters (utm_*, fbclid, Bing's msockid, …) from a URL, keeping everything else.
+pub fn strip_tracking(raw: &str) -> String {
+    let Ok(mut u) = url::Url::parse(raw.trim()) else { return raw.trim().to_string() };
+    if !u.query_pairs().any(|(k, _)| is_tracking_param(&k)) {
+        return raw.trim().to_string();
+    }
+    let kept: Vec<(String, String)> =
+        u.query_pairs().filter(|(k, _)| !is_tracking_param(k)).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    if kept.is_empty() {
+        u.set_query(None);
+    } else {
+        u.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    u.to_string()
+}
+
 /// Normalise a URL for de-duplication: drop fragment, tracking params, trailing slash, `www.`.
 pub fn normalize_url(raw: &str) -> String {
     let Ok(mut u) = url::Url::parse(raw.trim()) else {
         return raw.trim().to_string();
     };
     u.set_fragment(None);
-    let kept: Vec<(String, String)> = u
-        .query_pairs()
-        .filter(|(k, _)| {
-            let k = k.to_ascii_lowercase();
-            !(k.starts_with("utm_")
-                || matches!(k.as_str(), "fbclid" | "gclid" | "ref" | "ref_src" | "mc_cid" | "mc_eid"))
-        })
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
+    let kept: Vec<(String, String)> =
+        u.query_pairs().filter(|(k, _)| !is_tracking_param(k)).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
     if kept.is_empty() {
         u.set_query(None);
     } else {
@@ -77,6 +105,8 @@ impl SourceRegistry {
 
     /// Register a source (or update an existing one) and return its citation number.
     pub fn add(&mut self, title: &str, url: &str, snippet: &str, kind: SourceKind) -> usize {
+        let clean = strip_tracking(url);
+        let url = clean.as_str();
         let key = normalize_url(url);
         if let Some(s) = self.items.iter_mut().find(|s| normalize_url(&s.url) == key) {
             if s.title.is_empty() || (kind == SourceKind::Page && !title.is_empty()) {
@@ -103,6 +133,25 @@ impl SourceRegistry {
             cited: false,
         });
         n
+    }
+
+    /// Start from an earlier report's sources, keeping their numbers (for follow-ups).
+    /// Citation and read marks are cleared: they describe the new answer.
+    pub fn from_sources(sources: &[Source]) -> Self {
+        let mut items: Vec<Source> = sources.to_vec();
+        items.sort_by_key(|s| s.n);
+        for (i, s) in items.iter_mut().enumerate() {
+            s.n = i + 1;
+            s.cited = false;
+            s.read = false;
+        }
+        Self { items }
+    }
+
+    pub fn mark_read(&mut self, n: usize) {
+        if let Some(s) = self.items.get_mut(n.wrapping_sub(1)) {
+            s.read = true;
+        }
     }
 
     pub fn set_date(&mut self, n: usize, date: Option<String>) {
@@ -133,6 +182,33 @@ impl SourceRegistry {
         self.items.is_empty()
     }
 
+    /// Renumber sources so citations read 1, 2, 3… in the order they first appear in the answer.
+    /// `first` lists old numbers to put first (in order); the rest keep their relative order.
+    /// Returns the old → new mapping.
+    pub fn renumber(&mut self, first: &[usize]) -> std::collections::HashMap<usize, usize> {
+        let mut order: Vec<usize> = vec![];
+        for &n in first {
+            if n >= 1 && n <= self.items.len() && !order.contains(&n) {
+                order.push(n);
+            }
+        }
+        for s in &self.items {
+            if !order.contains(&s.n) {
+                order.push(s.n);
+            }
+        }
+        let mut map = std::collections::HashMap::new();
+        let mut items = Vec::with_capacity(self.items.len());
+        for (i, old) in order.into_iter().enumerate() {
+            let mut s = self.items[old - 1].clone();
+            map.insert(old, i + 1);
+            s.n = i + 1;
+            items.push(s);
+        }
+        self.items = items;
+        map
+    }
+
     pub fn pages_read(&self) -> usize {
         self.items.iter().filter(|s| s.read).count()
     }
@@ -151,6 +227,29 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(r.get(1).unwrap().read);
         assert_eq!(r.get(1).unwrap().title, "A page");
+    }
+
+    #[test]
+    fn strips_tracking_but_keeps_real_params() {
+        assert_eq!(strip_tracking("https://www.canva.com/?msockid=3d17"), "https://www.canva.com/");
+        assert_eq!(strip_tracking("https://x.com/p?id=3&utm_source=a"), "https://x.com/p?id=3");
+        let mut r = SourceRegistry::new();
+        r.add("C", "https://www.canva.com/?msockid=abc", "", SourceKind::Search);
+        assert_eq!(r.get(1).unwrap().url, "https://www.canva.com/");
+    }
+
+    #[test]
+    fn renumbers_in_citation_order() {
+        let mut r = SourceRegistry::new();
+        for u in ["https://a.com", "https://b.com", "https://c.com"] {
+            r.add(u, u, "", SourceKind::Search);
+        }
+        let map = r.renumber(&[3, 1]);
+        assert_eq!(map[&3], 1);
+        assert_eq!(map[&1], 2);
+        assert_eq!(map[&2], 3);
+        assert_eq!(r.get(1).unwrap().url, "https://c.com");
+        assert_eq!(r.get(3).unwrap().n, 3);
     }
 
     #[test]

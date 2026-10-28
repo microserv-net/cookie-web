@@ -8,8 +8,10 @@ User=cookie
 EnvironmentFile=/etc/cookie-web.env
 WorkingDirectory=/var/lib/cookie-web
 ExecStart=/usr/local/bin/cookie-web serve
-Restart=on-failure
+Restart=always
 RestartSec=5
+# cookie-web finishes or drops open streams within 10 s of SIGTERM
+TimeoutStopSec=20
 # cookie-web itself needs ~20 MB; the model lives in the Ollama process.
 MemoryMax=256M
 NoNewPrivileges=true

@@ -24,6 +24,10 @@ pub enum Event {
     Source { source: Source },
     /// A chunk of the final markdown answer.
     Token { text: String },
+    /// Discard the live `token` preview: the answer is being regenerated (a writing attempt failed).
+    Reset { reason: String },
+    /// Something went wrong but the job carries on (a degraded step, a fallback was used).
+    Warning { message: String },
     /// The finished result.
     Done { result: Box<ResearchResult> },
     /// Fatal error; no `done` follows.
@@ -40,6 +44,8 @@ impl Event {
             Event::ToolResult { .. } => "tool_result",
             Event::Source { .. } => "source",
             Event::Token { .. } => "token",
+            Event::Reset { .. } => "reset",
+            Event::Warning { .. } => "warning",
             Event::Done { .. } => "done",
             Event::Error { .. } => "error",
         }
@@ -66,5 +72,10 @@ impl Events {
     }
     pub fn status(&self, msg: impl Into<String>) {
         self.emit(Event::Status { message: msg.into() });
+    }
+    pub fn warn(&self, msg: impl Into<String>) {
+        let message = msg.into();
+        tracing::warn!("{message}");
+        self.emit(Event::Warning { message });
     }
 }

@@ -46,6 +46,7 @@ impl Depth {
                 page_chars: 4_000,
                 evidence_chars: 9_000,
                 write_tokens: 600,
+                gather_secs: 120,
                 target: "A direct answer in one or two short paragraphs (roughly 60-180 words). \
                          Then a `**Links**` list with the 3-5 most useful links as `- [Title](url) — why it's useful`. \
                          No other headings.",
@@ -57,6 +58,7 @@ impl Depth {
                 page_chars: 6_000,
                 evidence_chars: 22_000,
                 write_tokens: 1_500,
+                gather_secs: 300,
                 target: "A well-structured answer of roughly 300-700 words: start with a one-paragraph direct answer, \
                          then a few `##` sections with bullets where they help. Inline citations throughout.",
             },
@@ -67,6 +69,7 @@ impl Depth {
                 page_chars: 8_000,
                 evidence_chars: 40_000,
                 write_tokens: 3_500,
+                gather_secs: 900,
                 target: "A full research report of roughly 1000-2000 words. Start with `# <Title>`, then a \
                          `## TL;DR` of 3-5 bullets, then thematic `##` sections, a comparison table if \
                          things are being compared, and a final `## Caveats & open questions` section. \
@@ -104,6 +107,9 @@ pub struct Profile {
     /// Max characters of evidence given to the writer.
     pub evidence_chars: usize,
     pub write_tokens: u32,
+    /// Soft time budget for gathering (seconds, before `COOKIE_TIME_SCALE`); when it runs out,
+    /// cookie-web stops researching and writes with what it has.
+    pub gather_secs: u64,
     /// Formatting brief for the writer.
     pub target: &'static str,
 }
@@ -178,9 +184,9 @@ pub struct Triage {
     pub decided_by: String,
 }
 
+/// Unmistakable requests for a long answer.
 const DEEP_MARKERS: &[&str] = &[
     "report",
-    "research",
     "in-depth",
     "in depth",
     "deep dive",
@@ -188,24 +194,42 @@ const DEEP_MARKERS: &[&str] = &[
     "comprehensive",
     "thorough",
     "detailed",
-    "literature",
+    "literature review",
+    "state of the art",
+    "state-of-the-art",
+    "everything about",
+    "white paper",
+    "whitepaper",
+    "explain in detail",
+    "write up",
+    "write-up",
+];
+/// Words that *often* mean "go deep" but also appear in ordinary questions
+/// ("who funds cancer research?"): they lean deep, but the model gets the final say.
+const DEEP_HINTS: &[&str] = &[
+    "research",
     "analysis",
     "analyse",
     "analyze",
     "landscape",
-    "state of the art",
-    "state-of-the-art",
-    "everything about",
     "pros and cons",
     "market",
-    "white paper",
-    "whitepaper",
     "survey of",
     "overview of",
-    "explain in detail",
+    "literature",
 ];
-const COMPARE_MARKERS: &[&str] =
-    &[" vs ", " vs. ", " versus ", "compare", "comparison", "difference between", "better than", "alternatives to"];
+const COMPARE_MARKERS: &[&str] = &[
+    " vs ",
+    " vs. ",
+    " versus ",
+    "compare",
+    "compared",
+    "comparing",
+    "comparison",
+    "difference between",
+    "better than",
+    "alternatives to",
+];
 const NEWS_MARKERS: &[&str] =
     &["news", "latest", "today", "this week", "recent", "announced", "just released", "update on", "current status"];
 const HOWTO_MARKERS: &[&str] = &[
@@ -217,11 +241,14 @@ const HOWTO_MARKERS: &[&str] = &[
     "guide",
     "tutorial",
     "install",
+    "installing",
+    "guides",
     "set up",
     "setup",
     "configure",
     "fix ",
     "error",
+    "errors",
 ];
 const LINK_MARKERS: &[&str] = &[
     "link",
@@ -238,8 +265,73 @@ const LINK_MARKERS: &[&str] = &[
 const QUESTION_WORDS: &[&str] =
     &["what", "who", "when", "where", "which", "why", "how", "is", "are", "does", "do", "can", "should", "will", "did"];
 
+/// Does `hay` contain any of the phrases as whole words? ("link" must not match "Linkin Park",
+/// "error" must not match "terror".) Phrases starting/ending with a space keep their own boundary.
 fn has_any(hay: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|n| hay.contains(n))
+    needles.iter().any(|n| {
+        let n = n.trim();
+        hay.match_indices(n).any(|(i, _)| {
+            let before = hay[..i].chars().next_back();
+            let after = hay[i + n.len()..].chars().next();
+            let edge = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+            edge(before) && edge(after)
+        })
+    })
+}
+
+/// Conversational openers that only hurt as search keywords.
+const LEAD_INS: &[&str] = &[
+    "what can you tell me about",
+    "what do you know about",
+    "can you tell me about",
+    "could you tell me about",
+    "tell me everything about",
+    "tell me about",
+    "i want to know about",
+    "i'd like to know about",
+    "i would like to know about",
+    "give me information on",
+    "give me information about",
+    "give me info on",
+    "give me info about",
+    "find information about",
+    "find information on",
+    "search the web for",
+    "search for",
+    "look up",
+    "find me",
+    "please",
+    "can you",
+    "could you",
+];
+
+/// A search-engine-friendly version of a conversational request (used when the model doesn't
+/// provide one): strips lead-ins like "what can you tell me about", "hint:" labels and the
+/// trailing question mark, keeping names and quoted phrases intact.
+pub fn search_keywords(query: &str) -> String {
+    let mut q = query.trim().to_string();
+    loop {
+        let low = q.to_lowercase();
+        let Some(lead) = LEAD_INS
+            .iter()
+            .find(|l| low.starts_with(*l) && low[l.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric()))
+        else {
+            break;
+        };
+        q = q[lead.len()..].trim_start_matches([' ', ',', ':']).to_string();
+    }
+    // "write a detailed report on X" → "X": the format words only confuse search engines.
+    static FORMAT_LEAD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)^(?:(?:write|give me|make|create|prepare|do|produce|i need|i want)\s+)?(?:(?:an?|the|me an?)\s+)?(?:(?:detailed|in-depth|in depth|comprehensive|thorough|full|deep|quick|short|brief)\s+)?(?:report|analysis|overview|deep dive|deep-dive|write-up|writeup|summary|breakdown|explanation|guide)\s+(?:on|of|about|into|for)\s+",
+        )
+        .unwrap()
+    });
+    let q = FORMAT_LEAD.replace(&q, "").into_owned();
+    let q = q.replace("hint:", " ").replace("Hint:", " ").replace("HINT:", " ");
+    let q: String = q.split_whitespace().collect::<Vec<_>>().join(" ");
+    let q = q.trim_end_matches(['?', '.', '!', ' ']).replace(" ,", ",");
+    if q.trim().is_empty() { query.trim().trim_end_matches('?').to_string() } else { q }
 }
 
 /// Explicit user overrides: a leading `!quick`, `!standard` or `!deep` token.
@@ -270,7 +362,7 @@ pub fn heuristic(query: &str) -> (Triage, bool) {
         Intent::Howto
     } else if has_any(&q, NEWS_MARKERS) {
         Intent::News
-    } else if has_any(&q, DEEP_MARKERS) {
+    } else if has_any(&q, DEEP_MARKERS) || has_any(&q, DEEP_HINTS) {
         Intent::Research
     } else if n <= 4 && !is_question {
         Intent::Entity
@@ -281,13 +373,16 @@ pub fn heuristic(query: &str) -> (Triage, bool) {
     let mk = |depth: Depth, reason: &str| Triage {
         depth,
         intent,
-        search_query: query.trim().trim_end_matches('?').to_string(),
+        search_query: search_keywords(query),
         reason: reason.to_string(),
         decided_by: "heuristic".into(),
     };
 
-    if has_any(&q, DEEP_MARKERS) || (n >= 25) {
+    if has_any(&q, DEEP_MARKERS) {
         return (mk(Depth::Deep, "asks for an in-depth report/analysis"), true);
+    }
+    if has_any(&q, DEEP_HINTS) || n >= 25 {
+        return (mk(Depth::Deep, "looks like it wants a thorough answer"), false);
     }
     if n <= 3 && !is_question {
         return (mk(Depth::Quick, "a bare word/phrase: identify it and point to the best links"), true);
@@ -302,17 +397,18 @@ pub fn heuristic(query: &str) -> (Triage, bool) {
 }
 
 /// Full triage: override → confident heuristic → model → heuristic fallback.
-pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> Triage {
+/// Also returns what the model call cost (zero when no call was made).
+pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> (Triage, crate::llm::Usage) {
     let (forced, clean) = split_override(query);
     let (mut h, confident) = heuristic(&clean);
     if let Some(d) = forced {
         h.depth = d;
         h.reason = "set explicitly by the user".into();
         h.decided_by = "user".into();
-        return h;
+        return (h, Default::default());
     }
     if confident {
-        return h;
+        return (h, Default::default());
     }
 
     let schema = json!({
@@ -340,7 +436,9 @@ pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> Triage {
         .json(schema)
         .temperature(0.0)
         .max_tokens(200);
-    match llm.chat(req).await.ok().and_then(|m| parse_json_loose(&m.content)) {
+    let reply = llm.chat(req).await.ok();
+    let usage = reply.as_ref().map(|m| m.usage).unwrap_or_default();
+    let t = match reply.and_then(|m| parse_json_loose(&m.content)) {
         Some(v) => {
             let depth = v["depth"].as_str().and_then(Depth::parse).unwrap_or(h.depth);
             let sq = v["search_query"].as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() < 300);
@@ -353,7 +451,8 @@ pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> Triage {
             }
         }
         None => h,
-    }
+    };
+    (t, usage)
 }
 
 #[cfg(test)]
@@ -391,6 +490,39 @@ mod tests {
         }
         // a big window keeps the profile's own caps
         assert_eq!(Depth::Quick.profile().fit_to_context(65536).evidence_chars, 9_000);
+    }
+
+    #[test]
+    fn markers_match_whole_words() {
+        let (t, _) = heuristic("Linkin Park");
+        assert_eq!(t.intent, Intent::Entity, "'link' must not match 'Linkin'");
+        let (t, _) = heuristic("what is the terror bird");
+        assert_ne!(t.intent, Intent::Howto, "'error' must not match 'terror'");
+        let (t, _) = heuristic("download links for ubuntu 24.04");
+        assert_eq!(t.intent, Intent::Links);
+    }
+
+    #[test]
+    fn ambiguous_deep_words_defer_to_the_model() {
+        let (t, confident) = heuristic("who funds most cancer research in europe");
+        assert_eq!(t.depth, Depth::Deep);
+        assert!(!confident);
+        let (_, confident) = heuristic("give me a detailed report on cancer research funding");
+        assert!(confident);
+    }
+
+    #[test]
+    fn conversational_requests_become_keywords() {
+        assert_eq!(
+            search_keywords("what can you tell me about \"stares motherfuckingly\", hint: samuel l jackson"),
+            "\"stares motherfuckingly\", samuel l jackson"
+        );
+        assert_eq!(search_keywords("Please look up the WireGuard docs?"), "the WireGuard docs");
+        assert_eq!(search_keywords("who is Ada Lovelace?"), "who is Ada Lovelace");
+        assert_eq!(search_keywords("please?"), "please");
+        assert_eq!(search_keywords("write a detailed report on rust async runtimes"), "rust async runtimes");
+        assert_eq!(search_keywords("deep dive into sodium-ion batteries"), "sodium-ion batteries");
+        assert_eq!(search_keywords("report"), "report");
     }
 
     #[test]

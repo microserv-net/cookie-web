@@ -13,10 +13,165 @@ use crate::{
     config::AgentMode,
     depth::{Depth, Intent, Profile, Triage},
     engine::{Evidence, Run},
-    llm::{ChatRequest, Message, ToolCall, parse_json_loose},
+    llm::{ChatRequest, Message, Tier, ToolCall, parse_json_loose},
     sources::{SourceKind, domain_of},
-    tools::extract::truncate_chars,
+    tools::{
+        ToolOutput,
+        extract::{terms, truncate_chars},
+        search::relax_query,
+    },
 };
+
+/// Words that describe the *request* rather than its topic.
+const REQUEST_WORDS: &[&str] = &[
+    "tell",
+    "know",
+    "hint",
+    "please",
+    "info",
+    "information",
+    "explain",
+    "find",
+    "show",
+    "give",
+    "list",
+    "anything",
+    "something",
+    "need",
+    "want",
+    "looking",
+    "search",
+    "wondering",
+    "curious",
+    "thanks",
+    "help",
+];
+
+/// The distinctive words of a request, used to judge whether results are about it.
+pub fn topic_terms(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    terms(query).into_iter().filter(|t| !REQUEST_WORDS.contains(&t.as_str()) && seen.insert(t.clone())).collect()
+}
+
+/// How many topic terms occur in `text` (lenient about word endings: "stares" matches "stare").
+pub fn overlap(text: &str, topic: &[String]) -> usize {
+    let low = text.to_lowercase();
+    topic
+        .iter()
+        .filter(|t| {
+            let n = t.chars().count();
+            let keep = if n <= 4 { n } else { ((n as f64 * 0.75).round() as usize).max(4) };
+            let stem: String = t.chars().take(keep).collect();
+            low.contains(&stem)
+        })
+        .count()
+}
+
+/// Is this text plausibly about the request? (about a third of its distinctive terms appear)
+pub fn relevant(text: &str, topic: &[String]) -> bool {
+    topic.is_empty() || overlap(text, topic) >= ((topic.len() as f64 * 0.34).ceil() as usize).max(1)
+}
+
+/// Re-render a search result keeping only on-topic hits (with their citation numbers).
+/// `None` if none of them is on topic.
+fn on_topic_hits(run: &Run<'_>, out: &ToolOutput, topic: &[String]) -> Option<String> {
+    let hits = out.data["hits"].as_array()?;
+    let reg = run.ctx.sources.lock().unwrap();
+    let mut text = String::new();
+    let mut kept = 0;
+    for h in hits {
+        let (title, url, snippet) =
+            (h["title"].as_str().unwrap_or(""), h["url"].as_str().unwrap_or(""), h["snippet"].as_str().unwrap_or(""));
+        if !relevant(&format!("{title} {snippet} {url}"), topic) {
+            continue;
+        }
+        let key = crate::sources::normalize_url(url);
+        let Some(src) = reg.all().iter().find(|s| crate::sources::normalize_url(&s.url) == key) else { continue };
+        kept += 1;
+        text.push_str(&format!("[{}] {title} — {}\n    URL: {}\n", src.n, src.domain, src.url));
+        if !snippet.is_empty() {
+            text.push_str(&format!("    {}\n", snippet.chars().take(320).collect::<String>()));
+        }
+    }
+    let header = out.text.lines().next().unwrap_or("Results:");
+    (kept > 0).then(|| format!("{header} (off-topic results removed)\n{text}"))
+}
+
+/// Search hits in a tool result that look relevant to the request (0 for non-search tools or failures).
+pub fn relevant_hits(ok: bool, out: &ToolOutput, topic: &[String]) -> usize {
+    if !ok {
+        return 0;
+    }
+    out.data["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|h| {
+            let text = format!(
+                "{} {} {}",
+                h["title"].as_str().unwrap_or(""),
+                h["snippet"].as_str().unwrap_or(""),
+                h["url"].as_str().unwrap_or("")
+            );
+            relevant(&text, topic)
+        })
+        .count()
+}
+
+/// New search queries for a request whose searches found (almost) nothing.
+/// Asks the fast model for rephrasings (synonyms, likely names, using any hints the user gave);
+/// falls back to mechanical loosening if the model is unavailable.
+pub async fn rephrase(run: &Run<'_>, tried: &[String]) -> Vec<String> {
+    let schema = json!({
+        "type": "object",
+        "properties": { "queries": { "type": "array", "items": { "type": "string" } } },
+        "required": ["queries"]
+    });
+    let sys = format!(
+        "You help a web search that found nothing useful. Today is {}.\n\
+         Write 3 different web search queries likely to find what the user wants: use synonyms and simpler keywords, \
+         drop or replace unusual words, try the likely proper names or titles involved, and use any hints the user \
+         gave. Keywords only, no quotes. Reply with JSON only.",
+        run.today
+    );
+    let user =
+        format!("Request: {}\nQueries already tried (avoid repeating them):\n- {}", run.query, tried.join("\n- "));
+    let req = ChatRequest::new(vec![Message::system(sys), Message::user(user)])
+        .tier(Tier::Fast)
+        .json(schema)
+        .temperature(0.5)
+        .max_tokens(200);
+    let mut out: Vec<String> = run
+        .chat(req)
+        .await
+        .ok()
+        .and_then(|m| parse_json_loose(&m.content))
+        .map(|v| {
+            v["queries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|q| q.as_str().map(|s| s.trim().trim_matches('"').to_string()))
+                .filter(|q| !q.is_empty() && q.len() < 200)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Mechanical fallbacks: loosened phrasing, then the bare keywords.
+    let request = crate::depth::search_keywords(&run.query);
+    for q in tried.iter().chain(std::iter::once(&request)) {
+        if let Some(r) = relax_query(q) {
+            out.push(r);
+        }
+        let kw = terms(q);
+        if kw.len() >= 2 {
+            out.push(kw.into_iter().take(6).collect::<Vec<_>>().join(" "));
+        }
+    }
+    let mut seen: HashSet<String> = tried.iter().map(|q| q.to_lowercase()).collect();
+    out.retain(|q| seen.insert(q.to_lowercase()));
+    out.truncate(3);
+    out
+}
 
 /// Domains that rarely yield readable text without JavaScript or a login.
 pub const UNREADABLE: &[&str] = &[
@@ -30,6 +185,11 @@ pub const UNREADABLE: &[&str] = &[
     "pinterest.com",
     "linkedin.com",
     "quora.com",
+    // image/GIF hosts: nothing to read
+    "giphy.com",
+    "tenor.com",
+    "imgur.com",
+    "imgflip.com",
 ];
 
 pub fn readable(url: &str) -> bool {
@@ -110,15 +270,57 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
 
     // 1. Seed searches (always run — the system must use its tools).
     run.events.status("Searching the web");
-    let seed_calls = seeds(t, p);
-    let seed_results =
+    let mut seed_calls = seeds(t, p);
+    let mut seed_results =
         futures::future::join_all(seed_calls.iter().map(|(name, args)| run.tool(name, args.clone()))).await;
+
+    // 1b. Rescue: if the searches came back empty or off-topic (none of the request's distinctive
+    // words in the results), rephrase and search again before the model ever sees them —
+    // small models give up too easily, and search engines misread conversational queries.
+    let topic = topic_terms(&format!("{} {}", run.query, t.search_query));
+    // Wikipedia almost always returns *some* article; it only counts if it is about the request.
+    let wiki_found = seed_calls.iter().zip(&seed_results).any(|((name, _), (ok, out))| {
+        *name == "wikipedia" && *ok && !out.summary.contains("no article") && relevant(&out.text, &topic)
+    });
+    let hits: usize = seed_results.iter().map(|(ok, out)| relevant_hits(*ok, out, &topic)).sum();
+    if hits < 2 && !wiki_found && !run.out_of_time() {
+        run.events.status("Results look thin or off-topic — trying other phrasings");
+        let alts = rephrase(run, std::slice::from_ref(&t.search_query)).await;
+        let extra: Vec<(&'static str, Value)> =
+            alts.into_iter().map(|q| ("web_search", json!({ "query": q }))).collect();
+        let extra_results =
+            futures::future::join_all(extra.iter().map(|(name, args)| run.tool(name, args.clone()))).await;
+        let more: usize = extra_results.iter().map(|(ok, out)| relevant_hits(*ok, out, &topic)).sum();
+        if hits + more == 0 {
+            run.warn("the web searches found little that matches this request, even after rephrasing");
+        }
+        seed_calls.extend(extra);
+        seed_results.extend(extra_results);
+    }
     let mut messages =
         vec![Message::system(agent_system(run, t, p, native)), Message::user(format!("Request: {}", run.query))];
     let mut seed_dump = String::new();
     let mut seed_tool_msgs = vec![];
-    for ((name, args), (ok, out)) in seed_calls.iter().zip(seed_results) {
+    // Once some search found on-topic results, drop the searches that found only off-topic ones:
+    // they would cost context and tempt a small model into citing them.
+    let any_relevant = seed_results.iter().any(|(ok, out)| relevant_hits(*ok, out, &topic) > 0);
+    for ((name, args), (ok, mut out)) in seed_calls.iter().zip(seed_results) {
         done.insert(format!("{name}{args}"));
+        let is_search = out.data["hits"].is_array();
+        if any_relevant && is_search {
+            match on_topic_hits(run, &out, &topic) {
+                Some(text) => out.text = text,
+                None => {
+                    out.text = format!(
+                        "(Results for {} were off-topic and have been set aside.)",
+                        args["query"].as_str().unwrap_or("this search")
+                    );
+                    seed_tool_msgs.push(Message::tool(name, out.text.clone()));
+                    seed_dump.push_str(&format!("Result of {name} {args}:\n{}\n\n", out.text));
+                    continue;
+                }
+            }
+        }
         if ok {
             evidence.push(Evidence {
                 label: format!("{name}: {}", args["query"].as_str().or(args["topic"].as_str()).unwrap_or("")),
@@ -139,12 +341,19 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
 
     // 2. Model-driven rounds (skipped in pipeline mode).
     let mut use_native = native;
+    let mut switched = false;
+    // Everything gathered so far as plain text, used if we must switch to the JSON protocol mid-way.
+    let mut all_dump = seed_dump.clone();
     let rounds = if run.engine.cfg.agent_mode == AgentMode::Pipeline { 0 } else { p.max_steps };
     // Prompt budget for the loop: context minus the reply, tool specs and a safety margin.
     let loop_budget =
         (run.engine.cfg.num_ctx.saturating_sub(700 + 1_100) as f64 * crate::depth::CHARS_PER_TOKEN) as usize;
     for step in 0..rounds {
         if run.ctx.fetches_left() == 0 && step > 0 && t.depth == Depth::Quick {
+            break;
+        }
+        if run.out_of_time() {
+            run.warn("the time budget for research ran out; answering with what was found");
             break;
         }
         compact(&mut messages, loop_budget);
@@ -167,13 +376,18 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
                     messages.push(m);
                     calls
                 }
-                Err(e) if step == 0 => {
-                    tracing::warn!("native tool calling failed ({e:#}); switching to JSON protocol");
+                Err(e) if !switched => {
+                    // Small models sometimes emit malformed tool calls; the JSON protocol is more forgiving.
+                    tracing::warn!("native tool calling failed ({e:#}); switching to the JSON protocol");
                     use_native = false;
-                    messages[0] = Message::system(agent_system(run, t, p, false));
-                    // replace native seed messages with a plain dump
-                    messages.truncate(2);
-                    messages.push(Message::user(seed_dump.clone()));
+                    switched = true;
+                    messages = vec![
+                        Message::system(agent_system(run, t, p, false)),
+                        Message::user(format!("Request: {}", run.query)),
+                        Message::user(format!(
+                            "{all_dump}Next tool call as JSON, or {{\"tool\":\"done\",\"args\":{{}}}}."
+                        )),
+                    ];
                     continue;
                 }
                 Err(e) => {
@@ -227,6 +441,7 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
                 let label = args["url"].as_str().or(args["query"].as_str()).or(args["topic"].as_str()).unwrap_or("");
                 evidence.push(Evidence { label: format!("{name}: {label}"), text: out.text.clone() });
             }
+            all_dump.push_str(&format!("Result of {name}:\n{}\n\n", truncate_chars(&out.text, 1_500)));
             if use_native {
                 messages.push(Message::tool(name, truncate_chars(&out.text, p.page_chars)));
             } else {
@@ -241,20 +456,25 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
 
     // 3. Deterministic floor: make sure some pages were actually read.
     let want = match (t.depth, t.intent) {
-        (Depth::Quick, Intent::Entity | Intent::Links) => 0,
+        // a Wikipedia summary + snippets is enough to identify a name; otherwise read one page
+        (Depth::Quick, Intent::Entity | Intent::Links) if wiki_found => 0,
         (Depth::Quick, _) => 1,
         _ => p.max_fetches.min(2),
     };
     let read = run.ctx.sources.lock().unwrap().pages_read();
     if read < want {
+        let topic = topic_terms(&run.query);
         let candidates: Vec<String> = {
             let reg = run.ctx.sources.lock().unwrap();
-            reg.all()
+            let mut c: Vec<(usize, &crate::sources::Source)> = reg
+                .all()
                 .iter()
                 .filter(|s| !s.read && matches!(s.kind, SourceKind::Search | SourceKind::News) && readable(&s.url))
-                .map(|s| s.url.clone())
-                .take((want - read) + 2)
-                .collect()
+                .map(|s| (overlap(&format!("{} {} {}", s.title, s.snippet, s.url), &topic), s))
+                .collect();
+            // most on-topic first; search rank breaks ties (the sort is stable)
+            c.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            c.into_iter().map(|(_, s)| s.url.clone()).take((want - read) + 4).collect()
         };
         if !candidates.is_empty() {
             run.events.status("Reading the top results");
@@ -269,6 +489,9 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
                 evidence.push(Evidence { label: format!("fetch_page: {url}"), text: out.text });
                 got += 1;
             }
+        }
+        if got < want {
+            run.warn(format!("could only read {got} of the {want} pages wanted; the answer leans on search snippets"));
         }
     }
     Ok(evidence)
@@ -329,6 +552,15 @@ mod tests {
         assert!(m[2].content.len() < 1_500);
         assert_eq!(m[4].content.len(), 5000, "newest result kept intact");
         assert_eq!(m[0].content, "sys");
+    }
+
+    #[test]
+    fn judges_relevance_by_distinctive_words() {
+        let topic = topic_terms("what can you tell me about \"stares motherfuckingly\", hint: samuel l jackson");
+        assert_eq!(topic, vec!["stares", "motherfuckingly", "samuel", "jackson"]);
+        assert!(!relevant("Canva: Visual Suite for Everyone — design anything", &topic));
+        assert!(!relevant("CAN | meaning in the Cambridge English Dictionary", &topic));
+        assert!(relevant("Samuel L. Jackson's legendary stare in Pulp Fiction", &topic));
     }
 
     #[test]

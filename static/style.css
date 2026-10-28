@@ -130,6 +130,7 @@ button:disabled { opacity: .5; cursor: progress; }
 #log li.tool.ok::before { content: "✓"; color: var(--ok); }
 #log li.tool.fail::before { content: "✗"; color: var(--err); }
 #log li.error { color: var(--err); }
+#log li.warn { color: var(--warn); }
 #log code { font: 12px var(--mono); color: var(--ink); background: var(--code); padding: 1px 5px; border-radius: 4px; }
 
 /* answer */
@@ -155,6 +156,20 @@ button:disabled { opacity: .5; cursor: progress; }
 .md .caret { display: inline-block; width: 8px; height: 1em; background: var(--accent); vertical-align: -2px; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
+#go.stop { background: var(--muted); }
+#notice {
+  margin: 18px 0 0;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 10px;
+  background: var(--panel);
+  font-size: 13px;
+  color: var(--muted);
+}
+#notice.degraded { border-left-color: var(--err); color: var(--ink); }
+#notice summary { cursor: pointer; }
+#notice ul { margin: 8px 0 2px; padding-left: 18px; }
 #toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 22px 0 10px; }
 #stats { font-size: 13px; margin-left: auto; }
 
@@ -196,3 +211,14 @@ dialog menu { padding: 0; margin: 16px 0 0; text-align: right; }
   #menu-btn { display: inline-block; }
   #welcome, #run, #composer { padding-left: 16px; padding-right: 16px; }
 }
+
+/* follow-ups */
+.follow { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px 12px; font-size: 13px; color: var(--muted); cursor: pointer; vertical-align: top; padding-top: 6px; }
+.follow[hidden] { display: none; }
+.follow input { accent-color: var(--accent); margin: 0; }
+.src-tools { margin-left: 8px; font-size: 12px; white-space: nowrap; }
+.src-tools a, .src-tools button {
+  font: 500 11px var(--mono); color: var(--muted); background: var(--chip); border: 0;
+  border-radius: 4px; padding: 1px 6px; margin-left: 4px; cursor: pointer; text-decoration: none;
+}
+.src-tools a:hover, .src-tools button:hover { color: var(--accent); }

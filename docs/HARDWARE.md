@@ -74,7 +74,39 @@ To make it faster on weak hardware without changing the model:
   results). Fewer LLM calls, slightly less adaptive research.
 - Send `"depth":"quick"` or `"standard"` from the supervisor when you don't need a report.
 
-## Ollama settings for a dedicated box
+## Why the CPU sits at 100% (and when it shouldn't)
+
+Running the model on a CPU means doing billions of multiplications per token, and Ollama uses **every core** to do
+them. So while cookie-web answers, all cores at 100% is expected — on 4 vCPUs and on 8. Most of the work is
+*reading* the prompts (search results and page excerpts); a quick or standard answer sends the model roughly
+4–8k tokens across 2–6 calls, which keeps a small CPU busy for a minute or a few. More cores make it finish
+sooner; they don't make it lighter.
+
+cookie-web itself is not the load: measured at ~0% idle and 3–4% of one core during a job, ~30 MB of memory.
+Every result reports the model's share (`stats.prompt_tokens`, `stats.output_tokens`, `stats.model_ms`; also in
+the GUI stats line and the log), so you can see what each request cost.
+
+**Not expected:** 100% CPU when nothing is running. Check what is busy:
+
+```bash
+ps -eo pid,comm,%cpu,etime --sort=-%cpu | head      # ollama / "ollama runner"? cargo / rustc (still compiling)?
+curl -s localhost:11434/api/ps                      # what model Ollama has loaded
+curl -s localhost:8765/api/health | jq '.jobs_running, .jobs_queued'
+journalctl -u ollama -n 30                          # model reloads, errors
+```
+
+`cargo`/`rustc` at 100% is the install script compiling cookie-web (minutes, once). `ollama` busy with no running
+or queued job usually means another client (e.g. `ollama run` in a terminal) is using it.
+
+To keep the box pleasant to use:
+- `scripts/install-ollama.sh` runs Ollama at **lower priority** (`Nice=10`, `CPUWeight=50`): SSH and cookie-web stay
+  responsive, and the model still gets every idle cycle, so answers are not slower.
+- `COOKIE_NUM_THREAD=3` (or `install-cookie-web.sh --threads 3`) caps the model's threads, leaving a core free —
+  at the cost of somewhat slower answers.
+- Less work per request: `"depth": "quick"` when a short answer will do, or `COOKIE_AGENT_MODE=pipeline`
+  (fewer model calls).
+
+
 
 Set these on the Ollama service (`sudo systemctl edit ollama`, see [`deploy/ollama.conf`](../deploy/ollama.conf)):
 
@@ -93,6 +125,20 @@ cookie-web itself already defaults to `COOKIE_KEEP_ALIVE=-1`, `COOKIE_NUM_CTX=81
 doesn't pay the load time.
 
 ## Bare-metal install (no Docker)
+
+On Ubuntu/Debian the scripts do all of this (and are safe to re-run):
+
+```bash
+./scripts/setup-ubuntu.sh                       # = install-ollama.sh + install-cookie-web.sh
+./scripts/install-ollama.sh --model qwen3:4b-instruct --fast-model qwen3:1.7b
+./scripts/install-cookie-web.sh --binary ./cookie-web    # binary built on a faster machine
+```
+
+`install-ollama.sh` writes the tuning above as a systemd drop-in
+(`/etc/systemd/system/ollama.service.d/cookie-web.conf`), so Ollama upgrades don't undo it. Compiling cookie-web
+takes a while on a 4-core mini PC; building once elsewhere (same CPU architecture) and passing `--binary` is quicker.
+
+By hand, the same steps are:
 
 ```bash
 # 1. Ollama + model

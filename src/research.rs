@@ -10,7 +10,7 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 
 use crate::{
-    agent::readable,
+    agent::{readable, relevant, rephrase, topic_terms},
     depth::{Intent, Profile, Triage},
     engine::{Evidence, Run},
     llm::{ChatRequest, Message, Tier, parse_json_loose},
@@ -111,9 +111,25 @@ async fn search_round(run: &Run<'_>, queries: &[String], news: bool) -> Vec<Hit>
     v.into_iter().map(|(_, h)| h).collect()
 }
 
-/// Pick up to `n` readable, unseen URLs with at most 2 per domain.
-fn choose(hits: &[Hit], n: usize, seen: &mut HashSet<String>) -> Vec<String> {
-    let mut per_domain: HashMap<String, usize> = HashMap::new();
+/// Pick up to `n` readable, unseen URLs with at most 2 per domain. On-topic hits go first; off-topic
+/// ones (a search engine misreading a query) are only used to reach a minimum of 3 pages — every page
+/// read costs a model call for notes.
+fn choose(hits: &[Hit], n: usize, seen: &mut HashSet<String>, topic: &[String]) -> Vec<String> {
+    let on: Vec<&Hit> =
+        hits.iter().filter(|h| relevant(&format!("{} {} {}", h.title, h.snippet, h.url), topic)).collect();
+    let off: Vec<&Hit> = hits.iter().filter(|h| !on.iter().any(|o| std::ptr::eq(*o, *h))).collect();
+    let mut out = pick(&on, n, seen, &mut HashMap::new());
+    if out.len() < n.min(3) {
+        let mut per_domain = HashMap::new();
+        for u in &out {
+            *per_domain.entry(domain_of(u)).or_default() += 1;
+        }
+        out.extend(pick(&off, n.min(3) - out.len(), seen, &mut per_domain));
+    }
+    out
+}
+
+fn pick(hits: &[&Hit], n: usize, seen: &mut HashSet<String>, per_domain: &mut HashMap<String, usize>) -> Vec<String> {
     let mut out = vec![];
     for h in hits {
         if out.len() >= n {
@@ -131,8 +147,8 @@ fn choose(hits: &[Hit], n: usize, seen: &mut HashSet<String>) -> Vec<String> {
     out
 }
 
-/// Read pages and distil each into notes.
-async fn read_and_note(run: &Run<'_>, urls: Vec<String>, sub_questions: &[String]) -> Vec<Evidence> {
+/// Read pages and distil each into notes. Returns the notes and how many pages were actually read.
+async fn read_and_note(run: &Run<'_>, urls: Vec<String>, sub_questions: &[String]) -> (Vec<Evidence>, usize) {
     run.events.status(format!("Reading {} sources", urls.len()));
     let pages: Vec<_> = stream::iter(urls)
         .map(|u| async move { run.tool("fetch_page", json!({ "url": u, "focus": run.query })).await })
@@ -150,6 +166,11 @@ async fn read_and_note(run: &Run<'_>, urls: Vec<String>, sub_questions: &[String
     let mut out = vec![];
     for (i, text) in pages.iter().enumerate() {
         let header = text.lines().next().unwrap_or("source").to_string();
+        if run.out_of_time() {
+            // No time left for the model to take notes: hand the writer a focused excerpt instead.
+            out.push(Evidence { label: header, text: truncate_chars(text, 1500) });
+            continue;
+        }
         run.events.status(format!(
             "Taking notes {}/{}: {}",
             i + 1,
@@ -174,7 +195,7 @@ async fn read_and_note(run: &Run<'_>, urls: Vec<String>, sub_questions: &[String
             _ => out.push(Evidence { label: header, text: truncate_chars(text, 1500) }),
         }
     }
-    out
+    (out, pages.len())
 }
 
 async fn gaps(run: &Run<'_>, sub_questions: &[String], notes: &[Evidence]) -> Vec<String> {
@@ -221,20 +242,49 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
     }
 
     run.events.status(format!("Running {} searches", plan.queries.len()));
-    let hits = search_round(run, &plan.queries, news).await;
+    let mut hits = search_round(run, &plan.queries, news).await;
+    let topic = topic_terms(&run.query);
+    let on_topic = hits.iter().filter(|h| relevant(&format!("{} {} {}", h.title, h.snippet, h.url), &topic)).count();
+    if on_topic < 3 {
+        run.events.status("Few results — trying other phrasings");
+        let alts = rephrase(run, &plan.queries).await;
+        hits.extend(search_round(run, &alts, news).await);
+        if hits.is_empty() {
+            run.warn("the web searches found almost nothing for this request, even after rephrasing");
+        }
+    }
     let mut seen = HashSet::new();
     let first = p.max_fetches.saturating_sub(3).max(3);
-    let urls = choose(&hits, first, &mut seen);
-    evidence.extend(read_and_note(run, urls, &plan.sub_questions).await);
+    let urls = choose(&hits, first, &mut seen, &topic);
+    let (notes, mut read) = read_and_note(run, urls, &plan.sub_questions).await;
+    evidence.extend(notes);
+    // Dead links and blocked pages: top up from the next-best results.
+    if read < first.min(3) && run.ctx.fetches_left() > 0 && !run.out_of_time() {
+        let n = (first - read).min(run.ctx.fetches_left() as usize);
+        let urls = choose(&hits, n, &mut seen, &topic);
+        if !urls.is_empty() {
+            let (notes, more) = read_and_note(run, urls, &plan.sub_questions).await;
+            evidence.extend(notes);
+            read += more;
+        }
+    }
+    if read == 0 {
+        run.warn("no page could be read in full; the report relies on search snippets");
+    }
 
-    // Follow-up round for gaps.
-    let follow = gaps(run, &plan.sub_questions, &evidence).await;
+    // Follow-up round for gaps (skipped when the time budget is spent).
+    let follow = if run.out_of_time() {
+        run.warn("the time budget for research ran out; skipped the gap-filling round");
+        vec![]
+    } else {
+        gaps(run, &plan.sub_questions, &evidence).await
+    };
     if !follow.is_empty() && run.ctx.fetches_left() > 0 {
         run.events.status(format!("Filling gaps: {}", follow.join(" · ")));
         let more = search_round(run, &follow, news).await;
         let n = (run.ctx.fetches_left() as usize).min(3);
-        let urls = choose(&more, n, &mut seen);
-        evidence.extend(read_and_note(run, urls, &plan.sub_questions).await);
+        let urls = choose(&more, n, &mut seen, &topic);
+        evidence.extend(read_and_note(run, urls, &plan.sub_questions).await.0);
     }
 
     // Snippets of results we did not read: cheap extra breadth for the writer.
