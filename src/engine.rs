@@ -350,6 +350,30 @@ impl Engine {
         if removed > 0 {
             run.warn(format!("removed {removed} link(s) the research never visited (likely made up by the model)"));
         }
+        // Fact check: statements that tie names together must match what the sources say.
+        let body = if self.cfg.fact_check && !degraded {
+            let checkable: Vec<Evidence> =
+                evidence.iter().filter(|e| !e.label.starts_with("Earlier answer")).cloned().collect();
+            let max = match triage.depth {
+                Depth::Quick => 5,
+                Depth::Standard => 8,
+                Depth::Deep => 12,
+            };
+            let (checked, dropped) = crate::verify::check(run, &body, &checkable, max).await;
+            if !dropped.is_empty() {
+                let list: Vec<String> =
+                    dropped.iter().map(|d| format!("“{}”", d.chars().take(140).collect::<String>())).collect();
+                run.warn(format!(
+                    "removed {} statement{} the sources don't support: {}",
+                    dropped.len(),
+                    if dropped.len() == 1 { "" } else { "s" },
+                    list.join("; ")
+                ));
+            }
+            checked
+        } else {
+            body
+        };
         let (markdown, sources) = {
             let mut reg = run.ctx.sources.lock().unwrap();
             // The writer saw only these numbers; anything else it cites is invented.
@@ -471,7 +495,7 @@ impl Engine {
         query: &str,
         evidence: &[Evidence],
     ) -> (Completion, bool) {
-        let attempts = [(p.evidence_chars, 0.3f32), ((p.evidence_chars * 6 / 10).max(3_000), 0.2)];
+        let attempts = [(p.evidence_chars, 0.2f32), ((p.evidence_chars * 6 / 10).max(3_000), 0.1)];
         let streamed = Arc::new(AtomicBool::new(false));
         let mut last_err = String::new();
         for (i, (budget, temperature)) in attempts.into_iter().enumerate() {
@@ -528,6 +552,10 @@ impl Engine {
                Only use numbers that appear in the evidence. Never put URLs in citations.\n\
              - In link lists you may write Markdown links, using URLs exactly as they appear in the evidence.\n\
              - Never invent facts, numbers, dates, names or URLs. If the evidence is thin, outdated or conflicting, say so briefly.\n\
+             - Keep different people, characters and things apart. When the evidence covers several similar ones (two AIs, \
+               two actors, two products), state each fact only about the one the evidence ties it to. If unsure, leave it out.\n\
+             - Say each fact once, in short paragraphs. Do not repeat the answer as a list afterwards and do not add a \
+               \"Citations:\" line.\n\
              - If the evidence does not answer the request, say what you found and what is still unknown.\n\
              - Do not add a Sources/References section — it is appended automatically.\n\
              - Do not talk about \"the evidence\", \"search results\" or your tools. Just answer.\n\

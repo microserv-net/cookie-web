@@ -35,6 +35,7 @@ pub mod research;
 pub mod server;
 pub mod sources;
 pub mod tools;
+pub mod verify;
 
 use std::sync::Arc;
 

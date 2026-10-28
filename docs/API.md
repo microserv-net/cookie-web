@@ -308,6 +308,8 @@ What a caller can count on:
   read from the Wayback Machine (`COOKIE_ARCHIVE_FALLBACK`).
 - **No invented sources**: citations to sources the writer wasn't shown and Markdown links to URLs the research never
   visited are removed (and reported in `warnings`).
+- **Fact-checked names**: statements that connect names (who plays whom, who founded what) are checked against the
+  source sentences; ones the sources contradict or don't contain are removed and quoted in `warnings`.
 - **Time-boxed research**: each depth has a time budget (scaled by `COOKIE_TIME_SCALE`); when it runs out the answer is
   written from what was found.
 - **Retries are safe** with `Idempotency-Key`; **disconnects are recoverable** with `?from=` / `Last-Event-ID`.

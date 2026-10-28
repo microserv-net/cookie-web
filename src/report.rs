@@ -17,6 +17,12 @@ static TRAILING_SOURCES: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|
 /// Remove a Sources/References list the model may have appended (we generate our own).
 /// Only strips it if it is the very last block and consists of list lines.
 pub fn strip_model_sources(md: &str) -> String {
+    // a trailing "Citations: [1][2][3]" / "Sources: …" line that only repeats citations
+    static CITE_LINE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)\n\s*(?:\*\*)?(?:citations|sources|references)(?:\*\*)?\s*:?(?:\*\*)?\s*(?:\[[^\n]*)?\s*\z")
+            .unwrap()
+    });
+    let md = CITE_LINE.replace(md.trim_end(), "").into_owned();
     let md = md.trim_end().to_string() + "\n";
     // Keep quick-mode "**Links**" lists: they are content, not a bibliography.
     let out = TRAILING_SOURCES.replace(&md, |caps: &regex::Captures| {
@@ -580,6 +586,7 @@ mod tests {
     fn strips_trailing_sources_but_keeps_links_list() {
         let md = "Body text.\n\n## Sources\n- [1] One\n- [2] Two\n";
         assert_eq!(strip_model_sources(md), "Body text.");
+        assert_eq!(strip_model_sources("Body [1].\n\nCitations: [1][2](https://x.y)[3]\n"), "Body [1].");
         let quick = "Answer.\n\n**Links**\n- [A](https://a.com) — x\n";
         assert!(strip_model_sources(quick).contains("**Links**"));
     }

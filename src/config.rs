@@ -70,6 +70,8 @@ pub struct Config {
     pub time_scale: f64,
     /// When a page can't be fetched (dead link, 403, timeout), try its Wayback Machine copy.
     pub archive_fallback: bool,
+    /// Check statements that connect names against the sources and remove unsupported ones.
+    pub fact_check: bool,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -139,6 +141,7 @@ impl Config {
             job_timeout: Duration::from_secs(parse("COOKIE_JOB_TIMEOUT_SECS", 1800u64).max(30)),
             time_scale: parse("COOKIE_TIME_SCALE", 1.0f64).clamp(0.1, 20.0),
             archive_fallback: flag("COOKIE_ARCHIVE_FALLBACK", true),
+            fact_check: flag("COOKIE_FACT_CHECK", true),
         }
     }
 
@@ -193,6 +196,7 @@ impl Config {
             job_timeout: Duration::from_secs(120),
             time_scale: 1.0,
             archive_fallback: false,
+            fact_check: true,
         }
     }
 }

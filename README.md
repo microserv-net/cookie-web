@@ -22,6 +22,8 @@ cookie-web is a single Rust binary: an HTTP API, a built-in web GUI and a CLI. I
 - **Search backends** — SearXNG, Brave, Tavily, Ollama web search, plus keyless DuckDuckGo, Bing & Mojeek;
   fallback or rank-fusion mode.
 - **Real citations** — every claim links to a numbered source; citations and links the research never saw are removed.
+- **Fact check** — statements that tie names together are checked against the source sentences; ones the sources
+  contradict (a small model mixing up two people, say) are removed and reported.
 - **Built not to fail** — off-topic or empty searches are rephrased, failing search engines rest on a cooldown,
   dead pages are read from the Wayback Machine, Ollama hiccups are retried, and if the model can't write at all
   you still get a cited digest of what was found. Every bump on the way is reported in `warnings`.
@@ -112,6 +114,7 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 | `COOKIE_JOB_TIMEOUT_SECS` | `1800` | hard limit per research job (it fails cleanly instead of hanging) |
 | `COOKIE_TIME_SCALE` | `1.0` | scales the per-depth research time budgets (e.g. `2` on a slow CPU, `0.5` on a GPU) |
 | `COOKIE_ARCHIVE_FALLBACK` | `true` | read dead/blocked pages from the Wayback Machine |
+| `COOKIE_FACT_CHECK` | `true` | check statements that connect names against the sources; remove unsupported ones |
 
 ### Model & hardware
 

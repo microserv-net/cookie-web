@@ -28,6 +28,7 @@ judgement calls.
 | `src/agent.rs` | fenced tool-calling loop for quick/standard |
 | `src/research.rs` | deep pipeline: plan → search → read → notes → gaps |
 | `src/followup.rs` | follow-ups on a saved report; reading a report's source pages |
+| `src/verify.rs` | fact check: statements that connect names, checked against the source sentences |
 | `src/report.rs` | citation linking, Sources section, report storage |
 | `src/sources.rs` | source registry (stable `[n]` numbers, URL de-dup) |
 | `src/llm/` | `ChatModel` trait + Ollama client (native tools, JSON mode, streaming) |
@@ -113,6 +114,24 @@ Configured backends are tried in order (`COOKIE_SEARCH_MODE=fallback`) or all qu
 Keyless scraping works from home connections but is often rate-limited from datacenter IPs — use SearXNG
 or an API key on servers.
 
+## Fact check
+
+Small models read correct sources and still cross facts between similar subjects. A real example: the sources
+said "F.R.I.D.A.Y. appears as Alison Hogan, while E.D.I.T.H. takes the form of Edith Marks", and a 4B model wrote
+"Friday is based on Edith Marks, played by Emily Hampshire". After the answer is written:
+
+1. It is split into statements (sentences and list items). The ones that connect **two or more names** — where facts
+   get crossed — are checked, the ones with the most names first (quick 5, standard 8, deep 12 at most).
+2. For each, code collects the source sentences that mention those names (plus their neighbours, for "she" and
+   "he"), matching names loosely ("F.R.I.D.A.Y." = "Friday", "Samuel Jackson" ≈ "Samuel L. Jackson").
+3. The model gets one short question per statement: do these passages *support*, *contradict* or *not contain* it,
+   paying attention to which name each fact belongs to. Judging one sentence against a few others is far easier for a
+   small model than writing the whole answer, so it catches what the writer got wrong.
+4. Contradicted or unsupported statements are removed and listed in `warnings`. If the checker would remove most of
+   the answer, it only removes outright contradictions (or nothing, with a warning) — the checker can be wrong too.
+
+Cost: a few hundred prompt tokens per statement checked. `COOKIE_FACT_CHECK=false` turns it off.
+
 ## Follow-ups
 
 A follow-up (`report` set on a request) skips triage-by-model and searching-first:
@@ -171,6 +190,7 @@ silent failure. Each layer has its own fallback:
 | the answer stream breaks off | the answer is rewritten (clients get a `reset` event to drop the half answer) |
 | the writer fails twice | a cited digest of the sources is returned, `degraded: true` |
 | the answer hits the token limit | a dangling half-sentence is dropped and open code fences are closed |
+| the model crosses facts between names | the fact check removes the statements the sources contradict (see *Fact check*) |
 | research runs long | per-depth time budget, then the answer is written from what was found |
 | a job hangs | hard limit `COOKIE_JOB_TIMEOUT_SECS` |
 | a job crashes | the job still ends with an `error` event; the server keeps running |
