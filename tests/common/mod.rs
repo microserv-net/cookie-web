@@ -38,6 +38,8 @@ pub struct FakeLlm {
     pub write_delay: Mutex<Duration>,
     /// The writer's reply.
     pub answer: Mutex<String>,
+    /// Fact-check prompts received (passage + statement).
+    pub judged: Mutex<Vec<String>>,
 }
 
 impl FakeLlm {
@@ -52,6 +54,7 @@ impl FakeLlm {
             panic_on_write: AtomicBool::new(false),
             write_delay: Mutex::new(Duration::ZERO),
             answer: Mutex::new(ANSWER.to_string()),
+            judged: Mutex::new(vec![]),
         }
     }
     fn note(&self, s: &str) {
@@ -71,6 +74,17 @@ impl ChatModel for FakeLlm {
             anyhow::bail!("cannot reach Ollama (fake outage)");
         }
         let sys = req.messages.first().map(|m| m.content.clone()).unwrap_or_default();
+        if sys.contains("You check one statement") {
+            // A stand-in fact checker that knows the right pairings:
+            // F.R.I.D.A.Y. = Allison Hogan (Orla Brady), E.D.I.T.H. = Edith Marks (Emily Hampshire).
+            self.note("judge");
+            let user = req.messages.last().map(|m| m.content.clone()).unwrap_or_default();
+            self.judged.lock().unwrap().push(user.clone());
+            let stmt = user.rsplit("Statement:").next().unwrap_or("").to_lowercase();
+            let crossed = stmt.contains("friday") && (stmt.contains("edith marks") || stmt.contains("hampshire"));
+            let verdict = if crossed { "contradicted" } else { "supported" };
+            return Ok(Message::assistant(format!(r#"{{"verdict":"{verdict}"}}"#)));
+        }
         if sys.contains("You help a web search that found nothing") {
             self.note("rephrase");
             return Ok(Message::assistant(r#"{"queries":["rescued query","another angle"]}"#));

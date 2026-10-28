@@ -234,3 +234,99 @@ async fn off_topic_results_trigger_a_rescue_and_are_set_aside() {
     assert!(r.sources.iter().any(|s| s.url == "https://wiki.example/glorbix" && s.cited), "{:?}", r.sources);
     assert!(!r.sources.iter().any(|s| s.url.contains("design") && s.cited), "off-topic results can't be cited");
 }
+
+/// Reads every page as the same short excerpt of the real VisionQuest sources.
+struct FixedFetch;
+
+const VISIONQUEST: &str = "The episodes also explore Vision's mind palace, where F.R.I.D.A.Y. and E.D.I.T.H. appear as \
+    human avatars linked to Tony Stark's past. F.R.I.D.A.Y. appears as Alison Hogan, while E.D.I.T.H. takes the form \
+    of Edith Marks, a fearless Stark test pilot. Orla Brady plays F.R.I.D.A.Y. in physical form. Emily Hampshire plays \
+    the E.D.I.T.H. avatar. Allison Hogan was Howard Stark's office administrator.";
+
+#[async_trait::async_trait]
+impl cookie_web::tools::Tool for FixedFetch {
+    fn name(&self) -> &'static str {
+        "fetch_page"
+    }
+    fn description(&self) -> &'static str {
+        "fetch"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"url":{"type":"string"}}})
+    }
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &cookie_web::tools::ToolCtx,
+    ) -> anyhow::Result<cookie_web::tools::ToolOutput> {
+        if !ctx.take_fetch() {
+            return Ok(cookie_web::tools::ToolOutput::new("budget exhausted", "budget exhausted"));
+        }
+        let url = args["url"].as_str().unwrap_or("");
+        let n = ctx.add_source("VisionQuest explained", url, "", cookie_web::sources::SourceKind::Page, None);
+        Ok(cookie_web::tools::ToolOutput::new(
+            format!("[{n}] VisionQuest explained\nURL: {url}\n\n{VISIONQUEST}"),
+            "read",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn fact_check_removes_crossed_up_statements() {
+    let mut tools = Registry::new();
+    tools.add(FakeSearch("web_search"));
+    tools.add(FixedFetch);
+    let mut c = cfg("factcheck");
+    c.agent_mode = AgentMode::Pipeline;
+    let llm = Arc::new(FakeLlm::new(true));
+    // the kind of answer a small model wrote from these sources: F.R.I.D.A.Y. and E.D.I.T.H. blended together
+    *llm.answer.lock().unwrap() =
+        "Orla Brady plays F.R.I.D.A.Y. in physical form [1]. In the series, Orla Brady plays \
+        Friday, who is based on the real-life person Edith Marks [2].\n\n\
+        - Friday is an AI avatar based on Edith Marks, played by Emily Hampshire [1].\n\
+        - Friday is modeled on Allison Hogan, Howard Stark's office administrator [2].\n\n\
+        Citations: [1][2]"
+            .into();
+    let (res, _, log) = run_with(
+        llm.clone(),
+        tools,
+        c,
+        req("what can you tell me about Friday from Iron Man and who plays her in VisionQuest", Some("standard")),
+    )
+    .await;
+    let r = res.unwrap();
+    let body = r.markdown.split("## Sources").next().unwrap();
+    assert!(log.contains(&"judge".to_string()), "{log:?}");
+    assert!(body.contains("Orla Brady plays F.R.I.D.A.Y. in physical form"), "{body}");
+    assert!(body.contains("Friday is modeled on Allison Hogan"), "{body}");
+    assert!(!body.contains("Edith Marks"), "crossed statements removed: {body}");
+    assert!(!body.contains("Citations:"), "{body}");
+    assert!(
+        r.warnings.iter().any(|w| w.contains("removed 2 statements the sources don't support")),
+        "{:?}",
+        r.warnings
+    );
+    // the checker was shown the sentence that settles it
+    let judged = llm.judged.lock().unwrap().clone();
+    let crossed =
+        judged.iter().find(|j| j.contains("Emily Hampshire [") || j.contains("played by Emily Hampshire")).unwrap();
+    assert!(
+        crossed.contains("F.R.I.D.A.Y. appears as Alison Hogan, while E.D.I.T.H. takes the form of Edith Marks"),
+        "{crossed}"
+    );
+}
+
+#[tokio::test]
+async fn fact_check_can_be_turned_off() {
+    let mut tools = Registry::new();
+    tools.add(FakeSearch("web_search"));
+    tools.add(FixedFetch);
+    let mut c = cfg("nofactcheck");
+    c.agent_mode = AgentMode::Pipeline;
+    c.fact_check = false;
+    let llm = Arc::new(FakeLlm::new(true));
+    *llm.answer.lock().unwrap() = "Friday is an AI avatar based on Edith Marks, played by Emily Hampshire [1].".into();
+    let (res, _, log) = run_with(llm, tools, c, req("who plays Friday in VisionQuest", Some("standard"))).await;
+    assert!(res.unwrap().markdown.contains("Edith Marks"));
+    assert!(!log.contains(&"judge".to_string()));
+}
