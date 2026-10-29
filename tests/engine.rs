@@ -127,3 +127,23 @@ async fn pipeline_mode_skips_model_tool_rounds() {
     assert!(r.stats.pages_read >= 2, "code still reads the top results");
     assert!(r.markdown.contains("## Sources"));
 }
+
+#[tokio::test]
+async fn quick_needs_no_model_round_when_code_found_enough() {
+    let (r, _events, log) = run(true, "what is the fake thing exactly", Some("quick")).await;
+    assert!(!log.iter().any(|l| l.starts_with("agent")), "an on-topic page was read, no planning call: {log:?}");
+    assert_eq!(r.stats.pages_read, 1);
+    assert_eq!(log.iter().filter(|l| *l == "write").count(), 1);
+}
+
+#[tokio::test]
+async fn pages_are_read_in_parallel_before_the_model_decides() {
+    let (_r, events, _log) = run(true, "how does the fake thing work in practice today", Some("standard")).await;
+    let pos = |pred: &dyn Fn(&Event) -> bool| events.iter().position(pred).unwrap();
+    let first_read = pos(&|e| matches!(e, Event::ToolCall { tool, .. } if tool == "fetch_page"));
+    let deciding = pos(&|e| matches!(e, Event::Status { message } if message.starts_with("Deciding")));
+    assert!(first_read < deciding, "code reads the top pages first");
+    let reads_before =
+        events[..deciding].iter().filter(|e| matches!(e, Event::ToolCall { tool, .. } if tool == "fetch_page")).count();
+    assert_eq!(reads_before, 2, "the top two pages, read together");
+}

@@ -111,10 +111,9 @@ impl ChatModel for FakeLlm {
             return Ok(Message::assistant("- a concrete fact\n- another fact"));
         }
         if sys.contains("research planner") {
-            let fetched = req
-                .messages
-                .iter()
-                .any(|m| m.content.contains("Result of fetch_page") || m.tool_name.as_deref() == Some("fetch_page"));
+            // A model that wants one specific page (a for native calls, b for JSON) and is done once it saw it.
+            let want = if req.tools.is_empty() { "https://example.com/b" } else { "https://example.com/a" };
+            let fetched = req.messages.iter().any(|m| m.content.contains(&format!("URL: {want}")));
             if !req.tools.is_empty() {
                 self.note("agent-native");
                 if self.native_broken.load(Ordering::SeqCst) {
