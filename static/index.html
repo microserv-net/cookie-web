@@ -80,6 +80,7 @@
         <input type="checkbox" id="follow" checked> ↳ Follow up on this answer</label>
       <div class="input-row">
         <textarea id="q" rows="1" placeholder="Ask anything… (Enter to send, Shift+Enter for a new line)" autofocus></textarea>
+        <button id="pause" type="button" class="ghost" hidden title="Pause this research: the model stops and the next queued job can run. Resume carries on where it stopped.">Pause</button>
         <button id="go" type="submit">Search</button>
       </div>
     </form>
@@ -92,6 +93,10 @@
     <section>
       <h4>Jobs</h4>
       <ul id="st-jobs" class="st-jobs"><li class="muted">No jobs yet</li></ul>
+    </section>
+    <section id="st-watch-wrap" hidden>
+      <h4>Watchdog</h4>
+      <dl id="st-watch" class="st-grid"></dl>
     </section>
     <section>
       <h4>Server &amp; model</h4>

@@ -130,6 +130,7 @@ pub async fn run(
     started: Instant,
     created_at: DateTime<Utc>,
     today: String,
+    control: std::sync::Arc<crate::control::Control>,
 ) -> anyhow::Result<ResearchResult> {
     let report_id = req.report.clone().unwrap_or_default();
     let parent = engine
@@ -206,6 +207,7 @@ pub async fn run(
             parent.query.replace('"', "'")
         )),
         title: Some(query.trim().to_string()),
+        control,
     };
     if !named || web_mode == WebMode::Always {
         triage.search_query = standalone_query(&run, &parent.query, &question).await;

@@ -69,6 +69,10 @@ pub struct Config {
     /// Password for the website (defaults to the API key). Also accepted by the API.
     pub password: Option<String>,
     pub max_concurrent: usize,
+    /// Most jobs allowed to wait in the queue; past it new requests get 503 + Retry-After.
+    pub max_queue: usize,
+    /// The watchdog (`cookie-watch`) to send heartbeats to, e.g. `http://127.0.0.1:8790`.
+    pub watch_url: Option<String>,
     pub allow_private_urls: bool,
     pub user_agent: String,
     pub fetch_timeout: Duration,
@@ -144,6 +148,8 @@ impl Config {
             password: var("COOKIE_PASSWORD"),
             // One model instance serves one request at a time on small boxes; queue the rest.
             max_concurrent: parse("COOKIE_MAX_CONCURRENT", 1usize).max(1),
+            max_queue: parse("COOKIE_MAX_QUEUE", 25usize),
+            watch_url: var("COOKIE_WATCH_URL").map(|u| u.trim_end_matches('/').to_string()),
             allow_private_urls: flag("COOKIE_ALLOW_PRIVATE_URLS", false),
             user_agent: var("COOKIE_USER_AGENT").unwrap_or_else(|| {
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
@@ -212,6 +218,8 @@ impl Config {
             api_key: None,
             password: None,
             max_concurrent: 2,
+            max_queue: 25,
+            watch_url: None,
             allow_private_urls: false,
             user_agent: "cookie-web-test".into(),
             fetch_timeout: Duration::from_secs(5),

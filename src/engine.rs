@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::{
     agent,
     config::Config,
+    control::Control,
     depth::{self, Depth, Intent, Profile, Triage},
     events::{Event, Events},
     llm::{ChatModel, ChatRequest, Completion, Message, Tier, Usage},
@@ -172,12 +173,15 @@ pub struct Run<'a> {
     pub context: Option<String>,
     /// The request as the caller wrote it, when the model sees a rewritten version (follow-ups).
     pub title: Option<String>,
+    /// Pause/resume for this job.
+    pub control: Arc<Control>,
 }
 
 impl Run<'_> {
     /// Gathering time is up: finish the current step and move on to writing.
     pub fn out_of_time(&self) -> bool {
-        Instant::now() >= self.deadline
+        // time spent paused doesn't count
+        Instant::now().checked_sub(self.control.paused_for()).is_some_and(|now| now >= self.deadline)
     }
 
     /// Record a non-fatal problem (shown to the caller in `warnings` and as a `warning` event).
@@ -197,6 +201,7 @@ impl Run<'_> {
         if matches!(name, "web_search" | "news_search") {
             self.counters.searches.fetch_add(1, Ordering::SeqCst);
         }
+        self.control.checkpoint().await;
         self.events.emit(Event::ToolCall { call_id, tool: name.to_string(), args: args.clone() });
         let (ok, out) = self.engine.tools.call(name, args, &self.ctx).await;
         self.events.emit(Event::ToolResult { call_id, tool: name.to_string(), ok, summary: out.summary.clone() });
@@ -206,7 +211,15 @@ impl Run<'_> {
     pub async fn chat(&self, req: ChatRequest) -> anyhow::Result<Message> {
         self.counters.llm_calls.fetch_add(1, Ordering::SeqCst);
         let req = if req.model.is_none() && req.tier == Tier::Main { req.model(self.model.clone()) } else { req };
-        let msg = self.engine.llm.chat(req).await?;
+        // a pause drops the call (Ollama stops generating) and makes it again on resume
+        let llm = self.engine.llm.clone();
+        let msg = self
+            .control
+            .pausable(|| {
+                let (llm, req) = (llm.clone(), req.clone());
+                async move { llm.chat(req).await }
+            })
+            .await?;
         self.counters.add_usage(msg.usage);
         Ok(msg)
     }
@@ -249,17 +262,43 @@ impl Engine {
 
     /// Run one research request. Never hangs: the whole job is bounded by `COOKIE_JOB_TIMEOUT_SECS`.
     pub async fn run(&self, req: ResearchRequest, events: Events) -> anyhow::Result<ResearchResult> {
+        self.run_controlled(req, events, Control::detached()).await
+    }
+
+    /// [`Engine::run`] for a job that can be paused through `control` (time paused doesn't count
+    /// against the time limits).
+    pub async fn run_controlled(
+        &self,
+        req: ResearchRequest,
+        events: Events,
+        control: Arc<Control>,
+    ) -> anyhow::Result<ResearchResult> {
         let limit = self.cfg.job_timeout;
-        match tokio::time::timeout(limit, self.run_inner(req, events)).await {
-            Ok(r) => r,
-            Err(_) => bail!(
-                "the research took longer than {}s and was stopped (raise COOKIE_JOB_TIMEOUT_SECS on slow hardware)",
-                limit.as_secs()
-            ),
+        let start = Instant::now();
+        let work = self.run_inner(req, events, control.clone());
+        tokio::pin!(work);
+        loop {
+            let used = start.elapsed().saturating_sub(control.paused_for());
+            if used >= limit {
+                bail!(
+                    "the research took longer than {}s and was stopped (raise COOKIE_JOB_TIMEOUT_SECS on slow hardware)",
+                    limit.as_secs()
+                );
+            }
+            tokio::select! {
+                r = &mut work => return r,
+                _ = tokio::time::sleep(limit - used) => {}
+            }
         }
     }
 
-    async fn run_inner(&self, req: ResearchRequest, events: Events) -> anyhow::Result<ResearchResult> {
+    async fn run_inner(
+        &self,
+        req: ResearchRequest,
+        events: Events,
+        control: Arc<Control>,
+    ) -> anyhow::Result<ResearchResult> {
+        control.set_events(events.clone());
         let started = Instant::now();
         let created_at = Utc::now();
         let query = req.query.trim().to_string();
@@ -271,7 +310,7 @@ impl Engine {
         }
         let today = created_at.format("%A, %B %-d, %Y").to_string();
         if req.report.is_some() {
-            return crate::followup::run(self, req, events, started, created_at, today).await;
+            return crate::followup::run(self, req, events, started, created_at, today, control).await;
         }
 
         // 1. Triage ------------------------------------------------------------
@@ -279,7 +318,7 @@ impl Engine {
         if req.depth.as_deref().is_some_and(|d| !d.eq_ignore_ascii_case("auto")) && forced.is_none() {
             bail!("invalid depth '{}': use auto, quick, standard or deep", req.depth.unwrap_or_default());
         }
-        let (mut triage, triage_usage) = depth::triage(self.llm.as_ref(), &query, &today).await;
+        let (mut triage, triage_usage) = control.pausable(|| depth::triage(self.llm.as_ref(), &query, &today)).await;
         if let Some(d) = forced {
             triage.depth = d;
             triage.reason = "set explicitly by the caller".into();
@@ -307,6 +346,7 @@ impl Engine {
             pages: Mutex::new(HashMap::new()),
             context: None,
             title: None,
+            control,
         };
         if triage_usage != Usage::default() {
             run.counters.llm_calls.fetch_add(1, Ordering::SeqCst);
@@ -438,7 +478,8 @@ impl Engine {
                 searches: run.counters.searches.load(Ordering::SeqCst),
                 pages_read,
                 llm_calls: run.counters.llm_calls.load(Ordering::SeqCst),
-                duration_ms: started.elapsed().as_millis() as u64,
+                // working time: a pause doesn't count
+                duration_ms: started.elapsed().saturating_sub(run.control.paused_for()).as_millis() as u64,
                 prompt_tokens: run.counters.usage().prompt_tokens,
                 output_tokens: run.counters.usage().output_tokens,
                 model_ms: run.counters.usage().model_ms,
@@ -593,12 +634,22 @@ impl Engine {
             .temperature(temperature)
             .model(run.model.clone());
         run.counters.llm_calls.fetch_add(1, Ordering::SeqCst);
-        let events = run.events.clone();
-        let c = self
-            .llm
-            .chat_stream(req, &move |tok: &str| {
-                streamed.store(true, Ordering::SeqCst);
-                events.emit(Event::Token { text: tok.to_string() })
+        // A pause stops the generation; on resume the answer is written again from the start.
+        let c = run
+            .control
+            .pausable(|| {
+                if streamed.swap(false, Ordering::SeqCst) {
+                    run.events.emit(Event::Reset { reason: "resumed after a pause: writing the answer again".into() });
+                }
+                let (llm, req, events, streamed) =
+                    (self.llm.clone(), req.clone(), run.events.clone(), streamed.clone());
+                async move {
+                    let on_token = move |tok: &str| {
+                        streamed.store(true, Ordering::SeqCst);
+                        events.emit(Event::Token { text: tok.to_string() })
+                    };
+                    llm.chat_stream(req, &on_token).await
+                }
             })
             .await
             .context("writing the answer failed")?;

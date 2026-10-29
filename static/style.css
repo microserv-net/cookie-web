@@ -32,6 +32,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -157,6 +158,9 @@ button:disabled { opacity: .5; cursor: progress; }
 @keyframes blink { 50% { opacity: 0; } }
 
 #go.stop { background: var(--muted); }
+#pause { padding: 8px 14px; }
+#pause.paused { border-color: var(--accent); color: var(--accent); }
+#activity.paused summary::after { content: " · paused"; color: var(--warn); }
 #notice {
   margin: 18px 0 0;
   padding: 10px 14px;
@@ -236,11 +240,15 @@ dialog.panel section:last-child { padding-bottom: 18px; }
 .st-jobs { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
 .st-job { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
 .st-job.running { border-left: 3px solid var(--accent); }
+.st-job.paused { border-left: 3px solid var(--warn); }
 .st-job-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.st-job-top button { margin-left: auto; padding: 2px 10px; font-size: 12px; }
+.st-actions { margin-left: auto; display: flex; gap: 6px; }
+.st-actions button { padding: 2px 10px; font-size: 12px; }
 .st-time { font: 500 13px var(--mono); }
 .st-q { margin: 4px 0 2px; font-weight: 500; overflow-wrap: anywhere; }
 .chip.st-running { background: var(--accent); color: var(--accent-ink); }
+.chip.st-paused { background: #f5e3bd; color: #6b4a0c; }
+.chip.st-queued { background: var(--chip); }
 .chip.st-done { background: #e3efd9; color: #2f5a22; }
 .chip.st-error, .chip.st-cancelled { background: #f3d6cb; color: #7a2c18; }
 .st-grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; font-size: 14px; }
