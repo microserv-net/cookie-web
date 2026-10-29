@@ -19,16 +19,30 @@ All request/response bodies are JSON (UTF-8) unless noted. The GUI at `/` uses e
 
 ## Authentication
 
-Off by default. Set `COOKIE_API_KEY=<secret>` to require a key on every `/api/*` route except
-`/api/health` and `/api/manifest`. Send it as any of:
+Off by default. Set `COOKIE_API_KEY` (for programs) and optionally `COOKIE_PASSWORD` (for people) to turn it on:
+
+| | without signing in | how to get in |
+|---|---|---|
+| **website** (`/`, reports, …) | redirected to `/login` | the password: `COOKIE_PASSWORD`, or the API key if no password is set |
+| **API** (`/api/*`) | `401 {"error": …}` | the API key or the password, as below — or the website's session cookie |
+| `/login`, `/api/manifest`, page assets | open | — |
+| `/api/health` | open, but only `{"status","version","auth_required"}` | full details once authorized |
 
 ```
-Authorization: Bearer <secret>
-X-API-Key: <secret>
-?api_key=<secret>          # query param, for EventSource clients that can't set headers
+Authorization: Bearer <key>
+X-API-Key: <key>
+?api_key=<key>             # query param, for EventSource clients that can't set headers
 ```
 
-Missing/wrong key → `401 {"error":"missing or invalid API key"}`.
+Signing in (`POST /login`, form field `password`, or JSON `{"password": "…"}`) sets an HttpOnly,
+`SameSite=Strict` session cookie valid for 30 days. Sessions are signed with a key derived from the secrets, so
+they survive restarts, and changing the password or API key signs everyone out. `GET /logout` signs out.
+After 5 wrong passwords from one client in 15 minutes, sign-in is refused for the rest of that window
+(`429` for JSON, `/login?error=locked` for the form). Behind a reverse proxy the client address is taken from
+`X-Forwarded-For`, and the cookie gets `Secure` when `X-Forwarded-Proto: https`.
+
+> Over plain `http://` the password travels unencrypted. On a VPS, put cookie-web behind HTTPS (e.g. Caddy:
+> `your.domain { reverse_proxy 127.0.0.1:8765 }`) or reach it over a VPN / SSH tunnel.
 
 ## The request object
 
@@ -155,7 +169,16 @@ Returns `202 Accepted` with a `Location` header:
 ### `GET /api/jobs` · `GET /api/jobs/{id}`
 
 Job snapshot: `status` is `queued` → `running` → `done` | `error` | `cancelled`. When `done`, the snapshot includes `result`
-(a `ResearchResult`); when `error` or `cancelled`, it includes `error`. Finished jobs are kept in memory for ~1 hour.
+(a `ResearchResult`, single-job view only) and `report_id`; when `error` or `cancelled`, it includes `error`. Finished jobs
+are kept in memory for ~1 hour. Live progress fields (what the website's status view shows):
+
+| field | |
+|---|---|
+| `stage` | what it is doing now ("Reading the top 2 results", "Writing the answer", …) |
+| `depth` | quick / standard / deep, once decided |
+| `queued_ms`, `running_ms` | time spent waiting for a slot, and running (so far, or in total) |
+| `tool_calls`, `sources` | work done so far |
+| `report_id`, `warnings`, `degraded` | when done |
 
 ### `DELETE /api/jobs/{id}` — cancel
 
@@ -186,7 +209,7 @@ sends automatically on reconnect) resumes after event `N`.
 
 | method & path | returns |
 |---------------|---------|
-| `GET /api/health` | `status` (`ok`/`degraded`), Ollama reachability, model availability & capabilities, installed models, tools, search backends with their health (`search_health`: successes, failures, `cooldown_secs`, `last_error`), running and queued jobs |
+| `GET /api/health` | `status` (`ok`/`degraded`), Ollama reachability, model availability & capabilities, installed models, tools, search backends with their health (`search_health`: successes, failures, `cooldown_secs`, `last_error`), running and queued jobs, settings, `uptime_secs` |
 | `GET /api/manifest` | machine-readable agent card (name, capabilities, input/output, endpoints) for orchestrators |
 | `GET /api/tools` | the JSON-schema tool specs the model receives |
 

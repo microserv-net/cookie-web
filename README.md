@@ -30,6 +30,8 @@ cookie-web is a single Rust binary: an HTTP API, a built-in web GUI and a CLI. I
 - **Small-model friendly** — seeded searches, budgets, query-focused excerpts, deterministic fallbacks,
   JSON tool protocol for models without native tool calling.
 - **Integrates anywhere** — blocking JSON, Server-Sent Events, or async jobs; reports saved as `.md` files.
+- **Sign-in and status** — set a key/password and the website asks for it; a live status view shows running and
+  queued jobs (with Stop), the model, and which search engines are working.
 - **Follow-ups** — ask more about an answer (`@3` = about source 3) without starting over; citation numbers stay the
   same. Every source's full text (plain text, Markdown or JSON) and images are available from the report.
 
@@ -108,7 +110,8 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 | `COOKIE_SEARCH_MODE` | `fallback` | or `fusion` (query all backends, merge rankings) |
 | `COOKIE_DISABLE_SCRAPERS` | `false` | drop the keyless scrapers (DuckDuckGo, Bing, Mojeek) |
 | `COOKIE_REPORTS_DIR` | `reports` | where `.md` reports are saved |
-| `COOKIE_API_KEY` | — | require `Authorization: Bearer …` on the API |
+| `COOKIE_API_KEY` | — | protects the API (`Authorization: Bearer …`) and the website (it is the password unless `COOKIE_PASSWORD` is set) |
+| `COOKIE_PASSWORD` | — | a separate password for the website sign-in (also accepted by the API) |
 | `COOKIE_MAX_CONCURRENT` | `1` | parallel research jobs (others queue) |
 | `COOKIE_ALLOW_PRIVATE_URLS` | `false` | allow reading LAN/localhost pages |
 | `COOKIE_JOB_TIMEOUT_SECS` | `1800` | hard limit per research job (it fails cleanly instead of hanging) |
