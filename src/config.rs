@@ -57,6 +57,8 @@ pub struct Config {
 
     pub reports_dir: PathBuf,
     pub api_key: Option<String>,
+    /// Password for the website (defaults to the API key). Also accepted by the API.
+    pub password: Option<String>,
     pub max_concurrent: usize,
     pub allow_private_urls: bool,
     pub user_agent: String,
@@ -125,6 +127,7 @@ impl Config {
             disable_duckduckgo: flag("COOKIE_DISABLE_SCRAPERS", false) || flag("COOKIE_DISABLE_DUCKDUCKGO", false),
             reports_dir: PathBuf::from(var("COOKIE_REPORTS_DIR").unwrap_or_else(|| "reports".into())),
             api_key: var("COOKIE_API_KEY"),
+            password: var("COOKIE_PASSWORD"),
             // One model instance serves one request at a time on small boxes; queue the rest.
             max_concurrent: parse("COOKIE_MAX_CONCURRENT", 1usize).max(1),
             allow_private_urls: flag("COOKIE_ALLOW_PRIVATE_URLS", false),
@@ -187,6 +190,7 @@ impl Config {
             disable_duckduckgo: true,
             reports_dir: PathBuf::from("reports"),
             api_key: None,
+            password: None,
             max_concurrent: 2,
             allow_private_urls: false,
             user_agent: "cookie-web-test".into(),

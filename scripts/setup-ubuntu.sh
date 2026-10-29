@@ -14,7 +14,7 @@ COOKIE_ARGS=()
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--model | --fast-model) OLLAMA_ARGS+=("$1" "${2:?$1 needs a value}"); COOKIE_ARGS+=("$1" "$2"); shift 2 ;;
-	--port | --api-key | --binary | --ollama | --threads) COOKIE_ARGS+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+	--port | --api-key | --password | --binary | --ollama | --threads) COOKIE_ARGS+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
 	-h | --help) sed -n '2,8p' "$0"; exit 0 ;;
 	*) COOKIE_ARGS+=("$1"); shift ;;
 	esac

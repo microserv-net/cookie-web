@@ -26,6 +26,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
+    auth::Auth,
     depth::Depth,
     engine::{Engine, ResearchRequest, ResearchResult},
     events::{Event, Events},
@@ -57,6 +58,20 @@ pub struct Job {
     abort: Mutex<Option<tokio::task::AbortHandle>>,
     /// The caller's `Idempotency-Key`, if any.
     key: Option<String>,
+    /// Live progress, for the status view.
+    progress: Mutex<Progress>,
+}
+
+/// What a job is doing right now (kept up to date from its events).
+#[derive(Default)]
+struct Progress {
+    stage: Option<String>,
+    depth: Option<String>,
+    started: Option<Instant>,
+    ended: Option<Instant>,
+    tool_calls: usize,
+    sources: usize,
+    tokens: usize,
 }
 
 impl Job {
@@ -74,7 +89,12 @@ impl Job {
             tick,
             abort: Mutex::new(None),
             key,
+            progress: Mutex::new(Progress::default()),
         })
+    }
+
+    fn mark_running(&self) {
+        self.progress.lock().unwrap().started.get_or_insert_with(Instant::now);
     }
 
     pub fn status(&self) -> JobStatus {
@@ -95,6 +115,7 @@ impl Job {
             *st = JobStatus::Cancelled;
         }
         *self.error.lock().unwrap() = Some("cancelled".into());
+        self.progress.lock().unwrap().ended.get_or_insert_with(Instant::now);
         if let Some(h) = self.abort.lock().unwrap().as_ref() {
             h.abort();
         }
@@ -103,6 +124,29 @@ impl Job {
     }
 
     fn push(&self, e: Event) {
+        {
+            let mut p = self.progress.lock().unwrap();
+            match &e {
+                Event::Status { message } => p.stage = Some(message.clone()),
+                Event::Triage(t) => p.depth = Some(t.depth.as_str().to_string()),
+                Event::ToolCall { tool, .. } => {
+                    p.tool_calls += 1;
+                    p.stage = Some(format!("Running {tool}"));
+                }
+                Event::Source { .. } => p.sources += 1,
+                Event::Token { .. } => {
+                    p.tokens += 1;
+                    if p.tokens == 1 {
+                        p.stage = Some("Writing the answer".into());
+                    }
+                }
+                Event::Reset { .. } => p.tokens = 0,
+                Event::Done { .. } | Event::Error { .. } => {
+                    p.ended.get_or_insert_with(Instant::now);
+                }
+                _ => {}
+            }
+        }
         match &e {
             Event::Done { result } => {
                 *self.result.lock().unwrap() = Some((**result).clone());
@@ -140,6 +184,23 @@ impl Job {
             "events": self.events.lock().unwrap().len(),
             "events_url": format!("/api/jobs/{}/events", self.id),
         });
+        {
+            let p = self.progress.lock().unwrap();
+            let end = p.ended.unwrap_or_else(Instant::now);
+            v["stage"] = json!(p.stage);
+            v["depth"] = json!(p.depth);
+            v["tool_calls"] = json!(p.tool_calls);
+            v["sources"] = json!(p.sources);
+            // time waiting in the queue, and time running (so far, or in total once finished)
+            v["queued_ms"] = json!(p.started.unwrap_or(end).saturating_duration_since(self.created).as_millis() as u64);
+            v["running_ms"] =
+                json!(p.started.map(|s| end.saturating_duration_since(s).as_millis() as u64).unwrap_or(0));
+        }
+        if let Some(r) = self.result.lock().unwrap().as_ref() {
+            v["report_id"] = json!(r.id);
+            v["degraded"] = json!(r.degraded);
+            v["warnings"] = json!(r.warnings.len());
+        }
         if include_result && let Some(r) = self.result.lock().unwrap().as_ref() {
             v["result"] = serde_json::to_value(r).unwrap_or(Value::Null);
         }
@@ -161,15 +222,18 @@ impl Job {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub started: Instant,
     pub engine: Arc<Engine>,
     pub jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
     pub slots: Arc<Semaphore>,
+    pub auth: Arc<Auth>,
 }
 
 impl AppState {
     pub fn new(engine: Arc<Engine>) -> Self {
         let slots = Arc::new(Semaphore::new(engine.cfg.max_concurrent));
-        Self { engine, jobs: Arc::new(Mutex::new(HashMap::new())), slots }
+        let auth = Arc::new(Auth::new(engine.cfg.api_key.clone(), engine.cfg.password.clone()));
+        Self { started: Instant::now(), engine, jobs: Arc::new(Mutex::new(HashMap::new())), slots, auth }
     }
 
     /// Start a research job in the background. With an idempotency `key`, a request that repeats
@@ -224,6 +288,7 @@ impl AppState {
                     *s = JobStatus::Running;
                 }
             }
+            j.mark_running();
             j.tick.send_modify(|_| {});
             let res = st.engine.run(req, ev).await;
             drop(permit);
@@ -365,7 +430,10 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
         "max_concurrent": st.engine.cfg.max_concurrent,
         "num_ctx": st.engine.cfg.num_ctx,
         "agent_mode": format!("{:?}", st.engine.cfg.agent_mode).to_lowercase(),
-        "auth_required": st.engine.cfg.api_key.is_some(),
+        "auth_required": st.auth.required(),
+        "uptime_secs": st.started.elapsed().as_secs(),
+        "num_thread": st.engine.cfg.num_thread,
+        "fact_check": st.engine.cfg.fact_check,
     }))
 }
 
@@ -413,7 +481,7 @@ pub fn manifest_json(st: &AppState) -> Value {
             "health": { "method": "GET", "path": "/api/health" },
             "tools": { "method": "GET", "path": "/api/tools" }
         },
-        "auth": if st.engine.cfg.api_key.is_some() { "Authorization: Bearer <key> or X-API-Key header" } else { "none" },
+        "auth": if st.auth.required() { "Authorization: Bearer <key> or X-API-Key header (or a signed-in session)" } else { "none" },
         "docs": "/docs/API.md in the repository"
     })
 }
@@ -863,25 +931,155 @@ struct KeyQ {
     api_key: Option<String>,
 }
 
-async fn auth(State(st): State<AppState>, Query(q): Query<KeyQ>, req: Request, next: Next) -> Response {
-    let Some(expected) = st.engine.cfg.api_key.as_deref() else { return next.run(req).await };
-    let path = req.uri().path();
-    if !path.starts_with("/api/") || path == "/api/health" || path == "/api/manifest" {
-        return next.run(req).await;
-    }
+/// Paths anyone may load: the sign-in page and the assets it (and the app shell) needs, the
+/// agent card, and the health check (which answers with less detail when not signed in).
+fn public_path(path: &str) -> bool {
+    matches!(path, "/login" | "/logout" | "/style.css" | "/favicon.svg" | "/app.js" | "/api/manifest" | "/api/health")
+        || path.starts_with("/vendor/")
+}
+
+/// Is this request signed in (session cookie) or carrying the API key?
+fn authorized(st: &AppState, req: &Request, query_key: Option<&str>) -> bool {
     let h = req.headers();
     let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let xkey = h.get("x-api-key").and_then(|v| v.to_str().ok());
-    let given = bearer.or(xkey).or(q.api_key.as_deref());
-    if given.is_some_and(|g| constant_time_eq(g.as_bytes(), expected.as_bytes())) {
-        next.run(req).await
-    } else {
-        ApiError(StatusCode::UNAUTHORIZED, "missing or invalid API key".into()).into_response()
+    if bearer.or(xkey).or(query_key).is_some_and(|k| st.auth.check_key(k)) {
+        return true;
     }
+    h.get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(Auth::session_from)
+        .any(|t| st.auth.valid_session(t))
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+async fn auth(State(st): State<AppState>, Query(q): Query<KeyQ>, req: Request, next: Next) -> Response {
+    if !st.auth.required() {
+        return next.run(req).await;
+    }
+    let path = req.uri().path().to_string();
+    let ok = authorized(&st, &req, q.api_key.as_deref());
+    if ok {
+        return next.run(req).await;
+    }
+    if path == "/api/health" {
+        // enough for a load balancer or supervisor to see it's up, nothing more
+        return Json(json!({ "status": "ok", "version": VERSION, "auth_required": true })).into_response();
+    }
+    if public_path(&path) {
+        return next.run(req).await;
+    }
+    if path.starts_with("/api/") {
+        return ApiError(StatusCode::UNAUTHORIZED, "missing or invalid API key (or sign in)".into()).into_response();
+    }
+    let next_url = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let enc: String = url::form_urlencoded::byte_serialize(next_url.as_bytes()).collect();
+    (StatusCode::SEE_OTHER, [(header::LOCATION, format!("/login?next={enc}"))]).into_response()
+}
+
+fn client_of(req_headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
+    // behind a reverse proxy, the client is in X-Forwarded-For (first entry); otherwise the peer address
+    req_headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| peer.map(|p| p.ip().to_string()))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn session_cookie(value: &str, max_age: u64, secure: bool) -> String {
+    format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        crate::auth::COOKIE,
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+fn is_https(headers: &HeaderMap) -> bool {
+    headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).is_some_and(|p| p.eq_ignore_ascii_case("https"))
+}
+
+async fn login_page(State(st): State<AppState>) -> Response {
+    if !st.auth.required() {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    }
+    Html(include_str!("../static/login.html")).into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    password: String,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+async fn login(State(st): State<AppState>, req: Request) -> Response {
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+    let headers = req.headers().clone();
+    let client = client_of(&headers, peer);
+    let wants_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| c.starts_with("application/json"));
+    let body = match axum::body::to_bytes(req.into_body(), 16 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return bad("request too large").into_response(),
+    };
+    let form: Option<LoginForm> =
+        if wants_json { serde_json::from_slice(&body).ok() } else { serde_urlencoded_form(&body) };
+    let Some(form) = form else { return bad("send `password`").into_response() };
+    // only same-site paths: never redirect to another site
+    let next = form.next.filter(|n| n.starts_with('/') && !n.starts_with("//")).unwrap_or_else(|| "/".into());
+    if !st.auth.required() {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, next)]).into_response();
+    }
+    if let Some(wait) = st.auth.locked_out(&client) {
+        tracing::warn!("login refused for {client}: too many wrong passwords");
+        if wants_json {
+            return ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("too many wrong passwords; try again in {} minutes", wait.as_secs().div_ceil(60)),
+            )
+            .into_response();
+        }
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/login?error=locked".to_string())]).into_response();
+    }
+    if !st.auth.check_password(&form.password) {
+        st.auth.record_failure(&client);
+        tracing::warn!("wrong password from {client}");
+        if wants_json {
+            return ApiError(StatusCode::UNAUTHORIZED, "wrong password".into()).into_response();
+        }
+        let enc: String = url::form_urlencoded::byte_serialize(next.as_bytes()).collect();
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, format!("/login?error=1&next={enc}"))]).into_response();
+    }
+    st.auth.clear_failures(&client);
+    let cookie = session_cookie(&st.auth.issue(), crate::auth::SESSION_DAYS * 86_400, is_https(&headers));
+    if wants_json {
+        return ([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response();
+    }
+    (StatusCode::SEE_OTHER, [(header::SET_COOKIE, cookie), (header::LOCATION, next)]).into_response()
+}
+
+/// `password=…&next=…` (browsers' form encoding).
+fn serde_urlencoded_form(body: &[u8]) -> Option<LoginForm> {
+    let mut password = None;
+    let mut next = None;
+    for (k, v) in url::form_urlencoded::parse(body) {
+        match k.as_ref() {
+            "password" => password = Some(v.into_owned()),
+            "next" => next = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    Some(LoginForm { password: password?, next })
+}
+
+async fn logout(headers: HeaderMap) -> Response {
+    let cookie = session_cookie("", 0, is_https(&headers));
+    (StatusCode::SEE_OTHER, [(header::SET_COOKIE, cookie), (header::LOCATION, "/login".to_string())]).into_response()
 }
 
 // ------------------------------------------------------------------ router
@@ -898,6 +1096,8 @@ pub fn router(st: AppState) -> Router {
     };
     Router::new()
         .route("/", get(index))
+        .route("/login", get(login_page).post(login))
+        .route("/logout", get(logout).post(logout))
         .route("/app.js", get(|| async { asset(include_str!("../static/app.js"), "text/javascript; charset=utf-8") }))
         .route("/style.css", get(|| async { asset(include_str!("../static/style.css"), "text/css; charset=utf-8") }))
         .route("/favicon.svg", get(|| async { asset(include_str!("../static/favicon.svg"), "image/svg+xml") }))
@@ -957,14 +1157,17 @@ pub async fn serve(engine: Arc<Engine>) -> anyhow::Result<()> {
         cfg.ollama_host
     );
     let loopback = matches!(cfg.host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]");
-    if !loopback && cfg.api_key.is_none() {
+    if !loopback && cfg.api_key.is_none() && cfg.password.is_none() {
         tracing::warn!(
             "no COOKIE_API_KEY is set and cookie-web is reachable from the network: anyone who can reach port {} \
-             can use it. Set COOKIE_API_KEY (or COOKIE_HOST=127.0.0.1 to keep it local).",
+             can use it. Set COOKIE_API_KEY and/or COOKIE_PASSWORD (or COOKIE_HOST=127.0.0.1 to keep it local).",
             cfg.port
         );
     }
-    axum::serve(listener, router(st)).with_graceful_shutdown(shutdown_signal()).await?;
+    // connect info: the client address, for rate-limiting wrong passwords
+    axum::serve(listener, router(st).into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 

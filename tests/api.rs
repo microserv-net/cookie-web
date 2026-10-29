@@ -259,3 +259,124 @@ async fn health_reports_search_backend_state() {
     assert!(v["search_health"].is_array());
     assert!(v["jobs_queued"].is_number());
 }
+
+// ------------------------------------------------------------ website login
+
+fn locked_app(password: Option<&str>) -> axum::Router {
+    let mut cfg = Config::for_tests(common::tmp_dir("login"));
+    cfg.api_key = Some("k3y".into());
+    cfg.password = password.map(String::from);
+    app_with(cfg)
+}
+
+fn form(password: &str, next: &str) -> Request<Body> {
+    Request::post("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!("password={password}&next={next}")))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn website_requires_sign_in() {
+    let a = locked_app(Some("open sesame"));
+    // the app redirects to the sign-in page; its assets and the sign-in page load
+    let r = a.clone().oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()[header::LOCATION], "/login?next=%2F");
+    for path in ["/login", "/style.css", "/app.js", "/vendor/marked.min.js"] {
+        let r = a.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{path}");
+    }
+    // health says little without signing in
+    let r = a.clone().oneshot(Request::get("/api/health").body(Body::empty()).unwrap()).await.unwrap();
+    let v: Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["auth_required"], true);
+    assert!(v.get("model").is_none() && v.get("search_backends").is_none(), "{v}");
+
+    // wrong password → back to the form
+    let r = a.clone().oneshot(form("nope", "%2Fapi%2Freports")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(r.headers()[header::LOCATION].to_str().unwrap().starts_with("/login?error=1"));
+    assert!(r.headers().get(header::SET_COOKIE).is_none());
+
+    // right password → session cookie, back to where we were going
+    let r = a.clone().oneshot(form("open%20sesame", "%2Fapi%2Freports")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()[header::LOCATION], "/api/reports");
+    let cookie = r.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+    assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"), "{cookie}");
+    let session = cookie.split(';').next().unwrap().to_string();
+
+    // the cookie opens both the website and the API
+    let mut req = Request::get("/").body(Body::empty()).unwrap();
+    req.headers_mut().insert(header::COOKIE, session.parse().unwrap());
+    assert_eq!(a.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let mut req = post("/api/research", json!({ "query": "VisionQuest" }));
+    req.headers_mut().insert(header::COOKIE, session.parse().unwrap());
+    assert_eq!(a.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let mut req = Request::get("/api/health").body(Body::empty()).unwrap();
+    req.headers_mut().insert(header::COOKIE, session.parse().unwrap());
+    let v: Value = serde_json::from_str(&body_string(a.clone().oneshot(req).await.unwrap()).await).unwrap();
+    assert!(v["model"].is_object(), "full health when signed in");
+
+    // a forged cookie doesn't
+    let mut req = Request::get("/api/reports").body(Body::empty()).unwrap();
+    req.headers_mut().insert(header::COOKIE, "cw_session=v1.9999999999.forged".parse().unwrap());
+    assert_eq!(a.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // the API key still works for programs; and so does the password
+    let mut req = Request::get("/api/reports").body(Body::empty()).unwrap();
+    req.headers_mut().insert(header::AUTHORIZATION, "Bearer k3y".parse().unwrap());
+    assert_eq!(a.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // sign out clears the cookie
+    let r = a.oneshot(Request::post("/logout").body(Body::empty()).unwrap()).await.unwrap();
+    assert!(r.headers()[header::SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
+}
+
+#[tokio::test]
+async fn the_api_key_is_the_password_when_none_is_set() {
+    let a = locked_app(None);
+    let r = a.clone().oneshot(form("k3y", "%2F")).await.unwrap();
+    assert!(r.headers().contains_key(header::SET_COOKIE));
+}
+
+#[tokio::test]
+async fn wrong_passwords_are_rate_limited_and_redirects_stay_on_site() {
+    let a = locked_app(Some("pw"));
+    for _ in 0..5 {
+        a.clone().oneshot(form("nope", "%2F")).await.unwrap();
+    }
+    let r = a.clone().oneshot(form("pw", "%2F")).await.unwrap();
+    assert_eq!(r.headers()[header::LOCATION], "/login?error=locked", "locked even with the right password");
+    assert!(r.headers().get(header::SET_COOKIE).is_none());
+
+    let b = locked_app(Some("pw"));
+    let r = b.oneshot(form("pw", "https%3A%2F%2Fevil.example")).await.unwrap();
+    assert_eq!(r.headers()[header::LOCATION], "/", "no open redirect");
+}
+
+#[tokio::test]
+async fn no_login_page_without_a_password() {
+    let r = app().oneshot(Request::get("/login").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    let r = app().oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn jobs_report_live_progress() {
+    let (a, _) = slow_app(400, 1);
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": "VisionQuest" }))).await.unwrap();
+    let id = serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string();
+    let running = wait_status(&a, &id, "running").await;
+    assert!(running["stage"].is_string(), "{running}");
+    let done = wait_status(&a, &id, "done").await;
+    assert_eq!(done["depth"], "quick");
+    assert!(done["running_ms"].as_u64().unwrap() >= 400, "{done}");
+    assert!(done["report_id"].as_str().unwrap().contains("visionquest"));
+    assert!(done["sources"].as_u64().unwrap() > 0 && done["tool_calls"].as_u64().unwrap() > 0);
+    let v = get_json(&a, "/api/jobs").await;
+    assert_eq!(v["jobs"][0]["id"], id.as_str());
+    assert!(get_json(&a, "/api/health").await["uptime_secs"].is_number());
+}

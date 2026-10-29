@@ -15,6 +15,7 @@ FAST_MODEL="${COOKIE_FAST_MODEL:-}"
 PORT=""
 HOST=""
 API_KEY=""
+PASSWORD=""
 NO_KEY=0
 BINARY=""
 OPEN_FIREWALL=0
@@ -30,6 +31,7 @@ Usage: install-cookie-web.sh [options]
   --port N            port to serve on (default 8765)
   --local             listen on 127.0.0.1 only, without an API key
   --api-key KEY       use this API key (default: keep the existing one, or generate one)
+  --password PW       website password (default: the API key signs you in too)
   --no-key            no API key (anyone on the network can use it — only on trusted networks)
   --binary PATH       install this prebuilt binary instead of compiling (compiling on a small box is slow)
   --ollama URL        where Ollama runs (default http://127.0.0.1:11434)
@@ -46,6 +48,7 @@ while [ $# -gt 0 ]; do
 	--port) PORT="${2:?}"; shift 2 ;;
 	--local) HOST="127.0.0.1"; NO_KEY=1; shift ;;
 	--api-key) API_KEY="${2:?}"; shift 2 ;;
+	--password) PASSWORD="${2:?}"; shift 2 ;;
 	--no-key) NO_KEY=1; shift ;;
 	--binary) BINARY="${2:?}"; shift 2 ;;
 	--ollama) OLLAMA_URL="${2:?}"; shift 2 ;;
@@ -80,9 +83,11 @@ DATA=/var/lib/cookie-web
 
 # Set KEY=VALUE in the env file (replacing an existing, possibly commented-out, line).
 set_env() {
-	local key="$1" value="$2"
+	local key="$1" value="$2" esc
+	# escape what sed treats specially in a replacement (passwords may contain anything)
+	esc="$(printf '%s' "$value" | sed -e 's/[\\|&]/\\&/g')"
 	if $SUDO grep -qE "^#? *${key}=" "$ENV_FILE"; then
-		$SUDO sed -i -E "s|^#? *${key}=.*|${key}=${value}|" "$ENV_FILE"
+		$SUDO sed -i -E "s|^#? *${key}=.*|${key}=${esc}|" "$ENV_FILE"
 	else
 		echo "${key}=${value}" | $SUDO tee -a "$ENV_FILE" >/dev/null
 	fi
@@ -165,6 +170,10 @@ else
 		ok "generated an API key"
 	fi
 fi
+if [ -n "$PASSWORD" ]; then
+	set_env COOKIE_PASSWORD "$PASSWORD"
+	ok "website password set"
+fi
 $SUDO chown root:cookie "$ENV_FILE"
 $SUDO chmod 640 "$ENV_FILE"
 PORT="$(get_env COOKIE_PORT)"
@@ -233,7 +242,12 @@ else
 	echo "             --open-firewall does it for ufw)"
 fi
 if [ -n "$API_KEY" ]; then
-	echo "  API key:  $API_KEY   (GUI: ⚙ Settings → API key · API: Authorization: Bearer <key>)"
+	if [ -n "$(get_env COOKIE_PASSWORD)" ]; then
+		echo "  Website:  sign in with the password you set (COOKIE_PASSWORD)"
+	else
+		echo "  Website:  sign in with the API key below as the password"
+	fi
+	echo "  API key:  $API_KEY   (programs: Authorization: Bearer <key>)"
 	echo "            stored in $ENV_FILE"
 fi
 echo "  Check:    sudo bash -c 'set -a; . $ENV_FILE; cookie-web doctor'"
