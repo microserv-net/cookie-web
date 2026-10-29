@@ -1,0 +1,24 @@
+[Unit]
+Description=cookie-watch — always-on status for cookie-web
+Documentation=https://github.com/microserv-net/cookie-web/blob/main/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+# Deliberately not bound to cookie-web.service: it must keep running (and answering) when
+# cookie-web is stopped, crashed or stuck.
+
+[Service]
+# same user as cookie-web, so it can look at cookie-web's process in /proc
+User=cookie
+EnvironmentFile=/etc/cookie-web.env
+ExecStart=/usr/local/bin/cookie-watch
+Restart=always
+RestartSec=2
+MemoryMax=64M
+CPUWeight=20
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

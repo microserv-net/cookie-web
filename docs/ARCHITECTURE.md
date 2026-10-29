@@ -23,6 +23,9 @@ judgement calls.
 |------|------|
 | `src/main.rs` | CLI: `serve`, `ask` (also `--follow`), `source`, `doctor`, `tool`, `tools` |
 | `src/server.rs` | axum HTTP API, jobs, SSE, auth, embedded GUI |
+| `src/queue.rs` | the job queue: N slots, first come first served, resumed jobs at the front |
+| `src/control.rs` | pause/resume of a running job: checkpoints and interruptible model calls |
+| `src/watch.rs` · `src/bin/cookie-watch.rs` | the watchdog service; cookie-web's heartbeat; systemd notify/watchdog |
 | `src/engine.rs` | orchestrates a request; `Run` context; the writer prompt |
 | `src/depth.rs` | triage: depth levels, intents, budgets (`Profile`) |
 | `src/agent.rs` | fenced tool-calling loop for quick/standard |
@@ -84,8 +87,9 @@ request ─▶ triage (heuristics; model only if unsure)
    at the end.
 7. **Context fitting** — before each round, older tool results are shortened so the conversation stays inside
    `COOKIE_NUM_CTX` (Ollama would otherwise silently drop the start of the prompt — the instructions).
-8. **Pipeline mode** (`COOKIE_AGENT_MODE=pipeline`) skips step 4 entirely: code searches and reads, the model only
-   triages and writes. For slow CPUs or very small models.
+8. **Pipeline mode** (`COOKIE_AGENT_MODE=pipeline`, **the default**) skips step 4 entirely: code searches and reads,
+   the fast model triages and rephrases, and the main model is called once — to write. `COOKIE_AGENT_MODE=agent`
+   lets the main model run extra tool rounds when it wants more (more adaptive, slower on a CPU).
 9. **No native tool calling?** — models without Ollama `tools` support use a JSON protocol
    (`{"tool": "...", "args": {...}}` with Ollama structured output). If native calling errors at runtime
    (e.g. a malformed tool call) at any step, the loop switches to the JSON protocol automatically.
@@ -217,7 +221,13 @@ silent failure. Each layer has its own fallback:
 | the client disconnects | the job keeps running; streams resume with `?from=` / `Last-Event-ID` |
 | the client retries a POST | `Idempotency-Key` reattaches it to the same job |
 | the user changes their mind | `DELETE /api/jobs/{id}` (the GUI's *Stop*) frees the slot |
-| SIGTERM (systemd, Docker) | graceful shutdown; open streams get 10 s |
+| something more urgent comes in | `POST /api/jobs/{id}/pause`: the model call is dropped (CPU free at once), the slot goes to the next job; `resume` continues at the front of the line, paused time not counted |
+| too many requests pile up | the queue holds `COOKIE_MAX_QUEUE`; beyond that `503` + `Retry-After` instead of an endless wait |
+| a slot leaks (crash, cancel mid-handover) | slots are released on drop and handed straight to the next live waiter; cancelled waiters are skipped |
+| SIGTERM (systemd, Docker) | graceful shutdown; open streams get 10 s; the watchdog is told it's a clean stop |
+| cookie-web crashes | systemd restarts it (`Restart=always`); the watchdog shows `offline` with the reason meanwhile |
+| cookie-web hangs | systemd's watchdog (`WatchdogSec=60`) restarts it — it's pinged only while the HTTP server answers; cookie-watch shows `unresponsive` |
+| cookie-web is down and someone opens the site | nginx sends them to the watchdog's status page (API calls get a JSON 503), and back once it's up |
 
 Everything that went wrong along the way is listed in `result.warnings` (and streamed as `warning` events), so a
 supervisor can decide whether to trust, retry or escalate.
@@ -232,7 +242,11 @@ supervisor can decide whether to trust, retry or escalate.
 - **Limits** — page bodies capped (`COOKIE_MAX_PAGE_BYTES`), fetch timeouts, per-depth budgets derived from the
   context window (`Profile::fit_to_context`), evidence shrunk to fit.
 - **Caching** — pages (30 min) and non-empty searches (15 min) are cached in memory.
-- **Concurrency** — `COOKIE_MAX_CONCURRENT` jobs at a time; the rest queue (and say so in a `status` event).
+- **Concurrency** — `COOKIE_MAX_CONCURRENT` jobs at a time; the rest queue first come first served (with their
+  place in line), up to `COOKIE_MAX_QUEUE`.
+- **Network exposure** — in the standard deployment only nginx is reachable (ufw: SSH, 80, 443); cookie-web,
+  the watchdog and Ollama listen on 127.0.0.1. Forwarded client addresses are trusted only from 127.0.0.1, and
+  the watchdog accepts heartbeats only from the machine itself.
 
 ## Extending
 

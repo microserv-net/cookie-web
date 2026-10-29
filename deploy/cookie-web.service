@@ -1,9 +1,15 @@
 [Unit]
 Description=cookie-web research agent
-After=network-online.target ollama.service
-Wants=network-online.target ollama.service
+Documentation=https://github.com/microserv-net/cookie-web/blob/main/docs/DEPLOY.md
+After=network-online.target ollama.service cookie-watch.service
+Wants=network-online.target ollama.service cookie-watch.service
 
 [Service]
+# Type=notify: systemd knows when it is actually serving, and restarts it if it stops answering
+# (it pings the watchdog only while its own HTTP server responds).
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 User=cookie
 EnvironmentFile=/etc/cookie-web.env
 WorkingDirectory=/var/lib/cookie-web

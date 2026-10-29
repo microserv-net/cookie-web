@@ -3,10 +3,12 @@
 # Run from a checkout of the repository, after scripts/install-ollama.sh:
 #
 #   ./scripts/install-cookie-web.sh                        # build here, serve on 0.0.0.0:8765 with an API key
+#   ./scripts/install-cookie-web.sh --behind-proxy         # 127.0.0.1 + API key, for nginx (setup-nginx.sh)
 #   ./scripts/install-cookie-web.sh --local                # only reachable from this machine, no key
 #   ./scripts/install-cookie-web.sh --binary ./cookie-web  # use a binary built on another machine
 #
-# Safe to run again (upgrades the binary, keeps your settings and API key).
+# Also installs the watchdog, cookie-watch (a separate service that always knows whether cookie-web
+# is up). Safe to run again (upgrades the binaries, keeps your settings and API key).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,6 +23,9 @@ BINARY=""
 OPEN_FIREWALL=0
 OLLAMA_URL=""
 THREADS=""
+WATCHDOG=1
+WATCH_PORT=""
+WATCH_BINARY=""
 
 usage() {
 	cat <<'EOF'
@@ -29,11 +34,16 @@ Usage: install-cookie-web.sh [options]
   --model NAME        Ollama model cookie-web uses (default: qwen3:4b-instruct)
   --fast-model NAME   small model for the quick structured jobs (default qwen3:1.7b; "none" = main model only)
   --port N            port to serve on (default 8765)
+  --behind-proxy      listen on 127.0.0.1 only (nginx in front), keep the API key / password
   --local             listen on 127.0.0.1 only, without an API key
   --api-key KEY       use this API key (default: keep the existing one, or generate one)
   --password PW       website password (default: the API key signs you in too)
   --no-key            no API key (anyone on the network can use it — only on trusted networks)
-  --binary PATH       install this prebuilt binary instead of compiling (compiling on a small box is slow)
+  --binary PATH       install this prebuilt binary instead of compiling (compiling on a small box is slow);
+                      cookie-watch is taken from the same folder
+  --watch-binary PATH the prebuilt cookie-watch binary, if it's somewhere else
+  --watch-port N      the watchdog's port (default 8790, on 127.0.0.1)
+  --no-watchdog       don't install the watchdog service
   --ollama URL        where Ollama runs (default http://127.0.0.1:11434)
   --threads N         CPU threads the model may use (default: all cores; e.g. cores-1 keeps one free)
   --open-firewall     allow the port through ufw if ufw is active
@@ -47,6 +57,10 @@ while [ $# -gt 0 ]; do
 	--fast-model) FAST_MODEL="${2:?}"; shift 2 ;;
 	--port) PORT="${2:?}"; shift 2 ;;
 	--local) HOST="127.0.0.1"; NO_KEY=1; shift ;;
+	--behind-proxy) HOST="127.0.0.1"; shift ;;
+	--watch-binary) WATCH_BINARY="${2:?}"; shift 2 ;;
+	--watch-port) WATCH_PORT="${2:?}"; shift 2 ;;
+	--no-watchdog) WATCHDOG=0; shift ;;
 	--api-key) API_KEY="${2:?}"; shift 2 ;;
 	--password) PASSWORD="${2:?}"; shift 2 ;;
 	--no-key) NO_KEY=1; shift ;;
@@ -103,7 +117,7 @@ if [ -n "$BINARY" ]; then
 else
 	[ -f "$REPO/Cargo.toml" ] || die "run this from a checkout of the cookie-web repository (or pass --binary)"
 	NEED=()
-	for pkg in build-essential pkg-config curl ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 || NEED+=("$pkg"); done
+	for pkg in build-essential pkg-config libssl-dev curl ca-certificates; do dpkg -s "$pkg" >/dev/null 2>&1 || NEED+=("$pkg"); done
 	if [ ${#NEED[@]} -gt 0 ]; then
 		$SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq
 		$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${NEED[@]}" >/dev/null
@@ -126,6 +140,16 @@ else
 fi
 $SUDO install -m 755 "$BINARY" /usr/local/bin/cookie-web
 ok "installed /usr/local/bin/cookie-web"
+if [ "$WATCHDOG" -eq 1 ]; then
+	WATCH_BINARY="${WATCH_BINARY:-$(dirname "$BINARY")/cookie-watch}"
+	if [ -x "$WATCH_BINARY" ]; then
+		$SUDO install -m 755 "$WATCH_BINARY" /usr/local/bin/cookie-watch
+		ok "installed /usr/local/bin/cookie-watch (the watchdog)"
+	else
+		warn "no cookie-watch binary next to $BINARY — skipping the watchdog (pass --watch-binary)"
+		WATCHDOG=0
+	fi
+fi
 
 # --------------------------------------------------------------- 2. config
 step "Configuring"
@@ -154,6 +178,15 @@ fi
 [ -n "$HOST" ] && set_env COOKIE_HOST "$HOST"
 [ -n "$OLLAMA_URL" ] && set_env OLLAMA_HOST "$OLLAMA_URL"
 [ -n "$THREADS" ] && set_env COOKIE_NUM_THREAD "$THREADS"
+if [ "$WATCHDOG" -eq 1 ]; then
+	[ -n "$WATCH_PORT" ] && set_env COOKIE_WATCH_PORT "$WATCH_PORT"
+	WATCH_PORT="$(get_env COOKIE_WATCH_PORT)"
+	WATCH_PORT="${WATCH_PORT:-8790}"
+	set_env COOKIE_WATCH_PORT "$WATCH_PORT"
+	set_env COOKIE_WATCH_URL "http://127.0.0.1:$WATCH_PORT"
+else
+	$SUDO sed -i -E "s|^COOKIE_WATCH_URL=.*|# COOKIE_WATCH_URL=|" "$ENV_FILE"
+fi
 [ -z "$(get_env COOKIE_MODEL)" ] && set_env COOKIE_MODEL "qwen3:4b-instruct"
 # "auto" was the old default; the lean pipeline (one main-model call per answer) is the new one
 if [ "$(get_env COOKIE_AGENT_MODE)" = "auto" ]; then
@@ -194,6 +227,15 @@ fi
 # ---------------------------------------------------------------- 3. start
 step "Starting cookie-web"
 if systemd_running; then
+	if [ "$WATCHDOG" -eq 1 ]; then
+		if [ -f "$REPO/deploy/cookie-watch.service" ]; then
+			$SUDO install -m 644 "$REPO/deploy/cookie-watch.service" /etc/systemd/system/cookie-watch.service
+		fi
+		$SUDO systemctl daemon-reload
+		$SUDO systemctl enable --quiet cookie-watch
+		$SUDO systemctl restart cookie-watch
+		ok "watchdog running (cookie-watch on 127.0.0.1:$WATCH_PORT)"
+	fi
 	if [ -f "$REPO/deploy/cookie-web.service" ]; then
 		$SUDO install -m 644 "$REPO/deploy/cookie-web.service" /etc/systemd/system/cookie-web.service
 	elif [ ! -f /etc/systemd/system/cookie-web.service ]; then
@@ -207,6 +249,7 @@ if systemd_running; then
 else
 	warn "systemd is not running here, so cookie-web won't start on boot"
 	pkill -x cookie-web 2>/dev/null || true
+	pkill -x cookie-watch 2>/dev/null || true
 	LOG=/tmp/cookie-web.log
 	(
 		set -a
@@ -215,6 +258,7 @@ else
 		set +a
 		cd "$DATA"
 		# fully detached, so nothing holds this script's output open
+		if [ "$WATCHDOG" -eq 1 ]; then nohup /usr/local/bin/cookie-watch >/tmp/cookie-watch.log 2>&1 </dev/null & fi
 		nohup /usr/local/bin/cookie-web serve >"$LOG" 2>&1 </dev/null &
 	)
 	MANAGED="a background process (log: $LOG)"
@@ -224,7 +268,9 @@ for _ in $(seq 1 60); do
 	curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
 	sleep 1
 done
-HEALTH="$(curl -fsS --max-time 10 "http://127.0.0.1:$PORT/api/health" 2>/dev/null)" ||
+AUTH=()
+[ -n "$API_KEY" ] && AUTH=(-H "Authorization: Bearer $API_KEY")
+HEALTH="$(curl -fsS --max-time 10 "${AUTH[@]}" "http://127.0.0.1:$PORT/api/health" 2>/dev/null)" ||
 	die "cookie-web did not start — check: journalctl -u cookie-web -n 50"
 case "$HEALTH" in
 *'"status":"ok"'*) ok "running under $MANAGED" ;;
@@ -236,9 +282,15 @@ if [ "$OPEN_FIREWALL" -eq 1 ] && command -v ufw >/dev/null && $SUDO ufw status |
 	ok "opened port $PORT in ufw"
 fi
 
+if [ "$WATCHDOG" -eq 1 ]; then
+	sleep 2
+	WSTATUS="$(curl -s --max-time 3 "http://127.0.0.1:$WATCH_PORT/watch/status" | sed -n 's/.*"status":"\([a-z]*\)".*/\1/p')"
+	ok "watchdog says: ${WSTATUS:-no answer yet}"
+fi
+
 step "Done"
 if [ "${HOST:-0.0.0.0}" = "127.0.0.1" ]; then
-	echo "  GUI:      http://127.0.0.1:$PORT   (this machine only — rerun without --local to open it up)"
+	echo "  GUI:      http://127.0.0.1:$PORT   (this machine only — put nginx in front: scripts/setup-nginx.sh)"
 else
 	for ip in $(hostname -I 2>/dev/null); do
 		case "$ip" in *:*) ;; *) echo "  GUI:      http://$ip:$PORT" ;; esac
@@ -256,4 +308,5 @@ if [ -n "$API_KEY" ]; then
 	echo "            stored in $ENV_FILE"
 fi
 echo "  Check:    sudo bash -c 'set -a; . $ENV_FILE; cookie-web doctor'"
-if [ -n "${LOG:-}" ]; then echo "  Logs:     $LOG"; else echo "  Logs:     journalctl -u cookie-web -f"; fi
+[ "$WATCHDOG" -eq 1 ] && echo "  Status:   http://127.0.0.1:$WATCH_PORT/watch/   (always on, even when cookie-web is down)"
+if [ -n "${LOG:-}" ]; then echo "  Logs:     $LOG"; else echo "  Logs:     journalctl -u cookie-web -f   (watchdog: journalctl -u cookie-watch)"; fi

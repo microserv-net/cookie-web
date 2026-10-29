@@ -18,7 +18,7 @@ Steps 3–4 set the floor. Measured tool-calling accuracy drops sharply below ~4
 | model | size (Ollama, Q4) | tool calling | verdict |
 |-------|------------------|--------------|---------|
 | **qwen3:4b-instruct** (2507) | **2.5 GB** | ~87 on a validated BFCL slice (frontier ≈ 99); the 4-bit build ~83 | **default** — smallest reliable tool-caller, non-thinking (no wasted tokens), Apache-2.0 |
-| qwen3:1.7b | 1.4 GB | ~56 on the same slice; rated unreliable | budget fallback, **pipeline mode only**, noticeably weaker writing |
+| qwen3:1.7b | 1.4 GB | ~56 on the same slice; rated unreliable | **the fast model** (`COOKIE_FAST_MODEL`): only the small structured jobs, never the writing |
 | qwen3:8b | 5.2 GB | better | ~2× the RAM and ~2× slower on CPU for a modest gain here |
 | qwen3.5:4b | larger (multimodal) | BFCL-v4 ~0.50 | no advantage for a text-only agent |
 | gemma4:e2b | 7.2 GB download | BFCL-v4 ~37 | heavier and weaker at tools than it sounds |
@@ -30,6 +30,23 @@ Steps 3–4 set the floor. Measured tool-calling accuracy drops sharply below ~4
 cookie-web also does the things small models are bad at **in code**: it seeds the first search, budgets
 and de-duplicates tool calls, guarantees pages actually get read, excerpts pages to the relevant passages,
 checks citations, and fits every prompt to the context window. That is why a 4B model is enough.
+
+## Two models: who does what
+
+Not every step needs the 4B model. cookie-web uses two tiers:
+
+| step | model | size of the job |
+|---|---|---|
+| triage (when heuristics can't tell), query rewriting, follow-up rewriting | fast (`qwen3:1.7b`) | a few hundred tokens in, ≤ 260 out, JSON |
+| fact-check verdicts (one short passage + one statement each) | fast | ~300 tokens in, a few out |
+| deep mode: plan, notes per page, gap check | fast | small, structured |
+| **writing the answer** | **main (`qwen3:4b-instruct`)** | **the one big call per answer** |
+
+In the default `pipeline` mode the research itself (searching, choosing and reading pages, rescuing off-topic
+results) is done by code, so a quick or standard answer makes **one call to the main model**. The 1.7B model
+processes a prompt roughly 2–2.5× faster than the 4B, so the small jobs around it cost little. If the fast model
+isn't pulled, or Ollama can't keep both loaded, everything falls back to the main model automatically
+(`/api/health` → `model.fast_active` / `fast_note` says why).
 
 ## Memory, always loaded (8K context — the default)
 
@@ -43,6 +60,20 @@ checks citations, and fits every prompt to the context window. That is why a 4B 
 | SearXNG (optional, same box) | ~0.2–0.3 GB | |
 | Linux server OS (no desktop) | ~0.3–0.5 GB | |
 | **Total** | **≈ 4.2–4.8 GB** | |
+
+Add the fast model (`qwen3:1.7b`, 4K context, q8_0 KV):
+
+| component | memory |
+|---|---|
+| weights | 1.4 GB |
+| KV cache, 4096 tokens (q8_0) | ~0.12 GB |
+| buffers | ~0.2–0.3 GB |
+| **fast model total** | **≈ 1.8 GB** |
+
+So both models together: **≈ 5.3 GB in Ollama**, ≈ 6 GB for the whole box (OS, nginx, cookie-web, watchdog
+≈ 0.5 GB more). **8 GB fits; 10 GB is comfortable** (room for `COOKIE_NUM_CTX=16384` or SearXNG on the same box).
+Ollama must keep both loaded — `OLLAMA_MAX_LOADED_MODELS=2`, which `install-ollama.sh` sets — otherwise it swaps
+models on every step and that costs far more than it saves.
 
 Why 8K context: every prompt cookie-web builds is sized to fit it (evidence budgets, page excerpts,
 compaction of the agent conversation). 16K buys more page text per answer for another ~0.6 GB
@@ -77,7 +108,10 @@ To make it faster on weak hardware without changing the model:
 ## Why the CPU sits at 100% (and when it shouldn't)
 
 Running the model on a CPU means doing billions of multiplications per token, and Ollama uses **every core** to do
-them. So while cookie-web answers, all cores at 100% is expected — on 4 vCPUs and on 8. Most of the work is
+them. So while the model is working, all cores at 100% is expected — on 4 vCPUs and on 8. What cookie-web controls is
+*how long* that lasts: fewer and smaller model calls (one main-model call per answer, the small jobs on the 1.7B
+model, `max_words` to cap the answer). Between model calls (searching, reading pages) the CPU is nearly idle, and a
+paused job frees it at once. Most of the work is
 *reading* the prompts (search results and page excerpts); a quick or standard answer sends the model roughly
 4–8k tokens across 2–6 calls, which keeps a small CPU busy for a minute or a few. More cores make it finish
 sooner; they don't make it lighter.
@@ -114,7 +148,7 @@ Set these on the Ollama service (`sudo systemctl edit ollama`, see [`deploy/olla
 [Service]
 Environment="OLLAMA_KEEP_ALIVE=-1"          # never unload the model
 Environment="OLLAMA_NUM_PARALLEL=1"         # one KV cache, not four
-Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=2"   # main + fast model, both kept loaded
 Environment="OLLAMA_FLASH_ATTENTION=1"      # required for the quantised KV cache
 Environment="OLLAMA_KV_CACHE_TYPE=q8_0"     # halves KV memory, negligible quality loss
 Environment="OLLAMA_HOST=127.0.0.1:11434"   # keep Ollama private; only cookie-web is exposed
