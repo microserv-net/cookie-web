@@ -171,6 +171,16 @@ pub struct ModelInfo {
     pub context_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The fast model for small jobs, if one is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_model: Option<String>,
+    /// It is pulled in Ollama.
+    pub fast_available: bool,
+    /// It is actually being used (false = the main model does its jobs: not pulled, or Ollama
+    /// can't keep both models loaded).
+    pub fast_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_note: Option<String>,
 }
 
 #[async_trait]

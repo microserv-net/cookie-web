@@ -27,7 +27,7 @@ usage() {
 Usage: install-cookie-web.sh [options]
 
   --model NAME        Ollama model cookie-web uses (default: qwen3:4b-instruct)
-  --fast-model NAME   optional smaller model for triage/notes
+  --fast-model NAME   small model for the quick structured jobs (default qwen3:1.7b; "none" = main model only)
   --port N            port to serve on (default 8765)
   --local             listen on 127.0.0.1 only, without an API key
   --api-key KEY       use this API key (default: keep the existing one, or generate one)

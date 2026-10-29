@@ -231,6 +231,11 @@ async fn doctor(cfg: Config) -> anyhow::Result<()> {
     println!("  {} reachable", mark(info.reachable));
     println!("  {} model {} pulled", mark(info.available), info.model);
     println!("  {} native tool calling", mark(info.supports_tools));
+    match &info.fast_model {
+        Some(f) if info.fast_active => println!("  ✓ fast model {f} for small jobs (context {})", cfg.fast_num_ctx),
+        Some(f) => println!("  ✗ fast model {f} not used: {}", info.fast_note.as_deref().unwrap_or("not available")),
+        None => println!("  · no fast model: the main model does every job (set COOKIE_FAST_MODEL)"),
+    }
     println!("  context {} tokens · keep_alive {} · agent mode {:?}", cfg.num_ctx, cfg.keep_alive, cfg.agent_mode);
     match (info.loaded, info.memory_bytes) {
         (true, Some(b)) => println!("  ✓ loaded — {:.2} GB in memory (weights + KV cache)", b as f64 / 1e9),

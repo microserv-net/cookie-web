@@ -59,7 +59,8 @@ Useful options: `--model NAME`, `--fast-model NAME`, `--local` (this machine onl
 
 ```bash
 # 1. A model (any Ollama model works; tool-calling ones work best)
-ollama pull qwen3:4b-instruct   # 2.5 GB — see docs/HARDWARE.md
+ollama pull qwen3:4b-instruct   # 2.5 GB, writes the answers — see docs/HARDWARE.md
+ollama pull qwen3:1.7b          # 1.4 GB, the fast model for small jobs (optional; set OLLAMA_MAX_LOADED_MODELS=2)
 
 # 2. Build & run
 cargo run --release             # serves on port 8765 on all interfaces (0.0.0.0)
@@ -87,6 +88,7 @@ cargo run --release -- source <report-id> 2 --text   # full text of source [2]
 ```bash
 docker compose up -d
 docker compose exec ollama ollama pull qwen3:4b-instruct
+docker compose exec ollama ollama pull qwen3:1.7b
 ```
 
 ## Configuration
@@ -98,7 +100,8 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 | `COOKIE_HOST` / `COOKIE_PORT` | `0.0.0.0` / `8765` | listen address (`0.0.0.0` = reachable from the network; `127.0.0.1` = this machine only). On a VPS, also set `COOKIE_API_KEY` |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | |
 | `COOKIE_MODEL` | `qwen3:4b-instruct` | main model (agent + writer) |
-| `COOKIE_FAST_MODEL` | = `COOKIE_MODEL` | optional smaller model for triage, planning, notes |
+| `COOKIE_FAST_MODEL` | `qwen3:1.7b` | small model for the small jobs (triage, query rewriting, fact-check verdicts, notes); `none` = the main model does everything. Used only if pulled and Ollama can keep both loaded |
+| `COOKIE_FAST_NUM_CTX` | `4096` | the fast model's context window (its jobs are small) |
 | `COOKIE_THINK` | `false` | let thinking models think while writing (slower, sometimes better) |
 | `COOKIE_NUM_CTX` | `8192` | context window; all prompts are sized to fit it |
 | `COOKIE_NUM_THREAD` | — | CPU threads the model may use (default: all cores; see [why the CPU sits at 100%](docs/HARDWARE.md#why-the-cpu-sits-at-100-and-when-it-shouldnt)) |

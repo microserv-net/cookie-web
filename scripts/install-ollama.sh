@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install Ollama on Ubuntu/Debian, tune it for a dedicated cookie-web box, and pull the models.
 #
-#   ./scripts/install-ollama.sh                       # Ollama + qwen3:4b-instruct
+#   ./scripts/install-ollama.sh                       # Ollama + qwen3:4b-instruct + qwen3:1.7b (fast model)
 #   ./scripts/install-ollama.sh --model qwen3:8b      # a different main model
 #   ./scripts/install-ollama.sh --fast-model qwen3:1.7b
 #   curl -fsSL https://raw.githubusercontent.com/microserv-net/cookie-web/main/scripts/install-ollama.sh | bash
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 MODEL="${COOKIE_MODEL:-qwen3:4b-instruct}"
-FAST_MODEL="${COOKIE_FAST_MODEL:-}"
+FAST_MODEL="${COOKIE_FAST_MODEL:-qwen3:1.7b}"
 LISTEN="127.0.0.1:11434"
 KV_CACHE="q8_0"
 UPGRADE=0
@@ -24,7 +24,8 @@ usage() {
 Usage: install-ollama.sh [options]
 
   --model NAME        main model to pull (default: $COOKIE_MODEL or qwen3:4b-instruct)
-  --fast-model NAME   optional second, smaller model for triage/notes (default: none)
+  --fast-model NAME   small model for the quick structured jobs (default: qwen3:1.7b, ~1.4 GB)
+  --no-fast-model     only the main model (it then does every job)
   --listen ADDR       where Ollama listens (default 127.0.0.1:11434 — private to this box)
   --kv-cache TYPE     q8_0 (default, half the memory) or f16
   --upgrade           reinstall/upgrade Ollama even if it is already installed
@@ -39,6 +40,7 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--model) MODEL="${2:?--model needs a value}"; shift 2 ;;
 	--fast-model) FAST_MODEL="${2:?--fast-model needs a value}"; shift 2 ;;
+	--no-fast-model) FAST_MODEL=""; shift ;;
 	--listen) LISTEN="${2:?--listen needs a value}"; shift 2 ;;
 	--kv-cache) KV_CACHE="${2:?--kv-cache needs a value}"; shift 2 ;;
 	--upgrade) UPGRADE=1; shift ;;
@@ -49,6 +51,9 @@ while [ $# -gt 0 ]; do
 	*) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
 	esac
 done
+
+case "${FAST_MODEL,,}" in none | off | same | main) FAST_MODEL="" ;; esac
+[ "$FAST_MODEL" = "$MODEL" ] && FAST_MODEL=""
 
 case "$KV_CACHE" in q8_0 | q4_0 | f16) ;; *) echo "--kv-cache must be q8_0, q4_0 or f16" >&2; exit 2 ;; esac
 
@@ -118,6 +123,10 @@ if awk -v m="$MEM_GB" 'BEGIN {exit !(m < 4)}'; then
 	warn "only ${MEM_GB} GB RAM — expect swapping"
 elif awk -v m="$MEM_GB" 'BEGIN {exit !(m < 7)}'; then
 	warn "${MEM_GB} GB RAM: works with the default model, but leaves little headroom (8 GB recommended)"
+	if [ -n "$FAST_MODEL" ]; then
+		warn "the fast model needs ~1.8 GB more: skipping it (use --fast-model to force it, after adding memory)"
+		[ "$FORCE" -eq 1 ] || FAST_MODEL=""
+	fi
 else
 	ok "RAM: ${MEM_GB} GB"
 fi
@@ -176,7 +185,8 @@ OLLAMA_ENV=(
 	"OLLAMA_HOST=$LISTEN"
 	"OLLAMA_KEEP_ALIVE=-1"
 	"OLLAMA_NUM_PARALLEL=1"
-	"OLLAMA_MAX_LOADED_MODELS=1"
+	# both models stay loaded when there is a fast model: swapping them on every call would be very slow
+	"OLLAMA_MAX_LOADED_MODELS=$([ -n "$FAST_MODEL" ] && echo 2 || echo 1)"
 	"OLLAMA_FLASH_ATTENTION=1"
 	"OLLAMA_KV_CACHE_TYPE=$KV_CACHE"
 )
@@ -271,4 +281,8 @@ fi
 
 step "Done"
 echo "  Ollama:  $API   models: ${MODELS[*]}"
-echo "  Next:    ./scripts/install-cookie-web.sh   (or: COOKIE_MODEL=$MODEL cargo run --release)"
+if [ -n "$FAST_MODEL" ]; then
+	echo "  Next:    ./scripts/install-cookie-web.sh --model $MODEL --fast-model $FAST_MODEL"
+else
+	echo "  Next:    ./scripts/install-cookie-web.sh --model $MODEL --fast-model none"
+fi

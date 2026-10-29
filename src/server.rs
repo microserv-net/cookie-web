@@ -420,7 +420,7 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
         "status": if ok { "ok" } else { "degraded" },
         "version": VERSION,
         "model": info,
-        "fast_model": st.engine.cfg.fast_model(),
+        "fast_model": info.fast_model.clone(),
         "tools": st.engine.tools.names(),
         "search_backends": backends,
         "search_health": search,

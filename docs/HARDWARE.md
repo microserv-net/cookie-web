@@ -146,6 +146,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 sudo systemctl edit ollama            # paste deploy/ollama.conf
 sudo systemctl restart ollama
 ollama pull qwen3:4b-instruct
+ollama pull qwen3:1.7b                # the fast model (optional)
 
 # 2. cookie-web (build on any machine with Rust, copy the 16 MB binary over)
 cargo build --release

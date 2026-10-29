@@ -34,10 +34,36 @@ struct Fake {
     script: Arc<Vec<Reply>>,
     calls: Arc<AtomicUsize>,
     bodies: Arc<std::sync::Mutex<Vec<Value>>>,
+    /// A model name Ollama doesn't have.
+    missing: Option<&'static str>,
+    /// What /api/ps reports as loaded.
+    loaded: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+async fn ps(State(f): State<Fake>) -> Json<Value> {
+    let models: Vec<Value> = f.loaded.lock().unwrap().iter().map(|m| json!({ "name": m })).collect();
+    Json(json!({ "models": models }))
 }
 
 async fn chat(State(f): State<Fake>, Json(body): Json<Value>) -> Response {
-    f.bodies.lock().unwrap().push(body);
+    let model = body["model"].as_str().unwrap_or("").to_string();
+    f.bodies.lock().unwrap().push(body.clone());
+    if f.missing == Some(model.as_str()) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("model \"{model}\" not found, try pulling it first") })),
+        )
+            .into_response();
+    }
+    if body["messages"].as_array().is_some_and(|m| m.is_empty()) {
+        // a warm-up load: with room for one model only, the new one replaces the old
+        let mut l = f.loaded.lock().unwrap();
+        l.retain(|m| m == &model);
+        if l.is_empty() {
+            l.push(model.clone());
+        }
+        return Json(json!({ "message": { "role": "assistant", "content": "" }, "done": true })).into_response();
+    }
     let i = f.calls.fetch_add(1, Ordering::SeqCst);
     match f.script.get(i).or(f.script.last()).cloned().unwrap() {
         Reply::Status(code, err) => {
@@ -62,14 +88,36 @@ async fn fake_ollama(script: Vec<Reply>) -> (Ollama, Arc<AtomicUsize>) {
     (o, calls)
 }
 
+struct FakeOpts {
+    missing: Option<&'static str>,
+}
+
 async fn fake_ollama_with(
     script: Vec<Reply>,
     tweak: impl FnOnce(&mut Config),
 ) -> (Ollama, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Value>>>) {
+    fake_ollama_opts(script, tweak, FakeOpts { missing: None }).await
+}
+
+async fn fake_ollama_opts(
+    script: Vec<Reply>,
+    tweak: impl FnOnce(&mut Config),
+    opts: FakeOpts,
+) -> (Ollama, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Value>>>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let bodies = Arc::new(std::sync::Mutex::new(vec![]));
-    let state = Fake { script: Arc::new(script), calls: calls.clone(), bodies: bodies.clone() };
-    let app = Router::new().route("/api/chat", post(chat)).route("/api/show", post(show)).with_state(state);
+    let state = Fake {
+        script: Arc::new(script),
+        calls: calls.clone(),
+        bodies: bodies.clone(),
+        missing: opts.missing,
+        loaded: Default::default(),
+    };
+    let app = Router::new()
+        .route("/api/chat", post(chat))
+        .route("/api/show", post(show))
+        .route("/api/ps", axum::routing::get(ps))
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -91,6 +139,50 @@ fn token(t: &str) -> Value {
 fn done(reason: &str) -> Value {
     json!({ "message": { "role": "assistant", "content": "" }, "done": true, "done_reason": reason,
             "prompt_eval_count": 3000, "eval_count": 2, "total_duration": 61_000_000_000u64 })
+}
+
+fn fast_req() -> ChatRequest {
+    ChatRequest::new(vec![Message::user("hi")]).tier(cookie_web::llm::Tier::Fast)
+}
+
+fn with_fast(c: &mut Config) {
+    c.fast_model = Some("small".into());
+    c.num_ctx = 8192;
+    c.fast_num_ctx = 4096;
+}
+
+#[tokio::test]
+async fn small_jobs_go_to_the_fast_model_with_its_own_context() {
+    let (o, _, bodies) = fake_ollama_with(vec![Reply::Chat("ok")], with_fast).await;
+    o.chat(fast_req()).await.unwrap();
+    o.chat(req()).await.unwrap();
+    let b = bodies.lock().unwrap();
+    assert_eq!(b[0]["model"], "small");
+    assert_eq!(b[0]["options"]["num_ctx"], 4096);
+    assert_eq!(b[1]["model"], "test-model");
+    assert_eq!(b[1]["options"]["num_ctx"], 8192);
+}
+
+#[tokio::test]
+async fn a_missing_fast_model_hands_its_jobs_to_the_main_model() {
+    let (o, _, bodies) =
+        fake_ollama_opts(vec![Reply::Chat("ok")], with_fast, FakeOpts { missing: Some("small") }).await;
+    assert_eq!(o.chat(fast_req()).await.unwrap().content, "ok");
+    o.chat(fast_req()).await.unwrap();
+    let models: Vec<String> = bodies.lock().unwrap().iter().map(|b| b["model"].as_str().unwrap().to_string()).collect();
+    assert_eq!(models, vec!["small", "test-model", "test-model"], "tried once, then main from then on");
+    let b = bodies.lock().unwrap();
+    assert_eq!(b[1]["options"]["num_ctx"], 8192, "main model, main context: no reload");
+}
+
+#[tokio::test]
+async fn fast_model_is_dropped_when_ollama_cant_keep_both_loaded() {
+    // the fake keeps one model at a time, like OLLAMA_MAX_LOADED_MODELS=1
+    let (o, _, bodies) = fake_ollama_with(vec![Reply::Chat("ok")], with_fast).await;
+    o.warmup().await.unwrap();
+    bodies.lock().unwrap().clear();
+    o.chat(fast_req()).await.unwrap();
+    assert_eq!(bodies.lock().unwrap()[0]["model"], "test-model", "no model swapping on every call");
 }
 
 #[tokio::test]
