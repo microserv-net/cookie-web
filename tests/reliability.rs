@@ -330,3 +330,28 @@ async fn fact_check_can_be_turned_off() {
     assert!(res.unwrap().markdown.contains("Edith Marks"));
     assert!(!log.contains(&"judge".to_string()));
 }
+
+#[tokio::test]
+async fn writer_gets_one_clean_list_of_search_results() {
+    // the first search misreads the request (design tools); the rescue finds the real thing
+    let mut tools = Registry::new();
+    tools.add(Misreading);
+    tools.add(FakeFetch(None));
+    let llm = Arc::new(FakeLlm::new(true));
+    let (res, _, _) = run_with(
+        llm.clone(),
+        tools,
+        cfg("consolidate"),
+        req("what can you tell me about glorbix the purple wombat", Some("standard")),
+    )
+    .await;
+    res.unwrap();
+    let prompt = llm.write_prompt.lock().unwrap().clone();
+    let evidence = prompt.split("# Research evidence").nth(1).unwrap();
+    assert!(evidence.matches("### Search results").count() <= 1, "{evidence}");
+    assert!(!evidence.contains("### web_search:"), "raw result blocks replaced: {evidence}");
+    assert!(!evidence.contains("design1.example"), "off-topic hits left out: {evidence}");
+    // the request is restated after the evidence
+    assert!(prompt.trim_end().ends_with("from the evidence above."), "{prompt}");
+    assert!(prompt.rsplit("---").next().unwrap().contains("Request: what can you tell me about glorbix"));
+}

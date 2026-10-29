@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::{
     Tool, ToolCtx, ToolOutput,
-    extract::{focus_excerpt, without_images},
+    extract::{focus_excerpt, for_model},
     net::Web,
 };
 use crate::sources::SourceKind;
@@ -64,7 +64,7 @@ impl Tool for FetchPage {
             }
         };
         let n = ctx.add_source(&page.title, &page.url, "", SourceKind::Page, page.published.clone());
-        let body = focus_excerpt(&without_images(&page.markdown), focus, ctx.page_chars);
+        let body = focus_excerpt(&for_model(&page.markdown, ctx.keep_urls), focus, ctx.page_chars);
         let mut meta = vec![format!("URL: {}", page.url)];
         if let Some(d) = &page.published {
             meta.push(format!("Published: {d}"));

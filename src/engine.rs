@@ -280,9 +280,11 @@ impl Engine {
         let gather = Duration::from_secs_f64(profile.gather_secs as f64 * self.cfg.time_scale)
             .min(self.cfg.job_timeout.mul_f64(0.6));
 
+        let mut ctx = ToolCtx::new(events.clone(), profile.results_per_search, profile.page_chars, profile.max_fetches);
+        ctx.keep_urls = triage.intent == depth::Intent::Links;
         let run = Run {
             engine: self,
-            ctx: ToolCtx::new(events.clone(), profile.results_per_search, profile.page_chars, profile.max_fetches),
+            ctx,
             events: events.clone(),
             counters: Counters::default(),
             model: req.model.clone(),
@@ -567,8 +569,11 @@ impl Engine {
             intent = t.intent.guidance(),
         );
         let context = run.context.as_deref().map(|c| format!("{c}\n")).unwrap_or_default();
+        // The request goes first (to read the evidence with it in mind) and last (small models follow
+        // what they read most recently).
         let user = format!(
-            "Request: {query}\n{context}\n# Research evidence\n\n{evidence}\n---\nWrite the answer to the request now."
+            "Request: {query}\n{context}\n# Research evidence\n\n{evidence}\n---\nRequest: {query}\n\
+             Write the answer to this request now, from the evidence above."
         );
         let req = ChatRequest::new(vec![Message::system(system), Message::user(user)])
             .max_tokens(p.write_tokens)

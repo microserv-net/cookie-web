@@ -26,7 +26,7 @@ use crate::{
     sources::{SourceRegistry, normalize_url},
     tools::{
         ToolCtx,
-        extract::{Page, focus_excerpt, without_images},
+        extract::{Page, focus_excerpt, for_model},
     },
 };
 
@@ -235,7 +235,7 @@ pub async fn run(
         let src = parent.sources.iter().find(|s| s.n == n).expect("validated above");
         match page {
             Ok(p) => {
-                let excerpt = focus_excerpt(&without_images(&p.markdown), Some(&focus), profile.page_chars);
+                let excerpt = focus_excerpt(&for_model(&p.markdown, false), Some(&focus), profile.page_chars);
                 if !topic.is_empty() && overlap(&excerpt, &topic) * 2 >= topic.len() {
                     covered = true;
                 }

@@ -40,6 +40,8 @@ pub struct FakeLlm {
     pub answer: Mutex<String>,
     /// Fact-check prompts received (passage + statement).
     pub judged: Mutex<Vec<String>>,
+    /// The last prompt the writer received.
+    pub write_prompt: Mutex<String>,
 }
 
 impl FakeLlm {
@@ -55,6 +57,7 @@ impl FakeLlm {
             write_delay: Mutex::new(Duration::ZERO),
             answer: Mutex::new(ANSWER.to_string()),
             judged: Mutex::new(vec![]),
+            write_prompt: Mutex::new(String::new()),
         }
     }
     fn note(&self, s: &str) {
@@ -159,6 +162,7 @@ impl ChatModel for FakeLlm {
         // Like a real writer, cite the numbers the evidence actually shows: [1][2][3] in the scripted
         // answer stand for the first three numbers in the prompt.
         let prompt = req.messages.last().map(|m| m.content.clone()).unwrap_or_default();
+        *self.write_prompt.lock().unwrap() = prompt.clone();
         let mut shown: Vec<String> = vec![];
         for cap in prompt.split('[').skip(1) {
             if let Some(n) = cap.split(']').next().filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))

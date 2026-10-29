@@ -251,6 +251,7 @@ async fn doctor(cfg: Config) -> anyhow::Result<()> {
             max: 3,
             time_range: None,
             kind: cookie_web::tools::search::Kind::Web,
+            broad: false,
         };
         match b.search(&web, &q).await {
             Ok(h) if !h.is_empty() => println!("  ✓ {:<10} {} results (e.g. {})", b.name(), h.len(), h[0].url),
