@@ -107,7 +107,7 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 | `COOKIE_NUM_THREAD` | — | CPU threads the model may use (default: all cores; see [why the CPU sits at 100%](docs/HARDWARE.md#why-the-cpu-sits-at-100-and-when-it-shouldnt)) |
 | `COOKIE_KEEP_ALIVE` | `-1` | keep the model loaded forever |
 | `COOKIE_WARMUP` | `true` | load the model when the server starts |
-| `COOKIE_AGENT_MODE` | `auto` | `pipeline` = no model-driven tool rounds (faster on slow CPUs / tiny models) |
+| `COOKIE_AGENT_MODE` | `pipeline` | `pipeline`: code researches, the main model writes once (fast). `agent`: the model may also run extra tool rounds (slower) |
 | `SEARXNG_URL` | — | e.g. `http://localhost:8888` (recommended) |
 | `BRAVE_API_KEY` / `TAVILY_API_KEY` / `OLLAMA_API_KEY` | — | optional search APIs |
 | `COOKIE_SEARCH_MODE` | `fallback` | or `fusion` (query all backends, merge rankings) |

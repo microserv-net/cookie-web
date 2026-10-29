@@ -184,7 +184,7 @@ pub async fn run(
         "follow-up on the earlier report".into()
     };
     triage.decided_by = if forced.is_some() { "user".into() } else { "follow-up".into() };
-    let profile = triage.depth.profile().fit_to_context(engine.cfg.num_ctx);
+    let profile = triage.depth.profile().limit_words(req.max_words).fit_to_context(engine.cfg.num_ctx);
     let gather = Duration::from_secs_f64(profile.gather_secs as f64 * engine.cfg.time_scale)
         .min(engine.cfg.job_timeout.mul_f64(0.6));
 

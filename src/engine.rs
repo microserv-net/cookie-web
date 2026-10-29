@@ -54,6 +54,9 @@ pub struct ResearchRequest {
     /// question, never when `sources` is given), `never` or `always`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<String>,
+    /// Upper limit on the answer's length in words (shorter answers are much faster to write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_words: Option<u32>,
 }
 
 fn yes() -> bool {
@@ -62,7 +65,16 @@ fn yes() -> bool {
 
 impl ResearchRequest {
     pub fn new(query: impl Into<String>) -> Self {
-        Self { query: query.into(), depth: None, model: None, save: true, report: None, sources: None, web: None }
+        Self {
+            query: query.into(),
+            depth: None,
+            model: None,
+            save: true,
+            report: None,
+            sources: None,
+            web: None,
+            max_words: None,
+        }
     }
 }
 
@@ -275,7 +287,7 @@ impl Engine {
         }
         let clean_query = depth::split_override(&query).1;
         events.emit(Event::Triage(triage.clone()));
-        let profile: Profile = triage.depth.profile().fit_to_context(self.cfg.num_ctx);
+        let profile: Profile = triage.depth.profile().limit_words(req.max_words).fit_to_context(self.cfg.num_ctx);
         // Leave at least 40% of the hard job limit for writing.
         let gather = Duration::from_secs_f64(profile.gather_secs as f64 * self.cfg.time_scale)
             .min(self.cfg.job_timeout.mul_f64(0.6));
@@ -562,10 +574,11 @@ impl Engine {
              - Do not add a Sources/References section — it is appended automatically.\n\
              - Do not talk about \"the evidence\", \"search results\" or your tools. Just answer.\n\
              - Match the user's language.\n\n\
-             Length & format: {target}\n\
+             Length & format: {target}{limit}\n\
              Request type: {intent}",
             today = run.today,
             target = p.target,
+            limit = p.max_words.map(|n| format!(" Hard limit: at most {n} words.")).unwrap_or_default(),
             intent = t.intent.guidance(),
         );
         let context = run.context.as_deref().map(|c| format!("{c}\n")).unwrap_or_default();

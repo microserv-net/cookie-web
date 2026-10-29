@@ -155,6 +155,11 @@ fi
 [ -n "$OLLAMA_URL" ] && set_env OLLAMA_HOST "$OLLAMA_URL"
 [ -n "$THREADS" ] && set_env COOKIE_NUM_THREAD "$THREADS"
 [ -z "$(get_env COOKIE_MODEL)" ] && set_env COOKIE_MODEL "qwen3:4b-instruct"
+# "auto" was the old default; the lean pipeline (one main-model call per answer) is the new one
+if [ "$(get_env COOKIE_AGENT_MODE)" = "auto" ]; then
+	set_env COOKIE_AGENT_MODE pipeline
+	ok "switched COOKIE_AGENT_MODE from the old default (auto) to pipeline — set it to agent to keep model-driven rounds"
+fi
 set_env COOKIE_REPORTS_DIR "$DATA/reports"
 
 if [ "$NO_KEY" -eq 1 ]; then

@@ -227,6 +227,17 @@ pub fn readable(url: &str) -> bool {
 
 fn seeds(t: &Triage, p: &Profile) -> Vec<(&'static str, Value)> {
     let q = t.search_query.clone();
+    let mut calls = base_seeds(t, p, q);
+    // the other parts of a multi-part request get their own searches (not for quick answers)
+    if t.depth != Depth::Quick {
+        for extra in t.extra_queries.iter().take(2) {
+            calls.push(("web_search", json!({ "query": extra, "max_results": p.results_per_search.min(6) })));
+        }
+    }
+    calls
+}
+
+fn base_seeds(t: &Triage, p: &Profile, q: String) -> Vec<(&'static str, Value)> {
     match t.intent {
         Intent::News => {
             vec![("news_search", json!({ "query": q, "time_range": "month" })), ("web_search", json!({ "query": q }))]
@@ -375,7 +386,8 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
         // a Wikipedia summary + snippets is enough to identify a name; otherwise read one page
         (Depth::Quick, Intent::Entity | Intent::Links) if wiki_found => 0,
         (Depth::Quick, _) => 1,
-        _ => p.max_fetches.min(2),
+        // one more page when the request has several parts
+        _ => p.max_fetches.min(2 + t.extra_queries.len().min(1)),
     };
     let reads = read_top(run, t, want).await;
     if !reads.is_empty() {
@@ -553,18 +565,47 @@ async fn read_top(run: &Run<'_>, t: &Triage, n: usize) -> Vec<((String, Value), 
     }
     let (asked, searched) = topics_of(run, t);
     let topic = topic_terms(&format!("{} {}", run.query, t.search_query));
+    // One ranking per part of the request (the main query, then any extra ones); picking from them in
+    // turn makes sure every part gets a page, not just the one the search engines liked best.
+    let mut parts: Vec<Vec<String>> = vec![topic.clone()];
+    parts.extend(t.extra_queries.iter().map(|q| topic_terms(q)).filter(|p| !p.is_empty()));
     let mut candidates: Vec<String> = {
         let reg = run.ctx.sources.lock().unwrap();
-        let mut c: Vec<(usize, &crate::sources::Source)> = reg
+        let pool: Vec<&crate::sources::Source> = reg
             .all()
             .iter()
             .filter(|s| !s.read && matches!(s.kind, SourceKind::Search | SourceKind::News) && readable(&s.url))
-            .filter(|s| about(&format!("{} {} {}", s.title, s.snippet, s.url), &[&asked, &searched], 0.25))
-            .map(|s| (overlap(&format!("{} {} {}", s.title, s.snippet, s.url), &topic), s))
+            .filter(|s| {
+                let text = format!("{} {} {}", s.title, s.snippet, s.url);
+                about(&text, &[&asked, &searched], 0.25) || parts[1..].iter().any(|p| about(&text, &[p], 0.34))
+            })
             .collect();
-        // most on-topic first; search rank breaks ties (the sort is stable)
-        c.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-        c.into_iter().map(|(_, s)| s.url.clone()).take(n + 4).collect()
+        let ranked: Vec<Vec<&crate::sources::Source>> = parts
+            .iter()
+            .map(|part| {
+                let mut c: Vec<(usize, &crate::sources::Source)> = pool
+                    .iter()
+                    .map(|s| (overlap(&format!("{} {} {}", s.title, s.snippet, s.url), part), *s))
+                    .filter(|(score, _)| *score > 0)
+                    .collect();
+                // most on-topic first; search rank breaks ties (the sort is stable)
+                c.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+                c.into_iter().map(|(_, s)| s).collect()
+            })
+            .collect();
+        let mut picked: Vec<String> = vec![];
+        let longest = ranked.iter().map(Vec::len).max().unwrap_or(0);
+        for i in 0..longest {
+            for list in &ranked {
+                if let Some(s) = list.get(i)
+                    && !picked.contains(&s.url)
+                {
+                    picked.push(s.url.clone());
+                }
+            }
+        }
+        picked.truncate(n + 4);
+        picked
     };
     if candidates.is_empty() {
         return vec![];

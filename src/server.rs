@@ -369,6 +369,9 @@ fn validate(req: &ResearchRequest) -> Result<(), ApiError> {
     {
         return Err(bad("`depth` must be one of: auto, quick, standard, deep"));
     }
+    if req.max_words.is_some_and(|n| !(20..=5000).contains(&n)) {
+        return Err(bad("`max_words` must be between 20 and 5000"));
+    }
     if req.report.is_none() && (req.sources.is_some() || req.web.is_some()) {
         return Err(bad("`sources` and `web` only apply to follow-ups: set `report` to the report id"));
     }
@@ -455,7 +458,8 @@ pub fn manifest_json(st: &AppState) -> Value {
             "save": "bool (default true) — persist the Markdown report",
             "report": "string (optional) — follow up on this report id: answered from its sources, same citation numbers; @3 in the query = its source [3]",
             "sources": "[int] (optional, with report) — only these sources of the report",
-            "web": "auto | never | always (with report; default auto = search only if the sources don't cover it)"
+            "web": "auto | never | always (with report; default auto = search only if the sources don't cover it)",
+            "max_words": "int 20-5000 (optional) — upper limit on the answer's length; shorter is faster"
         },
         "output": "ResearchResult { id, query, depth, intent, triage, markdown, sources[], stats, model, created_at, report_path, warnings[], degraded }",
         "reliability": {
@@ -675,6 +679,8 @@ struct AskBody {
     model: Option<String>,
     #[serde(default = "yes")]
     save: bool,
+    #[serde(default)]
+    max_words: Option<u32>,
 }
 
 fn yes() -> bool {
@@ -697,6 +703,7 @@ async fn ask(
         report: Some(id),
         sources: b.sources,
         web: b.web,
+        max_words: b.max_words,
     };
     validate(&req)?;
     check_report(&st, &req).await?;

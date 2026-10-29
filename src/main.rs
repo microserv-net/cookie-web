@@ -53,6 +53,9 @@ enum Cmd {
         /// With --follow: auto | never | always search the web
         #[arg(long)]
         web: Option<String>,
+        /// Upper limit on the answer's length in words
+        #[arg(long)]
+        max_words: Option<u32>,
     },
     /// Print the full content of source N of a saved report (read and stored on first use).
     Source {
@@ -143,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Ask { query, depth, model, out, json, no_save, follow, sources, web } => {
+        Cmd::Ask { query, depth, model, out, json, no_save, follow, sources, web, max_words } => {
             let q = query.join(" ");
             if q.trim().is_empty() {
                 anyhow::bail!("usage: cookie-web ask <question>");
@@ -174,8 +177,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             });
-            let req =
-                ResearchRequest { query: q, depth: Some(depth), model, save: !no_save, report: follow, sources, web };
+            let req = ResearchRequest {
+                query: q,
+                depth: Some(depth),
+                model,
+                save: !no_save,
+                report: follow,
+                sources,
+                web,
+                max_words,
+            };
             let result = engine.run(req, Events::new(tx)).await;
             let _ = printer.await;
             let result = result?;

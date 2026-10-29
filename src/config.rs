@@ -16,10 +16,11 @@ pub enum SearchMode {
 /// How the model participates in gathering information (quick/standard requests).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentMode {
-    /// The model drives extra tool calls (native tool calling, or the JSON protocol as fallback).
+    /// `agent`: after code has searched and read, the main model may run more tool rounds
+    /// (native tool calling, or the JSON protocol as fallback). Slower: each round re-reads everything.
     Auto,
-    /// No model-driven tool rounds: code searches and reads the top results, the model only
-    /// triages and writes. Fastest and most robust on tiny models / slow CPUs.
+    /// `pipeline` (default): code searches, rescues, reads and assembles the evidence; the main model
+    /// is called once, to write. The fast model only answers small structured questions.
     Pipeline,
 }
 
@@ -128,8 +129,8 @@ impl Config {
             temperature: parse("COOKIE_TEMPERATURE", 0.3),
             keep_alive: var("COOKIE_KEEP_ALIVE").unwrap_or_else(|| "-1".into()),
             agent_mode: match var("COOKIE_AGENT_MODE").map(|v| v.to_ascii_lowercase()).as_deref() {
-                Some("pipeline") => AgentMode::Pipeline,
-                _ => AgentMode::Auto,
+                Some("agent" | "auto") => AgentMode::Auto,
+                _ => AgentMode::Pipeline,
             },
             warmup: flag("COOKIE_WARMUP", true),
             search_mode,

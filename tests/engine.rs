@@ -21,6 +21,7 @@ async fn run(
         report: None,
         sources: None,
         web: None,
+        max_words: None,
     };
     let result = engine.run(req, Events::new(tx)).await.expect("run ok");
     let mut events = vec![];
@@ -103,6 +104,7 @@ async fn rejects_bad_input() {
         report: None,
         sources: None,
         web: None,
+        max_words: None,
     };
     assert!(engine.run(req, Events::none()).await.is_err());
 }
@@ -120,6 +122,7 @@ async fn pipeline_mode_skips_model_tool_rounds() {
         report: None,
         sources: None,
         web: None,
+        max_words: None,
     };
     let r = engine.run(req, Events::none()).await.unwrap();
     let log = llm.log.lock().unwrap().clone();
@@ -146,4 +149,41 @@ async fn pages_are_read_in_parallel_before_the_model_decides() {
     let reads_before =
         events[..deciding].iter().filter(|e| matches!(e, Event::ToolCall { tool, .. } if tool == "fetch_page")).count();
     assert_eq!(reads_before, 2, "the top two pages, read together");
+}
+
+#[tokio::test]
+async fn multi_part_requests_search_and_read_every_part() {
+    let mut cfg = cookie_web::config::Config::for_tests(common::tmp_dir("multipart"));
+    cfg.agent_mode = cookie_web::config::AgentMode::Pipeline;
+    let (engine, llm) = common::engine_with(true, cfg);
+    *llm.triage_reply.lock().unwrap() = Some(
+        r#"{"depth":"standard","intent":"fact","search_query":"fake thing","extra_queries":["gizmo maker"],"reason":"two parts"}"#
+            .into(),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let req = ResearchRequest { save: false, ..ResearchRequest::new("what is the fake thing and who made the gizmo") };
+    let r = engine.run(req, Events::new(tx)).await.unwrap();
+    let mut queries = vec![];
+    while let Ok(e) = rx.try_recv() {
+        if let Event::ToolCall { tool, args, .. } = e
+            && tool == "web_search"
+        {
+            queries.push(args["query"].as_str().unwrap_or("").to_string());
+        }
+    }
+    assert!(queries.contains(&"fake thing".into()) && queries.contains(&"gizmo maker".into()), "{queries:?}");
+    assert_eq!(r.stats.pages_read, 3, "one more page for the second part");
+    assert!(r.sources.iter().any(|s| s.read && s.url.contains("gizmo-maker")), "the second part got a page");
+    let log = llm.log.lock().unwrap().clone();
+    assert!(!log.iter().any(|l| l.starts_with("agent")), "pipeline: no planning rounds: {log:?}");
+    assert_eq!(log.iter().filter(|l| *l == "write").count(), 1, "one main-model call: {log:?}");
+}
+
+#[tokio::test]
+async fn max_words_limits_the_answer() {
+    let (engine, llm) = common::engine(true, "maxwords");
+    let req = ResearchRequest { save: false, max_words: Some(120), ..ResearchRequest::new("VisionQuest") };
+    engine.run(req, Events::none()).await.unwrap();
+    assert!(llm.write_system.lock().unwrap().contains("at most 120 words"));
+    assert!(llm.write_max_tokens.lock().unwrap().unwrap() <= 252);
 }
