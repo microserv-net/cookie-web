@@ -79,11 +79,11 @@ async fn plan(run: &Run<'_>, t: &Triage) -> Plan {
 }
 
 /// Run searches, return hits ranked by reciprocal-rank fusion across queries.
-async fn search_round(run: &Run<'_>, queries: &[String], news: bool) -> Vec<Hit> {
+async fn search_round(run: &Run<'_>, queries: &[String], news: bool, broad: bool) -> Vec<Hit> {
     let calls: Vec<(String, Value)> = queries
         .iter()
         .flat_map(|q| {
-            let mut v = vec![("web_search".to_string(), json!({ "query": q }))];
+            let mut v = vec![("web_search".to_string(), json!({ "query": q, "broad": broad }))];
             if news {
                 v.push(("news_search".to_string(), json!({ "query": q, "time_range": "month" })));
             }
@@ -151,7 +151,10 @@ fn pick(hits: &[&Hit], n: usize, seen: &mut HashSet<String>, per_domain: &mut Ha
 async fn read_and_note(run: &Run<'_>, urls: Vec<String>, sub_questions: &[String]) -> (Vec<Evidence>, usize) {
     run.events.status(format!("Reading {} sources", urls.len()));
     let pages: Vec<_> = stream::iter(urls)
-        .map(|u| async move { run.tool("fetch_page", json!({ "url": u, "focus": run.query })).await })
+        .map(|u| async move {
+            let focus = crate::depth::search_keywords(&run.query);
+            run.tool("fetch_page", json!({ "url": u, "focus": focus })).await
+        })
         .buffer_unordered(4)
         .collect()
         .await;
@@ -242,13 +245,13 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
     }
 
     run.events.status(format!("Running {} searches", plan.queries.len()));
-    let mut hits = search_round(run, &plan.queries, news).await;
+    let mut hits = search_round(run, &plan.queries, news, false).await;
     let topic = topic_terms(&run.query);
     let on_topic = hits.iter().filter(|h| relevant(&format!("{} {} {}", h.title, h.snippet, h.url), &topic)).count();
     if on_topic < 3 {
         run.events.status("Few results — trying other phrasings");
         let alts = rephrase(run, &plan.queries).await;
-        hits.extend(search_round(run, &alts, news).await);
+        hits.extend(search_round(run, &alts, news, true).await);
         if hits.is_empty() {
             run.warn("the web searches found almost nothing for this request, even after rephrasing");
         }
@@ -281,7 +284,7 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
     };
     if !follow.is_empty() && run.ctx.fetches_left() > 0 {
         run.events.status(format!("Filling gaps: {}", follow.join(" · ")));
-        let more = search_round(run, &follow, news).await;
+        let more = search_round(run, &follow, news, false).await;
         let n = (run.ctx.fetches_left() as usize).min(3);
         let urls = choose(&more, n, &mut seen, &topic);
         evidence.extend(read_and_note(run, urls, &plan.sub_questions).await.0);

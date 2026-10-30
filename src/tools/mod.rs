@@ -56,6 +56,9 @@ pub struct ToolCtx {
     pub results_per_search: usize,
     pub page_chars: usize,
     fetches_left: Arc<AtomicIsize>,
+    /// Show page links with their URLs (requests that want links, e.g. downloads); otherwise
+    /// pages are shown to the model with link text only.
+    pub keep_urls: bool,
 }
 
 impl ToolCtx {
@@ -66,6 +69,7 @@ impl ToolCtx {
             results_per_search,
             page_chars,
             fetches_left: Arc::new(AtomicIsize::new(max_fetches as isize)),
+            keep_urls: false,
         }
     }
 

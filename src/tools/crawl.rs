@@ -171,7 +171,7 @@ impl Tool for CrawlSite {
                 "\n---\n[{n}] {}\nURL: {}\n{}\n",
                 p.title,
                 p.url,
-                focus_excerpt(&p.markdown, focus.as_deref(), per_page)
+                focus_excerpt(&super::extract::for_model(&p.markdown, ctx.keep_urls), focus.as_deref(), per_page)
             ));
         }
         Ok(ToolOutput::new(text, format!("crawled {} pages on {host}", pages.len())))

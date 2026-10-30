@@ -2,7 +2,7 @@
 //! async (poll) endpoints are three views of the same job.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -22,13 +22,16 @@ use axum::{
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
+    auth::Auth,
+    control::{Control, PauseState},
     depth::Depth,
     engine::{Engine, ResearchRequest, ResearchResult},
     events::{Event, Events},
+    queue::Queue,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,6 +41,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum JobStatus {
     Queued,
     Running,
+    /// Paused by the caller: it holds no slot (another job may run) until resumed.
+    Paused,
     Done,
     Error,
     Cancelled,
@@ -57,13 +62,33 @@ pub struct Job {
     abort: Mutex<Option<tokio::task::AbortHandle>>,
     /// The caller's `Idempotency-Key`, if any.
     key: Option<String>,
+    /// Live progress, for the status view.
+    progress: Mutex<Progress>,
+    /// Pause / resume.
+    pub control: Arc<Control>,
+    queue: Arc<Queue>,
+}
+
+/// What a job is doing right now (kept up to date from its events).
+#[derive(Default)]
+struct Progress {
+    stage: Option<String>,
+    depth: Option<String>,
+    started: Option<Instant>,
+    ended: Option<Instant>,
+    tool_calls: usize,
+    sources: usize,
+    tokens: usize,
 }
 
 impl Job {
-    fn new(query: &str, key: Option<String>) -> Arc<Self> {
+    fn new(query: &str, key: Option<String>, queue: Arc<Queue>) -> Arc<Self> {
         let (tick, _) = watch::channel(0);
+        let id = format!("job_{}", uuid::Uuid::new_v4().simple());
         Arc::new(Self {
-            id: format!("job_{}", uuid::Uuid::new_v4().simple()),
+            control: Control::new(&id, Some(queue.clone())),
+            queue,
+            id,
             query: query.to_string(),
             created: Instant::now(),
             created_at: chrono::Utc::now(),
@@ -74,18 +99,27 @@ impl Job {
             tick,
             abort: Mutex::new(None),
             key,
+            progress: Mutex::new(Progress::default()),
         })
     }
 
+    fn mark_running(&self) {
+        self.progress.lock().unwrap().started.get_or_insert_with(Instant::now);
+    }
+
     pub fn status(&self) -> JobStatus {
-        *self.status.lock().unwrap()
+        let st = *self.status.lock().unwrap();
+        if st == JobStatus::Running && matches!(self.control.state(), PauseState::Paused | PauseState::Resuming) {
+            return JobStatus::Paused;
+        }
+        st
     }
 
     fn finished(&self) -> bool {
         matches!(self.status(), JobStatus::Done | JobStatus::Error | JobStatus::Cancelled)
     }
 
-    /// Stop the job if it is still queued or running. Returns false if it had already finished.
+    /// Stop the job if it is still queued, running or paused. Returns false if it had already finished.
     pub fn cancel(&self) -> bool {
         {
             let mut st = self.status.lock().unwrap();
@@ -95,14 +129,68 @@ impl Job {
             *st = JobStatus::Cancelled;
         }
         *self.error.lock().unwrap() = Some("cancelled".into());
+        self.progress.lock().unwrap().ended.get_or_insert_with(Instant::now);
         if let Some(h) = self.abort.lock().unwrap().as_ref() {
             h.abort();
         }
+        // free its place at once: out of the line, and its slot to the next job
+        self.queue.remove(&self.id);
+        self.control.release_slot();
         self.tick.send_modify(|_| {});
         true
     }
 
+    /// Pause a running job: the model call in progress stops right away, the job gives up its slot.
+    pub fn pause(&self) -> Result<(), String> {
+        match self.status() {
+            JobStatus::Running => {
+                self.control.pause();
+                self.tick.send_modify(|_| {});
+                Ok(())
+            }
+            JobStatus::Paused => Ok(()),
+            JobStatus::Queued => Err("the job hasn't started yet (it is queued); cancel it instead".into()),
+            _ => Err("the job has already finished".into()),
+        }
+    }
+
+    /// Resume a paused job: it goes to the front of the queue and carries on where it stopped.
+    pub fn resume(&self) -> Result<(), String> {
+        match self.status() {
+            JobStatus::Paused | JobStatus::Running => {
+                self.control.resume();
+                self.tick.send_modify(|_| {});
+                Ok(())
+            }
+            JobStatus::Queued => Ok(()),
+            _ => Err("the job has already finished".into()),
+        }
+    }
+
     fn push(&self, e: Event) {
+        {
+            let mut p = self.progress.lock().unwrap();
+            match &e {
+                Event::Status { message } => p.stage = Some(message.clone()),
+                Event::Triage(t) => p.depth = Some(t.depth.as_str().to_string()),
+                Event::ToolCall { tool, .. } => {
+                    p.tool_calls += 1;
+                    p.stage = Some(format!("Running {tool}"));
+                }
+                Event::Source { .. } => p.sources += 1,
+                Event::Token { .. } => {
+                    p.tokens += 1;
+                    if p.tokens == 1 {
+                        p.stage = Some("Writing the answer".into());
+                    }
+                }
+                Event::Reset { .. } => p.tokens = 0,
+                Event::Done { .. } | Event::Error { .. } => {
+                    p.ended.get_or_insert_with(Instant::now);
+                }
+                _ => {}
+            }
+        }
         match &e {
             Event::Done { result } => {
                 *self.result.lock().unwrap() = Some((**result).clone());
@@ -136,10 +224,37 @@ impl Job {
             "id": self.id,
             "query": self.query,
             "status": self.status(),
+            "pause": self.control.state(),
             "created_at": self.created_at,
             "events": self.events.lock().unwrap().len(),
             "events_url": format!("/api/jobs/{}/events", self.id),
         });
+        {
+            let p = self.progress.lock().unwrap();
+            let end = p.ended.unwrap_or_else(Instant::now);
+            v["stage"] = json!(p.stage);
+            v["depth"] = json!(p.depth);
+            v["tool_calls"] = json!(p.tool_calls);
+            v["sources"] = json!(p.sources);
+            // time waiting in the queue, and time running (so far, or in total once finished)
+            v["queued_ms"] = json!(p.started.unwrap_or(end).saturating_duration_since(self.created).as_millis() as u64);
+            // working time: pauses don't count
+            let paused = self.control.paused_for();
+            v["running_ms"] = json!(
+                p.started
+                    .map(|s| end.saturating_duration_since(s).saturating_sub(paused).as_millis() as u64)
+                    .unwrap_or(0)
+            );
+            v["paused_ms"] = json!(paused.as_millis() as u64);
+        }
+        if let Some(pos) = self.queue.position(&self.id) {
+            v["position"] = json!(pos);
+        }
+        if let Some(r) = self.result.lock().unwrap().as_ref() {
+            v["report_id"] = json!(r.id);
+            v["degraded"] = json!(r.degraded);
+            v["warnings"] = json!(r.warnings.len());
+        }
         if include_result && let Some(r) = self.result.lock().unwrap().as_ref() {
             v["result"] = serde_json::to_value(r).unwrap_or(Value::Null);
         }
@@ -161,20 +276,74 @@ impl Job {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub started: Instant,
     pub engine: Arc<Engine>,
     pub jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
-    pub slots: Arc<Semaphore>,
+    /// Jobs take turns: `COOKIE_MAX_CONCURRENT` at a time, the rest wait in line.
+    pub queue: Arc<Queue>,
+    pub auth: Arc<Auth>,
+    /// Recent working times per depth (ms), for the latency figures in the manifest.
+    recent: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Model and watchdog info for `/api/status`, refreshed at most every few seconds (it is polled).
+    status_cache: Arc<tokio::sync::Mutex<StatusCache>>,
 }
+
+#[derive(Default)]
+struct StatusCache {
+    model: Option<(Instant, crate::llm::ModelInfo)>,
+    watch: Option<(Instant, Value)>,
+}
+
+/// How many recent jobs per depth the latency figures are based on.
+const LATENCY_WINDOW: usize = 20;
 
 impl AppState {
     pub fn new(engine: Arc<Engine>) -> Self {
-        let slots = Arc::new(Semaphore::new(engine.cfg.max_concurrent));
-        Self { engine, jobs: Arc::new(Mutex::new(HashMap::new())), slots }
+        let queue = Queue::new(engine.cfg.max_concurrent);
+        let auth = Arc::new(Auth::new(engine.cfg.api_key.clone(), engine.cfg.password.clone()));
+        Self {
+            started: Instant::now(),
+            started_at: chrono::Utc::now(),
+            engine,
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            queue,
+            auth,
+            recent: Arc::new(Mutex::new(HashMap::new())),
+            status_cache: Arc::new(tokio::sync::Mutex::new(StatusCache::default())),
+        }
+    }
+
+    fn count(&self, status: JobStatus) -> usize {
+        self.jobs.lock().unwrap().values().filter(|j| j.status() == status).count()
+    }
+
+    fn record_latency(&self, depth: &str, ms: u64) {
+        let mut r = self.recent.lock().unwrap();
+        let q = r.entry(depth.to_string()).or_default();
+        q.push_back(ms);
+        while q.len() > LATENCY_WINDOW {
+            q.pop_front();
+        }
+    }
+
+    /// Median and slowest-of-90% working time per depth, over the recent jobs.
+    fn latency(&self) -> Value {
+        let r = self.recent.lock().unwrap();
+        let mut out = serde_json::Map::new();
+        for d in ["quick", "standard", "deep"] {
+            let Some(q) = r.get(d).filter(|q| !q.is_empty()) else { continue };
+            let mut v: Vec<u64> = q.iter().copied().collect();
+            v.sort_unstable();
+            let at = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
+            out.insert(d.into(), json!({ "jobs": v.len(), "median_ms": at(0.5), "p90_ms": at(0.9) }));
+        }
+        Value::Object(out)
     }
 
     /// Start a research job in the background. With an idempotency `key`, a request that repeats
     /// the key of a job still queued, running or done returns that job instead of starting another.
-    pub fn spawn(&self, req: ResearchRequest, key: Option<String>) -> Arc<Job> {
+    pub fn spawn(&self, req: ResearchRequest, key: Option<String>) -> Result<Arc<Job>, ApiError> {
         if let Some(k) = key.as_deref() {
             let existing = self
                 .jobs
@@ -183,14 +352,24 @@ impl AppState {
                 .values()
                 .find(|j| {
                     j.key.as_deref() == Some(k)
-                        && matches!(j.status(), JobStatus::Queued | JobStatus::Running | JobStatus::Done)
+                        && matches!(
+                            j.status(),
+                            JobStatus::Queued | JobStatus::Running | JobStatus::Paused | JobStatus::Done
+                        )
                 })
                 .cloned();
             if let Some(j) = existing {
-                return j;
+                return Ok(j);
             }
         }
-        let job = Job::new(req.query.trim(), key);
+        let cap = self.engine.cfg.max_queue;
+        if self.queue.running() >= self.queue.capacity() && self.queue.waiting() >= cap {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("the queue is full ({cap} jobs waiting); try again later"),
+            ));
+        }
+        let job = Job::new(req.query.trim(), key, self.queue.clone());
         self.jobs.lock().unwrap().insert(job.id.clone(), job.clone());
         let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
         let events = Events::new(tx);
@@ -206,37 +385,43 @@ impl AppState {
         let st = self.clone();
         let j = job.clone();
         let ev = events.clone();
+        // take a place in line now, so the position is right from the first status request
+        let ticket = self.queue.enqueue(&job.id, false);
+        if !ticket.is_ready() {
+            let ahead = self.queue.position(&job.id).unwrap_or(1) - 1;
+            events.status(match ahead {
+                0 => "Queued — waiting for the current job to finish".to_string(),
+                n => format!("Queued — {n} job(s) ahead of this one"),
+            });
+        }
         let work = tokio::spawn(async move {
-            let permit = match st.slots.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    let ahead = st.queued_before(&j);
-                    ev.status(match ahead {
-                        0 => "Queued — waiting for the current job to finish".to_string(),
-                        n => format!("Queued — {n} job(s) ahead of this one"),
-                    });
-                    st.slots.clone().acquire_owned().await.map_err(|_| anyhow::anyhow!("server is shutting down"))?
-                }
-            };
+            j.control.set_slot(ticket.wait().await);
             {
                 let mut s = j.status.lock().unwrap();
                 if *s == JobStatus::Queued {
                     *s = JobStatus::Running;
                 }
             }
+            j.mark_running();
             j.tick.send_modify(|_| {});
-            let res = st.engine.run(req, ev).await;
-            drop(permit);
-            res
+            st.engine.run_controlled(req, ev, j.control.clone()).await
         });
         *job.abort.lock().unwrap() = Some(work.abort_handle());
 
         // Whatever happens to the work — success, error, cancellation, even a panic — the job ends
         // with exactly one `done` or `error` event, so no client is ever left waiting.
         let j = job.clone();
+        let st = self.clone();
         tokio::spawn(async move {
-            match work.await {
-                Ok(Ok(r)) => events.emit(Event::Done { result: Box::new(r) }),
+            let outcome = work.await;
+            // the slot goes to the next job whatever happened
+            j.control.release_slot();
+            j.queue.remove(&j.id);
+            match outcome {
+                Ok(Ok(r)) => {
+                    st.record_latency(r.depth.as_str(), r.stats.duration_ms);
+                    events.emit(Event::Done { result: Box::new(r) })
+                }
                 Ok(Err(e)) => {
                     tracing::warn!("job {} failed: {e:#}", j.id);
                     events.emit(Event::Error { message: format!("{e:#}") });
@@ -250,17 +435,7 @@ impl AppState {
                 }
             }
         });
-        job
-    }
-
-    /// Jobs queued before `job` (for the "waiting" message).
-    fn queued_before(&self, job: &Job) -> usize {
-        self.jobs
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|j| j.id != job.id && j.created < job.created && j.status() == JobStatus::Queued)
-            .count()
+        Ok(job)
     }
 
     fn get(&self, id: &str) -> Option<Arc<Job>> {
@@ -279,7 +454,11 @@ pub struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        let mut resp = (self.0, Json(json!({ "error": self.1 }))).into_response();
+        if self.0 == StatusCode::SERVICE_UNAVAILABLE {
+            resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+        }
+        resp
     }
 }
 
@@ -303,6 +482,9 @@ fn validate(req: &ResearchRequest) -> Result<(), ApiError> {
         && Depth::parse(d).is_none()
     {
         return Err(bad("`depth` must be one of: auto, quick, standard, deep"));
+    }
+    if req.max_words.is_some_and(|n| !(20..=5000).contains(&n)) {
+        return Err(bad("`max_words` must be between 20 and 5000"));
     }
     if req.report.is_none() && (req.sources.is_some() || req.web.is_some()) {
         return Err(bad("`sources` and `web` only apply to follow-ups: set `report` to the report id"));
@@ -355,17 +537,23 @@ async fn health(State(st): State<AppState>) -> Json<Value> {
         "status": if ok { "ok" } else { "degraded" },
         "version": VERSION,
         "model": info,
-        "fast_model": st.engine.cfg.fast_model(),
+        "fast_model": info.fast_model.clone(),
         "tools": st.engine.tools.names(),
         "search_backends": backends,
         "search_health": search,
         "search_mode": format!("{:?}", st.engine.cfg.search_mode).to_lowercase(),
-        "jobs_running": st.jobs.lock().unwrap().values().filter(|j| j.status() == JobStatus::Running).count(),
-        "jobs_queued": st.jobs.lock().unwrap().values().filter(|j| j.status() == JobStatus::Queued).count(),
+        "jobs_running": st.count(JobStatus::Running),
+        "jobs_queued": st.count(JobStatus::Queued),
+        "jobs_paused": st.count(JobStatus::Paused),
         "max_concurrent": st.engine.cfg.max_concurrent,
+        "max_queue": st.engine.cfg.max_queue,
+        "watchdog": st.engine.cfg.watch_url.is_some(),
         "num_ctx": st.engine.cfg.num_ctx,
         "agent_mode": format!("{:?}", st.engine.cfg.agent_mode).to_lowercase(),
-        "auth_required": st.engine.cfg.api_key.is_some(),
+        "auth_required": st.auth.required(),
+        "uptime_secs": st.started.elapsed().as_secs(),
+        "num_thread": st.engine.cfg.num_thread,
+        "fact_check": st.engine.cfg.fact_check,
     }))
 }
 
@@ -387,7 +575,8 @@ pub fn manifest_json(st: &AppState) -> Value {
             "save": "bool (default true) — persist the Markdown report",
             "report": "string (optional) — follow up on this report id: answered from its sources, same citation numbers; @3 in the query = its source [3]",
             "sources": "[int] (optional, with report) — only these sources of the report",
-            "web": "auto | never | always (with report; default auto = search only if the sources don't cover it)"
+            "web": "auto | never | always (with report; default auto = search only if the sources don't cover it)",
+            "max_words": "int 20-5000 (optional) — upper limit on the answer's length; shorter is faster"
         },
         "output": "ResearchResult { id, query, depth, intent, triage, markdown, sources[], stats, model, created_at, report_path, warnings[], degraded }",
         "reliability": {
@@ -401,7 +590,9 @@ pub fn manifest_json(st: &AppState) -> Value {
             "submit_job": { "method": "POST", "path": "/api/jobs", "returns": "202 Job" },
             "job": { "method": "GET", "path": "/api/jobs/{id}" },
             "job_events": { "method": "GET", "path": "/api/jobs/{id}/events?from={n}", "returns": "text/event-stream (replays from event n, default the start)" },
-            "cancel_job": { "method": "DELETE", "path": "/api/jobs/{id}" },
+            "cancel_job": { "method": "DELETE or POST", "path": "/api/jobs/{id} or /api/jobs/{id}/cancel" },
+            "pause_job": { "method": "POST", "path": "/api/jobs/{id}/pause", "returns": "Job (status paused once it has stopped)" },
+            "resume_job": { "method": "POST", "path": "/api/jobs/{id}/resume", "returns": "Job (goes to the front of the queue)" },
             "reports": { "method": "GET", "path": "/api/reports" },
             "ask": { "method": "POST", "path": "/api/reports/{id}/ask", "body": "{question, sources?, web?, depth?}", "returns": "ResearchResult (follow-up)" },
             "report_sources": { "method": "GET", "path": "/api/reports/{id}/sources" },
@@ -411,10 +602,122 @@ pub fn manifest_json(st: &AppState) -> Value {
             "report": { "method": "GET", "path": "/api/reports/{id}" },
             "report_markdown": { "method": "GET", "path": "/api/reports/{id}/markdown" },
             "health": { "method": "GET", "path": "/api/health" },
+            "status": { "method": "GET", "path": "/api/status", "returns": "live: service, queue, active + recent jobs, model, search engines, latency, watchdog" },
+            "status_stream": { "method": "GET", "path": "/api/status/stream?interval=2", "returns": "text/event-stream of `status` events (the /api/status document)" },
+            "watch_status": { "method": "GET", "path": "/watch/status", "returns": "the watchdog's view; answers even when cookie-web is down (via nginx)" },
             "tools": { "method": "GET", "path": "/api/tools" }
         },
-        "auth": if st.engine.cfg.api_key.is_some() { "Authorization: Bearer <key> or X-API-Key header" } else { "none" },
+        "contract": contract(st),
+        "auth": if st.auth.required() { "Authorization: Bearer <key> or X-API-Key header (or a signed-in session)" } else { "none" },
         "docs": "/docs/API.md in the repository"
+    })
+}
+
+/// Everything live in one document: service, queue, active and recent jobs, model, watchdog.
+async fn live_status(st: &AppState) -> Value {
+    let (model, watch) = {
+        let mut c = st.status_cache.lock().await;
+        let fresh = |t: &Instant, secs: u64| t.elapsed() < Duration::from_secs(secs);
+        if !c.model.as_ref().is_some_and(|(t, _)| fresh(t, 10)) {
+            c.model = Some((Instant::now(), st.engine.llm.info().await));
+        }
+        if let Some(url) = st.engine.cfg.watch_url.as_deref()
+            && !c.watch.as_ref().is_some_and(|(t, _)| fresh(t, 3))
+        {
+            let mut req = reqwest::Client::new().get(format!("{url}/watch/status")).timeout(Duration::from_secs(2));
+            if let Some(k) = &st.engine.cfg.api_key {
+                req = req.bearer_auth(k);
+            }
+            let v = match req.send().await {
+                Ok(r) => r.json::<Value>().await.unwrap_or(Value::Null),
+                Err(e) => json!({ "error": format!("watchdog not reachable: {e}") }),
+            };
+            c.watch = Some((Instant::now(), v));
+        }
+        (c.model.as_ref().map(|m| m.1.clone()).unwrap_or_default(), c.watch.as_ref().map(|w| w.1.clone()))
+    };
+    let jobs: Vec<Arc<Job>> = st.jobs.lock().unwrap().values().cloned().collect();
+    let rank = |j: &Job| match j.status() {
+        JobStatus::Running => (0, 0),
+        JobStatus::Paused => (1, 0),
+        JobStatus::Queued => (2, j.queue.position(&j.id).unwrap_or(usize::MAX)),
+        _ => (3, 0),
+    };
+    let mut active: Vec<&Arc<Job>> = jobs.iter().filter(|j| !j.finished()).collect();
+    active.sort_by_key(|j| rank(j));
+    let mut recent: Vec<&Arc<Job>> = jobs.iter().filter(|j| j.finished()).collect();
+    recent.sort_by_key(|j| std::cmp::Reverse(j.created));
+    let ok = model.reachable && model.available;
+    json!({
+        "status": if ok { "ok" } else { "degraded" },
+        "at": chrono::Utc::now(),
+        "service": {
+            "name": "cookie-web", "version": VERSION, "pid": std::process::id(),
+            "started_at": st.started_at, "uptime_secs": st.started.elapsed().as_secs(),
+        },
+        "queue": {
+            "max_concurrent": st.queue.capacity(), "max_queue": st.engine.cfg.max_queue,
+            "slots_in_use": st.queue.running(), "waiting": st.queue.waiting(),
+            "running": st.count(JobStatus::Running), "paused": st.count(JobStatus::Paused),
+            "queued": st.count(JobStatus::Queued),
+        },
+        "jobs": active.iter().map(|j| j.snapshot(false)).collect::<Vec<_>>(),
+        "recent_jobs": recent.iter().take(10).map(|j| j.snapshot(false)).collect::<Vec<_>>(),
+        "model": {
+            "main": model.model, "fast": model.fast_model, "fast_active": model.fast_active,
+            "reachable": model.reachable, "available": model.available, "loaded": model.loaded,
+            "memory_bytes": model.memory_bytes, "error": model.error,
+        },
+        "search": st.engine.tools.search.as_ref().map(|s| s.status()).unwrap_or_default(),
+        "latency": st.latency(),
+        "watchdog": watch,
+    })
+}
+
+async fn status(State(st): State<AppState>) -> Json<Value> {
+    Json(live_status(&st).await)
+}
+
+#[derive(Deserialize)]
+struct EveryQ {
+    interval: Option<u64>,
+}
+
+/// `GET /api/status/stream` — the same document as `/api/status`, pushed every `interval` seconds
+/// (default 2) as `status` events.
+async fn status_stream(State(st): State<AppState>, Query(q): Query<EveryQ>) -> Response {
+    let every = Duration::from_secs(q.interval.unwrap_or(2).clamp(1, 60));
+    let stream = async_stream::stream! {
+        let mut n = 0u64;
+        loop {
+            n += 1;
+            let v = live_status(&st).await;
+            yield Ok::<_, Infallible>(SseEvent::default().event("status").id(n.to_string()).data(v.to_string()));
+            tokio::time::sleep(every).await;
+        }
+    };
+    let mut resp = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+    resp.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+    resp
+}
+
+/// What a caller can rely on: limits, queueing, time bounds and observed latency.
+fn contract(st: &AppState) -> Value {
+    let cfg = &st.engine.cfg;
+    json!({
+        "one_job_at_a_time": cfg.max_concurrent == 1,
+        "max_concurrent": cfg.max_concurrent,
+        "max_queue": cfg.max_queue,
+        "queue": "first come, first served; past max_queue a new job gets 503 with Retry-After. A resumed job goes to the front.",
+        "job_timeout_secs": cfg.job_timeout.as_secs(),
+        "time_bound": "every job ends with exactly one `done` or `error` event within job_timeout_secs of working time (paused time doesn't count)",
+        "pause": "POST /api/jobs/{id}/pause stops the model at once and frees the slot for the next job; /resume carries on where it stopped",
+        "cancel": "DELETE /api/jobs/{id} (or POST …/cancel) stops a queued, running or paused job at once",
+        "latency": st.latency(),
+        "latency_note": "median / 90th-percentile working time of recent jobs per depth on this machine; empty until jobs have run",
+        "limits": { "query_chars": 4000, "max_words": [20, 5000] },
+        "model_calls": "one call to the main model per answer (it writes); small steps use the fast model",
+        "degraded": "if the model fails, the answer is a digest of the sources and degraded=true — never an empty result",
     })
 }
 
@@ -448,7 +751,7 @@ async fn research(
 ) -> Result<Response, ApiError> {
     validate(&req)?;
     check_report(&st, &req).await?;
-    let job = st.spawn(req, idempotency_key(&headers)?);
+    let job = st.spawn(req, idempotency_key(&headers)?)?;
     finished_response(job, &fq, &headers).await
 }
 
@@ -500,7 +803,7 @@ async fn research_stream(
 ) -> Result<Response, ApiError> {
     validate(&req)?;
     check_report(&st, &req).await?;
-    let job = st.spawn(req, idempotency_key(&headers)?);
+    let job = st.spawn(req, idempotency_key(&headers)?)?;
     let mut resp = sse_for(job.clone(), 0).into_response();
     resp.headers_mut().insert("x-cookie-job", HeaderValue::from_str(&job.id).unwrap());
     resp.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
@@ -514,7 +817,7 @@ async fn submit_job(
 ) -> Result<Response, ApiError> {
     validate(&req)?;
     check_report(&st, &req).await?;
-    let job = st.spawn(req, idempotency_key(&headers)?);
+    let job = st.spawn(req, idempotency_key(&headers)?)?;
     let mut body = job.snapshot(false);
     body["status_url"] = json!(format!("/api/jobs/{}", job.id));
     Ok((StatusCode::ACCEPTED, [(header::LOCATION, format!("/api/jobs/{}", job.id))], Json(body)).into_response())
@@ -554,6 +857,20 @@ async fn cancel_job(State(st): State<AppState>, Path(id): Path<String>) -> Resul
     if job.cancel() {
         tracing::info!("job {id} cancelled by the client");
     }
+    Ok(Json(job.snapshot(false)))
+}
+
+async fn pause_job(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let job = st.get(&id).ok_or_else(|| not_found("job"))?;
+    job.pause().map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    tracing::info!("job {id}: pause requested");
+    Ok(Json(job.snapshot(false)))
+}
+
+async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let job = st.get(&id).ok_or_else(|| not_found("job"))?;
+    job.resume().map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    tracing::info!("job {id}: resume requested");
     Ok(Json(job.snapshot(false)))
 }
 
@@ -607,6 +924,8 @@ struct AskBody {
     model: Option<String>,
     #[serde(default = "yes")]
     save: bool,
+    #[serde(default)]
+    max_words: Option<u32>,
 }
 
 fn yes() -> bool {
@@ -629,10 +948,11 @@ async fn ask(
         report: Some(id),
         sources: b.sources,
         web: b.web,
+        max_words: b.max_words,
     };
     validate(&req)?;
     check_report(&st, &req).await?;
-    let job = st.spawn(req, idempotency_key(&headers)?);
+    let job = st.spawn(req, idempotency_key(&headers)?)?;
     finished_response(job, &fq, &headers).await
 }
 
@@ -863,25 +1183,161 @@ struct KeyQ {
     api_key: Option<String>,
 }
 
-async fn auth(State(st): State<AppState>, Query(q): Query<KeyQ>, req: Request, next: Next) -> Response {
-    let Some(expected) = st.engine.cfg.api_key.as_deref() else { return next.run(req).await };
-    let path = req.uri().path();
-    if !path.starts_with("/api/") || path == "/api/health" || path == "/api/manifest" {
-        return next.run(req).await;
-    }
+/// Paths anyone may load: the sign-in page and the assets it (and the app shell) needs, the
+/// agent card, and the health check (which answers with less detail when not signed in).
+fn public_path(path: &str) -> bool {
+    matches!(path, "/login" | "/logout" | "/style.css" | "/favicon.svg" | "/app.js" | "/api/manifest" | "/api/health")
+        || path.starts_with("/vendor/")
+}
+
+/// Is this request signed in (session cookie) or carrying the API key?
+fn authorized(st: &AppState, req: &Request, query_key: Option<&str>) -> bool {
     let h = req.headers();
     let bearer = h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let xkey = h.get("x-api-key").and_then(|v| v.to_str().ok());
-    let given = bearer.or(xkey).or(q.api_key.as_deref());
-    if given.is_some_and(|g| constant_time_eq(g.as_bytes(), expected.as_bytes())) {
-        next.run(req).await
-    } else {
-        ApiError(StatusCode::UNAUTHORIZED, "missing or invalid API key".into()).into_response()
+    if bearer.or(xkey).or(query_key).is_some_and(|k| st.auth.check_key(k)) {
+        return true;
     }
+    h.get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(Auth::session_from)
+        .any(|t| st.auth.valid_session(t))
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+async fn auth(State(st): State<AppState>, Query(q): Query<KeyQ>, req: Request, next: Next) -> Response {
+    if !st.auth.required() {
+        return next.run(req).await;
+    }
+    let path = req.uri().path().to_string();
+    let ok = authorized(&st, &req, q.api_key.as_deref());
+    if ok {
+        return next.run(req).await;
+    }
+    if path == "/api/health" {
+        // enough for a load balancer or supervisor to see it's up, nothing more
+        return Json(json!({ "status": "ok", "version": VERSION, "auth_required": true })).into_response();
+    }
+    if public_path(&path) {
+        return next.run(req).await;
+    }
+    if path.starts_with("/api/") {
+        return ApiError(StatusCode::UNAUTHORIZED, "missing or invalid API key (or sign in)".into()).into_response();
+    }
+    let next_url = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let enc: String = url::form_urlencoded::byte_serialize(next_url.as_bytes()).collect();
+    (StatusCode::SEE_OTHER, [(header::LOCATION, format!("/login?next={enc}"))]).into_response()
+}
+
+fn client_of(req_headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
+    // Behind the local reverse proxy (nginx), the client is in X-Real-IP / X-Forwarded-For. Those
+    // headers are only trusted from this machine: anyone else could make them up to dodge the limit.
+    let via_local_proxy = peer.is_none_or(|p| p.ip().is_loopback());
+    let forwarded = || {
+        let h = |n: &str| req_headers.get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+        h("x-real-ip")
+            .or_else(|| h("x-forwarded-for").and_then(|v| v.rsplit(',').next().map(str::to_string)))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    via_local_proxy
+        .then(forwarded)
+        .flatten()
+        .or_else(|| peer.map(|p| p.ip().to_string()))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn session_cookie(value: &str, max_age: u64, secure: bool) -> String {
+    format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        crate::auth::COOKIE,
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+fn is_https(headers: &HeaderMap) -> bool {
+    headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).is_some_and(|p| p.eq_ignore_ascii_case("https"))
+}
+
+async fn login_page(State(st): State<AppState>) -> Response {
+    if !st.auth.required() {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    }
+    Html(include_str!("../static/login.html")).into_response()
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    password: String,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+async fn login(State(st): State<AppState>, req: Request) -> Response {
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+    let headers = req.headers().clone();
+    let client = client_of(&headers, peer);
+    let wants_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| c.starts_with("application/json"));
+    let body = match axum::body::to_bytes(req.into_body(), 16 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return bad("request too large").into_response(),
+    };
+    let form: Option<LoginForm> =
+        if wants_json { serde_json::from_slice(&body).ok() } else { serde_urlencoded_form(&body) };
+    let Some(form) = form else { return bad("send `password`").into_response() };
+    // only same-site paths: never redirect to another site
+    let next = form.next.filter(|n| n.starts_with('/') && !n.starts_with("//")).unwrap_or_else(|| "/".into());
+    if !st.auth.required() {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, next)]).into_response();
+    }
+    if let Some(wait) = st.auth.locked_out(&client) {
+        tracing::warn!("login refused for {client}: too many wrong passwords");
+        if wants_json {
+            return ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("too many wrong passwords; try again in {} minutes", wait.as_secs().div_ceil(60)),
+            )
+            .into_response();
+        }
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/login?error=locked".to_string())]).into_response();
+    }
+    if !st.auth.check_password(&form.password) {
+        st.auth.record_failure(&client);
+        tracing::warn!("wrong password from {client}");
+        if wants_json {
+            return ApiError(StatusCode::UNAUTHORIZED, "wrong password".into()).into_response();
+        }
+        let enc: String = url::form_urlencoded::byte_serialize(next.as_bytes()).collect();
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, format!("/login?error=1&next={enc}"))]).into_response();
+    }
+    st.auth.clear_failures(&client);
+    let cookie = session_cookie(&st.auth.issue(), crate::auth::SESSION_DAYS * 86_400, is_https(&headers));
+    if wants_json {
+        return ([(header::SET_COOKIE, cookie)], Json(json!({ "ok": true }))).into_response();
+    }
+    (StatusCode::SEE_OTHER, [(header::SET_COOKIE, cookie), (header::LOCATION, next)]).into_response()
+}
+
+/// `password=…&next=…` (browsers' form encoding).
+fn serde_urlencoded_form(body: &[u8]) -> Option<LoginForm> {
+    let mut password = None;
+    let mut next = None;
+    for (k, v) in url::form_urlencoded::parse(body) {
+        match k.as_ref() {
+            "password" => password = Some(v.into_owned()),
+            "next" => next = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    Some(LoginForm { password: password?, next })
+}
+
+async fn logout(headers: HeaderMap) -> Response {
+    let cookie = session_cookie("", 0, is_https(&headers));
+    (StatusCode::SEE_OTHER, [(header::SET_COOKIE, cookie), (header::LOCATION, "/login".to_string())]).into_response()
 }
 
 // ------------------------------------------------------------------ router
@@ -898,6 +1354,8 @@ pub fn router(st: AppState) -> Router {
     };
     Router::new()
         .route("/", get(index))
+        .route("/login", get(login_page).post(login))
+        .route("/logout", get(logout).post(logout))
         .route("/app.js", get(|| async { asset(include_str!("../static/app.js"), "text/javascript; charset=utf-8") }))
         .route("/style.css", get(|| async { asset(include_str!("../static/style.css"), "text/css; charset=utf-8") }))
         .route("/favicon.svg", get(|| async { asset(include_str!("../static/favicon.svg"), "image/svg+xml") }))
@@ -910,6 +1368,8 @@ pub fn router(st: AppState) -> Router {
             get(|| async { asset(include_str!("../static/vendor/purify.min.js"), "text/javascript; charset=utf-8") }),
         )
         .route("/api/health", get(health))
+        .route("/api/status", get(status))
+        .route("/api/status/stream", get(status_stream))
         .route("/api/manifest", get(manifest))
         .route("/api/tools", get(tools))
         .route("/api/research", post(research))
@@ -917,6 +1377,9 @@ pub fn router(st: AppState) -> Router {
         .route("/api/jobs", post(submit_job).get(list_jobs))
         .route("/api/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/api/jobs/{id}/events", get(job_events))
+        .route("/api/jobs/{id}/cancel", post(cancel_job))
+        .route("/api/jobs/{id}/pause", post(pause_job))
+        .route("/api/jobs/{id}/resume", post(resume_job))
         .route("/api/reports", get(list_reports))
         .route("/api/reports/{id}", get(get_report).delete(delete_report))
         .route("/api/reports/{id}/markdown", get(report_markdown))
@@ -957,19 +1420,42 @@ pub async fn serve(engine: Arc<Engine>) -> anyhow::Result<()> {
         cfg.ollama_host
     );
     let loopback = matches!(cfg.host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]");
-    if !loopback && cfg.api_key.is_none() {
+    if !loopback && cfg.api_key.is_none() && cfg.password.is_none() {
         tracing::warn!(
             "no COOKIE_API_KEY is set and cookie-web is reachable from the network: anyone who can reach port {} \
-             can use it. Set COOKIE_API_KEY (or COOKIE_HOST=127.0.0.1 to keep it local).",
+             can use it. Set COOKIE_API_KEY and/or COOKIE_PASSWORD (or COOKIE_HOST=127.0.0.1 to keep it local).",
             cfg.port
         );
     }
-    axum::serve(listener, router(st)).with_graceful_shutdown(shutdown_signal()).await?;
+    // systemd: ready to serve, and keep its watchdog fed while the server answers
+    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(cfg.port);
+    crate::watch::sd_notify("READY=1");
+    crate::watch::start_systemd_watchdog(bound);
+    if let Some(url) = cfg.watch_url.clone() {
+        let s = st.clone();
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(cfg.port);
+        let name = crate::watch::Beat::own_name();
+        tracing::info!("registering with the watchdog at {url}");
+        crate::watch::start_heartbeat(url, move || crate::watch::Beat {
+            pid: std::process::id(),
+            name: name.clone(),
+            version: VERSION.into(),
+            port,
+            started_at: s.started_at,
+            jobs_running: s.count(JobStatus::Running),
+            jobs_queued: s.count(JobStatus::Queued),
+            jobs_paused: s.count(JobStatus::Paused),
+        });
+    }
+    // connect info: the client address, for rate-limiting wrong passwords
+    axum::serve(listener, router(st).into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal(cfg.watch_url.clone()))
+        .await?;
     Ok(())
 }
 
 /// Ctrl-C or SIGTERM (systemd, Docker). Open SSE streams get 10 s to finish, then the process exits.
-async fn shutdown_signal() {
+async fn shutdown_signal(watch_url: Option<String>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -989,6 +1475,10 @@ async fn shutdown_signal() {
         _ = term => {},
     }
     tracing::info!("shutting down");
+    crate::watch::sd_notify("STOPPING=1");
+    if let Some(url) = watch_url {
+        crate::watch::say_bye(&url).await;
+    }
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_secs(10)).await;
         std::process::exit(0);

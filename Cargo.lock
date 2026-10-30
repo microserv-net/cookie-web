@@ -503,6 +503,7 @@ dependencies = [
  "pdf-extract",
  "regex",
  "reqwest",
+ "ring",
  "scraper",
  "serde",
  "serde_json",

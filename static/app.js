@@ -14,6 +14,9 @@
     settings: $("#settings"), apiKey: $("#api-key"), model: $("#model"), save: $("#save"), models: $("#models"),
     notice: $("#notice"), noticeTitle: $("#notice-title"), noticeList: $("#notice-list"),
     follow: $("#follow"), followWrap: $("#follow-wrap"),
+    pause: $("#pause"), stWatch: $("#st-watch"), stWatchWrap: $("#st-watch-wrap"),
+    statusJobs: $("#status-jobs"), statusPanel: $("#status-panel"), logout: $("#logout-btn"),
+    stJobs: $("#st-jobs"), stServer: $("#st-server"), stSearch: $("#st-search"), stUpdated: $("#st-updated"),
   };
   const PLACEHOLDER = els.q.placeholder;
 
@@ -32,6 +35,11 @@
 
   async function api(path, opts = {}) {
     const r = await fetch(path, { ...opts, headers: headers(opts.headers || {}) });
+    if (r.status === 401 && !store.get("apiKey", "")) {
+      // signed out (session expired, password changed): back to the sign-in page
+      location.href = "/login?next=" + encodeURIComponent(location.pathname);
+      throw new Error("not signed in");
+    }
     if (!r.ok) {
       let msg = r.statusText;
       try { msg = (await r.json()).error || msg; } catch {}
@@ -105,13 +113,26 @@
     }
   }
 
+  const clock = (ms) => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    return s < 3600 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : `${Math.floor(s / 3600)}h${String(Math.floor(s / 60) % 60).padStart(2, "0")}`;
+  };
+  let runStarted = null;
+  function updateActivityCount() {
+    const steps = els.log.children.length;
+    // working time: a pause doesn't count
+    const pausedMs = pausedTotal + (pausedAt ? Date.now() - pausedAt : 0);
+    const t = runStarted ? ` · ${clock(Date.now() - runStarted - pausedMs)}` : "";
+    els.activityCount.textContent = `· ${steps} step${steps === 1 ? "" : "s"}${t}`;
+  }
+
   function logLine(cls, html) {
     const li = document.createElement("li");
     li.className = cls;
     li.innerHTML = html;
     els.log.appendChild(li);
     els.log.scrollTop = els.log.scrollHeight;
-    els.activityCount.textContent = `· ${els.log.children.length} steps`;
+    updateActivityCount();
     return li;
   }
 
@@ -141,6 +162,34 @@
     els.go.textContent = b ? "Stop" : "Search";
     els.go.classList.toggle("stop", b);
     els.activity.classList.toggle("running", b);
+    if (!b) setPaused(false);
+    els.pause.hidden = !b;
+  }
+
+  // Pause / resume the job this page is following.
+  let paused = false;
+  let pausedAt = null, pausedTotal = 0;
+  function setPaused(p) {
+    if (p && !paused) pausedAt = Date.now();
+    if (!p && paused && pausedAt) { pausedTotal += Date.now() - pausedAt; pausedAt = null; }
+    paused = p;
+    els.pause.textContent = p ? "Resume" : "Pause";
+    els.pause.classList.toggle("paused", p);
+    els.activity.classList.toggle("paused", p);
+  }
+  async function togglePause() {
+    const job = running && running.jobId;
+    if (!job) return;
+    els.pause.disabled = true;
+    try {
+      const r = await api(`/api/jobs/${encodeURIComponent(job)}/${paused ? "resume" : "pause"}`, { method: "POST" });
+      const j = await r.json();
+      setPaused(j.status === "paused" || j.pause === "pausing" || j.pause === "paused");
+    } catch (e) {
+      logLine("warn", "⚠ " + esc(e.message));
+    } finally {
+      els.pause.disabled = false;
+    }
   }
 
   // Cancel the job this page is following (frees the server's slot for the next request).
@@ -214,6 +263,9 @@
     const parent = current && current.saved && !els.followWrap.hidden && els.follow.checked ? current.id : null;
     resetRun(parent ? `↳ ${query}` : query);
     setBusy(true);
+    runStarted = Date.now();
+    pausedTotal = 0; pausedAt = null; setPaused(false);
+    const timer = setInterval(updateActivityCount, 1000);
     const depth = document.querySelector('input[name="depth"]:checked').value;
     const body = { query, depth, save: els.save.checked };
     if (parent) body.report = parent;
@@ -234,7 +286,11 @@
       switch (event) {
         case "started": me.jobId = data.job_id; break;
         case "triage": showTriage(data); break;
-        case "status": logLine("status", esc(data.message)); break;
+        case "status":
+          logLine("status", esc(data.message));
+          if (data.message === "Paused") { setPaused(true); els.activityTitle.textContent = "Paused"; }
+          else if (data.message === "Resumed") { setPaused(false); els.activityTitle.textContent = "Working"; }
+          break;
         case "warning": logLine("warn", "⚠ " + esc(data.message)); break;
         case "tool_call": tools.set(data.call_id, logLine("tool", `<b>${esc(data.tool)}</b> ${argText(data.args)}`)); break;
         case "tool_result": {
@@ -322,6 +378,9 @@
         els.activityTitle.textContent = "Failed";
       }
     } finally {
+      clearInterval(timer);
+      updateActivityCount();
+      runStarted = null;
       if (running === me) running = null;
       if (controller === ctl) setBusy(false);
     }
@@ -368,17 +427,123 @@
 
   async function checkHealth() {
     try {
-      const h = await (await fetch("/api/health")).json();
+      const h = await (await fetch("/api/health", { headers: headers() })).json();
       els.status.className = "pill " + (h.status === "ok" ? "ok" : "degraded");
       const m = h.model || {};
       els.statusText.textContent = h.status === "ok"
         ? `${m.model}${m.supports_tools ? "" : " (no native tools)"} · ${searchSummary(h)}`
         : (m.error || "degraded");
       els.models.innerHTML = (m.installed || []).map((x) => `<option value="${esc(x)}">`).join("");
+      els.logout.hidden = !h.auth_required;
+      const busy = (h.jobs_running || 0) + (h.jobs_queued || 0) + (h.jobs_paused || 0);
+      els.statusJobs.hidden = !busy;
+      els.statusJobs.textContent = [
+        h.jobs_running ? `${h.jobs_running} running` : "",
+        h.jobs_paused ? `${h.jobs_paused} paused` : "",
+        h.jobs_queued ? `${h.jobs_queued} queued` : "",
+      ].filter(Boolean).join(" · ");
+      return h;
     } catch {
       els.status.className = "pill down";
       els.statusText.textContent = "server unreachable";
+      return null;
     }
+  }
+
+  // ------------------------------------------------------------ status view
+  let statusTimer = null;
+  const gb = (b) => (b ? `${(b / 1e9).toFixed(2)} GB` : "—");
+  const ago = (iso) => {
+    const s = Math.round((Date.now() - new Date(iso)) / 1000);
+    return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : new Date(iso).toLocaleString();
+  };
+
+  function renderJobs(jobs) {
+    if (!jobs.length) { els.stJobs.innerHTML = '<li class="muted">No jobs yet</li>'; return; }
+    els.stJobs.innerHTML = jobs.slice(0, 20).map((j) => {
+      const live = j.status === "running" || j.status === "queued" || j.status === "paused";
+      const time = j.status === "queued" ? `#${j.position || "?"} in line · waiting ${clock(j.queued_ms)}`
+        : j.status === "running" ? clock(j.running_ms)
+        : j.status === "paused" ? `${clock(j.running_ms)} · paused` : `took ${clock(j.running_ms)}`;
+      const detail = live ? esc(j.pause === "pausing" ? "Pausing…" : j.pause === "resuming" ? "Resuming — next in line" : (j.stage || "starting…"))
+        : j.status === "done" ? `${j.sources} sources · ${j.tool_calls} tool calls${j.warnings ? ` · ${j.warnings} notes` : ""}${j.degraded ? " · degraded" : ""}`
+        : esc(j.error || "");
+      const id = esc(j.id);
+      const btns = [];
+      if (j.status === "running" && j.pause !== "pausing") btns.push(`<button type="button" data-pause="${id}">Pause</button>`);
+      if (j.status === "paused" && j.pause !== "resuming") btns.push(`<button type="button" data-resume="${id}">Resume</button>`);
+      if (live) btns.push(`<button type="button" data-stop="${id}">Stop</button>`);
+      else if (j.report_id) btns.push(`<button type="button" data-open="${esc(j.report_id)}">Open</button>`);
+      const actions = btns.length ? `<span class="st-actions">${btns.join("")}</span>` : "";
+      return `<li class="st-job ${esc(j.status)}">
+        <div class="st-job-top"><span class="chip st-${esc(j.status)}">${esc(j.status)}</span>
+          ${j.depth ? `<span class="chip">${esc(j.depth)}</span>` : ""}
+          <span class="st-time">${time}</span><span class="muted small">${ago(j.created_at)}</span>${actions}</div>
+        <div class="st-q">${esc(j.query)}</div>
+        <div class="muted small">${detail}</div></li>`;
+    }).join("");
+  }
+
+  function renderServer(h) {
+    const m = h.model || {};
+    const row = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+    const up = h.uptime_secs != null ? clock(h.uptime_secs * 1000) : "—";
+    els.stServer.innerHTML = [
+      row("Status", `<span class="chip st-${h.status === "ok" ? "done" : "error"}">${esc(h.status)}</span>`),
+      row("Model", `${esc(m.model || "—")}${m.supports_tools ? "" : " (no native tools)"}`),
+      row("Ollama", m.reachable ? "reachable" : `<span class="err">${esc(m.error || "unreachable")}</span>`),
+      row("Loaded", m.loaded ? `yes · ${gb(m.memory_bytes)}${m.context_length ? ` · ${m.context_length} ctx` : ""}` : "no (loads on the next request)"),
+      row("Jobs", `${h.jobs_running} running · ${h.jobs_paused || 0} paused · ${h.jobs_queued} queued · ${h.max_concurrent} at a time, up to ${h.max_queue} waiting`),
+      row("Settings", `ctx ${h.num_ctx} · threads ${h.num_thread || "all"} · ${esc(h.agent_mode)} · fact check ${h.fact_check ? "on" : "off"}`),
+      row("Version", `${esc(h.version)} · up ${up}`),
+    ].join("");
+    const engines = h.search_health || [];
+    els.stSearch.innerHTML = `<tr><th>engine</th><th>state</th><th>ok</th><th>failed</th><th>last error</th></tr>` +
+      engines.map((b) => `<tr><td>${esc(b.name)}</td>
+        <td>${b.cooldown_secs ? `<span class="warn">resting ${clock(b.cooldown_secs * 1000)}</span>` : '<span class="okc">ready</span>'}</td>
+        <td>${b.ok}</td><td>${b.failures}</td>
+        <td class="muted small" title="${esc(b.last_error || "")}">${esc((b.last_error || "").slice(0, 60))}</td></tr>`).join("");
+  }
+
+  // The watchdog (a separate service, reached through nginx at /watch/) — absent without nginx.
+  const WATCH_TITLES = { online: "online", degraded: "degraded", unresponsive: "not responding", offline: "offline", unknown: "unknown" };
+  async function refreshWatch() {
+    try {
+      const r = await fetch("/watch/status", { cache: "no-store", credentials: "same-origin" });
+      if (!(r.headers.get("content-type") || "").includes("json")) throw new Error("no watchdog");
+      const w = await r.json();
+      const d = w.detail || {};
+      const row = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+      const cls = w.status === "online" ? "done" : w.status === "degraded" ? "paused" : "error";
+      els.stWatch.innerHTML = [
+        row("API", `<span class="chip st-${cls}">${esc(WATCH_TITLES[w.status] || w.status)}</span> since ${ago(w.since)}${w.reason ? ` · ${esc(w.reason)}` : ""}`),
+        d.pid ? row("Process", `pid ${d.pid}${d.last_beat_secs_ago != null ? ` · heartbeat ${d.last_beat_secs_ago}s ago` : ""}`) : "",
+        d.latency_ms != null ? row("Health check", `${d.latency_ms} ms · every ${w.watchdog.interval_secs}s`) : "",
+        row("Watchdog", `up ${clock(w.watchdog.uptime_secs * 1000)} · <a href="/watch/" target="_blank">status page</a>`),
+      ].join("");
+      els.stWatchWrap.hidden = false;
+    } catch {
+      els.stWatchWrap.hidden = true;
+    }
+  }
+
+  async function refreshStatus() {
+    try {
+      refreshWatch();
+      const [h, j] = await Promise.all([checkHealth(), api("/api/jobs").then((r) => r.json())]);
+      if (h) renderServer(h);
+      renderJobs(j.jobs || []);
+      els.stUpdated.textContent = "updated " + new Date().toLocaleTimeString();
+    } catch (e) {
+      els.stUpdated.textContent = "update failed: " + e.message;
+    }
+  }
+
+  function openStatus() {
+    refreshStatus();
+    clearInterval(statusTimer);
+    statusTimer = setInterval(refreshStatus, 2000);
+    els.statusPanel.showModal();
   }
 
   // ------------------------------------------------------------- wiring
@@ -437,8 +602,31 @@
   });
   els.save.checked = store.get("save", "1") === "1";
   els.follow.addEventListener("change", updatePlaceholder);
+  els.status.addEventListener("click", openStatus);
+  els.pause.addEventListener("click", togglePause);
+  $("#status-close").addEventListener("click", () => els.statusPanel.close());
+  els.statusPanel.addEventListener("close", () => clearInterval(statusTimer));
+  els.stJobs.addEventListener("click", async (e) => {
+    const stop = e.target.closest("[data-stop]");
+    const open = e.target.closest("[data-open]");
+    const pz = e.target.closest("[data-pause]") || e.target.closest("[data-resume]");
+    if (pz) {
+      pz.disabled = true;
+      const id = pz.dataset.pause || pz.dataset.resume;
+      await api(`/api/jobs/${encodeURIComponent(id)}/${pz.dataset.pause ? "pause" : "resume"}`, { method: "POST" }).catch(() => {});
+      if (running && running.jobId === id) setPaused(!!pz.dataset.pause);
+      refreshStatus();
+    } else if (stop) {
+      stop.disabled = true;
+      await api(`/api/jobs/${encodeURIComponent(stop.dataset.stop)}`, { method: "DELETE" }).catch(() => {});
+      refreshStatus();
+    } else if (open) {
+      els.statusPanel.close();
+      openReport(open.dataset.open);
+    }
+  });
 
   checkHealth();
   loadHistory();
-  setInterval(checkHealth, 30000);
+  setInterval(checkHealth, 10000);
 })();

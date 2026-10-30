@@ -30,6 +30,13 @@ cookie-web is a single Rust binary: an HTTP API, a built-in web GUI and a CLI. I
 - **Small-model friendly** — seeded searches, budgets, query-focused excerpts, deterministic fallbacks,
   JSON tool protocol for models without native tool calling.
 - **Integrates anywhere** — blocking JSON, Server-Sent Events, or async jobs; reports saved as `.md` files.
+- **A service with a contract** — jobs take turns in a first-come-first-served queue; any job can be paused (the model
+  stops at once and the next job runs), resumed or cancelled, from the website or the API. `/api/manifest` states
+  the limits, the time bound and the observed latency per depth.
+- **Sign-in and status** — set a key/password and the website asks for it; a live status view shows running, paused
+  and queued jobs, the model, which search engines work, and the watchdog's view.
+- **Always know if it's up** — a separate watchdog service (`cookie-watch`) answers `/watch/status` even when cookie-web
+  is down; systemd restarts it if it crashes *or hangs*.
 - **Follow-ups** — ask more about an answer (`@3` = about source 3) without starting over; citation numbers stay the
   same. Every source's full text (plain text, Markdown or JSON) and images are available from the report.
 
@@ -39,25 +46,20 @@ cookie-web is a single Rust binary: an HTTP API, a built-in web GUI and a CLI. I
 
 ```bash
 git clone https://github.com/microserv-net/cookie-web && cd cookie-web
-./scripts/setup-ubuntu.sh            # Ollama + qwen3:4b-instruct, then cookie-web as a service
+./scripts/setup-ubuntu.sh --password 'a long passphrase'      # add --domain/--email for HTTPS
 ```
 
-That installs and tunes Ollama, pulls the model, builds cookie-web and starts it under systemd on port 8765
-with a generated API key (printed at the end). The two halves also run on their own:
-
-| script | what it does |
-|--------|--------------|
-| `scripts/install-ollama.sh` | checks the machine (RAM, disk, AVX2), installs Ollama, applies the memory tuning, pulls the model(s) with retries, verifies tool calling, test-loads the model |
-| `scripts/install-cookie-web.sh` | builds (or takes `--binary`), creates the `cookie` user, `/etc/cookie-web.env` and the systemd service, starts it and checks `/api/health` |
-
-Useful options: `--model NAME`, `--fast-model NAME`, `--local` (this machine only, no key), `--port N`,
-`--binary PATH` (skip compiling on a slow box), `--open-firewall`. All scripts are safe to re-run; `--help` lists everything.
+That installs the build tools and Rust, installs and tunes Ollama with both models, builds cookie-web and its
+watchdog and runs them under systemd, puts nginx in front, and turns on the firewall (SSH + 80/443). Open
+`http://<server IP>/` and sign in. Every step is its own script too, and all are safe to re-run —
+**[docs/DEPLOY.md](docs/DEPLOY.md)** has the details.
 
 ### Manually
 
 ```bash
 # 1. A model (any Ollama model works; tool-calling ones work best)
-ollama pull qwen3:4b-instruct   # 2.5 GB — see docs/HARDWARE.md
+ollama pull qwen3:4b-instruct   # 2.5 GB, writes the answers — see docs/HARDWARE.md
+ollama pull qwen3:1.7b          # 1.4 GB, the fast model for small jobs (optional; set OLLAMA_MAX_LOADED_MODELS=2)
 
 # 2. Build & run
 cargo run --release             # serves on port 8765 on all interfaces (0.0.0.0)
@@ -85,6 +87,7 @@ cargo run --release -- source <report-id> 2 --text   # full text of source [2]
 ```bash
 docker compose up -d
 docker compose exec ollama ollama pull qwen3:4b-instruct
+docker compose exec ollama ollama pull qwen3:1.7b
 ```
 
 ## Configuration
@@ -96,20 +99,24 @@ Environment variables (a `.env` file is read too — see [`.env.example`](.env.e
 | `COOKIE_HOST` / `COOKIE_PORT` | `0.0.0.0` / `8765` | listen address (`0.0.0.0` = reachable from the network; `127.0.0.1` = this machine only). On a VPS, also set `COOKIE_API_KEY` |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | |
 | `COOKIE_MODEL` | `qwen3:4b-instruct` | main model (agent + writer) |
-| `COOKIE_FAST_MODEL` | = `COOKIE_MODEL` | optional smaller model for triage, planning, notes |
+| `COOKIE_FAST_MODEL` | `qwen3:1.7b` | small model for the small jobs (triage, query rewriting, fact-check verdicts, notes); `none` = the main model does everything. Used only if pulled and Ollama can keep both loaded |
+| `COOKIE_FAST_NUM_CTX` | `4096` | the fast model's context window (its jobs are small) |
 | `COOKIE_THINK` | `false` | let thinking models think while writing (slower, sometimes better) |
 | `COOKIE_NUM_CTX` | `8192` | context window; all prompts are sized to fit it |
 | `COOKIE_NUM_THREAD` | — | CPU threads the model may use (default: all cores; see [why the CPU sits at 100%](docs/HARDWARE.md#why-the-cpu-sits-at-100-and-when-it-shouldnt)) |
 | `COOKIE_KEEP_ALIVE` | `-1` | keep the model loaded forever |
 | `COOKIE_WARMUP` | `true` | load the model when the server starts |
-| `COOKIE_AGENT_MODE` | `auto` | `pipeline` = no model-driven tool rounds (faster on slow CPUs / tiny models) |
+| `COOKIE_AGENT_MODE` | `pipeline` | `pipeline`: code researches, the main model writes once (fast). `agent`: the model may also run extra tool rounds (slower) |
 | `SEARXNG_URL` | — | e.g. `http://localhost:8888` (recommended) |
 | `BRAVE_API_KEY` / `TAVILY_API_KEY` / `OLLAMA_API_KEY` | — | optional search APIs |
 | `COOKIE_SEARCH_MODE` | `fallback` | or `fusion` (query all backends, merge rankings) |
 | `COOKIE_DISABLE_SCRAPERS` | `false` | drop the keyless scrapers (DuckDuckGo, Bing, Mojeek) |
 | `COOKIE_REPORTS_DIR` | `reports` | where `.md` reports are saved |
-| `COOKIE_API_KEY` | — | require `Authorization: Bearer …` on the API |
+| `COOKIE_API_KEY` | — | protects the API (`Authorization: Bearer …`) and the website (it is the password unless `COOKIE_PASSWORD` is set) |
+| `COOKIE_PASSWORD` | — | a separate password for the website sign-in (also accepted by the API) |
 | `COOKIE_MAX_CONCURRENT` | `1` | parallel research jobs (others queue) |
+| `COOKIE_MAX_QUEUE` | `25` | jobs allowed to wait; past it new requests get `503` + `Retry-After` |
+| `COOKIE_WATCH_URL` | — | the watchdog to send heartbeats to (the installer sets `http://127.0.0.1:8790`); see [DEPLOY.md](docs/DEPLOY.md#watchdog-settings) |
 | `COOKIE_ALLOW_PRIVATE_URLS` | `false` | allow reading LAN/localhost pages |
 | `COOKIE_JOB_TIMEOUT_SECS` | `1800` | hard limit per research job (it fails cleanly instead of hanging) |
 | `COOKIE_TIME_SCALE` | `1.0` | scales the per-depth research time budgets (e.g. `2` on a slow CPU, `0.5` on a GPU) |
@@ -132,11 +139,18 @@ Full reference with examples: **[docs/API.md](docs/API.md)**. In short:
 |----------|---|
 | `POST /api/research` | blocking → `ResearchResult` JSON (or `?format=markdown`) |
 | `POST /api/research/stream` | Server-Sent Events: triage, tool calls, sources, tokens, done |
-| `POST /api/jobs` → `GET /api/jobs/{id}` (+`/events?from=n`) · `DELETE /api/jobs/{id}` | async jobs, resumable streams, cancel |
+| `POST /api/jobs` → `GET /api/jobs/{id}` (+`/events?from=n`) | async jobs, resumable streams, place in the queue |
+| `POST /api/jobs/{id}/pause` · `/resume` · `/cancel` (or `DELETE`) | pause (frees the model for the next job), resume (front of the line), cancel |
 | `GET /api/reports[/{id}[/markdown]]` | saved reports |
 | `POST /api/reports/{id}/ask` | follow-up question on a report (`@3` = about source 3) |
 | `GET /api/reports/{id}/sources/{n}[/images/{k}]` · `/content` | a source's full content (json/markdown/text) and images; all sources at once |
-| `GET /api/health` · `/api/manifest` · `/api/tools` | introspection |
+| `GET /api/health` · `/api/manifest` (with the service `contract`) · `/api/tools` | introspection |
+| `GET /api/status` · `/api/status/stream` | live status in one call (queue, jobs in order, model, engines, watchdog), or pushed every few seconds |
+| `GET /watch/status` | always-on up/down status from the watchdog (200 / 503) |
+
+To try the API from another machine, open **[`client/console.html`](client/README.md)** in a browser: set the server
+and API key, and it shows the live queue and status, a form for every endpoint, and the full request and response of
+every call.
 
 Send an `Idempotency-Key` header and a retried request reattaches to the same job instead of starting another.
 

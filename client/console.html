@@ -1,0 +1,798 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cookie-web console</title>
+<style>
+:root {
+  --bg: #f7f1e8; --panel: #fffaf2; --ink: #2b1d14; --muted: #7b6656; --line: #e6d8c5;
+  --accent: #b5652a; --accent-ink: #fff7ee; --chip: #f0e3d0; --code: #f2e8da;
+  --ok: #4f8a3c; --warn: #c58a1d; --err: #b8412f; --info: #3b6ea8;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #17110d; --panel: #201813; --ink: #f1e6d8; --muted: #a8927f; --line: #3a2c22;
+    --accent: #e0914d; --accent-ink: #1b120c; --chip: #2c2119; --code: #2a1f18; --info: #7aa7dd; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); display: flex; flex-direction: column; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 5px 12px; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button.small { padding: 2px 9px; font-size: 12px; }
+button:disabled { opacity: .5; cursor: default; }
+input, select, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; min-width: 0; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+textarea { font-family: var(--mono); font-size: 12.5px; width: 100%; resize: vertical; }
+code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
+pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+
+/* ---------- top bar ---------- */
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.brand { font: 600 18px Georgia, serif; white-space: nowrap; margin-right: 6px; }
+.brand b { color: var(--accent); }
+#conn { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex: 1; }
+#conn label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+#base { width: 230px; }
+#key { width: 220px; }
+#watch-url { width: 200px; }
+.pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 999px; background: var(--chip); font-size: 12.5px; white-space: nowrap; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.s-online .dot, .s-ok .dot { background: var(--ok); }
+.s-degraded .dot { background: var(--warn); }
+.s-offline .dot, .s-unresponsive .dot, .s-down .dot { background: var(--err); }
+
+/* ---------- layout ---------- */
+main { flex: 1; display: grid; grid-template-columns: 340px minmax(0, 1fr) minmax(0, 420px); min-height: 0; }
+main > section { min-height: 0; overflow-y: auto; padding: 14px 16px; border-right: 1px solid var(--line); }
+main > section:last-child { border-right: 0; }
+h2 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin: 16px 0 8px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+h2:first-child { margin-top: 0; }
+h2 .grow { flex: 1; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
+.chip { display: inline-block; padding: 0 8px; border-radius: 999px; background: var(--chip); font-size: 11.5px; line-height: 19px; white-space: nowrap; }
+.c-running { background: var(--accent); color: var(--accent-ink); }
+.c-paused { background: #f5e3bd; color: #6b4a0c; }
+.c-done, .c-2 { background: #e3efd9; color: #2f5a22; }
+.c-error, .c-cancelled, .c-4, .c-5 { background: #f3d6cb; color: #7a2c18; }
+.c-3 { background: #dfe8f3; color: #23466e; }
+.c-sse { background: #e2dcf2; color: #46307a; }
+@media (prefers-color-scheme: dark) {
+  .c-paused { background: #4a3a17; color: #f3dca5; } .c-done, .c-2 { background: #26391e; color: #bfe0ad; }
+  .c-error, .c-cancelled, .c-4, .c-5 { background: #4a231a; color: #f1b9a8; } .c-3 { background: #1f2e40; color: #b9d0ec; }
+  .c-sse { background: #2f2645; color: #cdbff0; }
+}
+.jobs { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.job { border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px; background: var(--panel); }
+.job.running { border-left: 3px solid var(--accent); }
+.job.paused { border-left: 3px solid var(--warn); }
+.job-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.job-q { font-weight: 500; overflow-wrap: anywhere; margin: 3px 0 1px; }
+.job-acts { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 5px; }
+.empty { color: var(--muted); font-size: 13px; padding: 4px 0; }
+
+/* explorer */
+.ep-list { display: grid; gap: 2px; }
+.ep-group { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 10px 0 3px; }
+.ep { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 7px; cursor: pointer; border: 1px solid transparent; }
+.ep:hover { background: var(--chip); }
+.ep.active { background: var(--chip); border-color: var(--line); }
+.verb { font: 600 10.5px var(--mono); width: 50px; text-align: center; border-radius: 5px; padding: 1px 0; flex: none; }
+.v-GET { background: #dfe8f3; color: #23466e; } .v-POST { background: #e3efd9; color: #2f5a22; } .v-DELETE { background: #f3d6cb; color: #7a2c18; }
+@media (prefers-color-scheme: dark) { .v-GET { background: #1f2e40; color: #b9d0ec; } .v-POST { background: #26391e; color: #bfe0ad; } .v-DELETE { background: #4a231a; color: #f1b9a8; } }
+.ep-path { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+#explorer-grid { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 16px; }
+#form h3 { margin: 0 0 2px; font-size: 16px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#form .desc { color: var(--muted); margin: 0 0 10px; }
+.field { display: grid; grid-template-columns: 130px 1fr; gap: 8px; align-items: center; margin: 6px 0; }
+.field label { font-family: var(--mono); font-size: 12.5px; }
+.field label small { display: block; font-family: var(--sans); color: var(--muted); }
+.send-row { display: flex; gap: 8px; align-items: center; margin: 10px 0 4px; flex-wrap: wrap; }
+.url-preview { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+
+/* exchange view (request + response) */
+.xch { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-top: 12px; overflow: hidden; }
+.xch-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.xch-head .grow { flex: 1 1 260px; min-width: 0; }
+.tabs { display: flex; gap: 2px; padding: 4px 6px 0; border-bottom: 1px solid var(--line); }
+.tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 5px 10px; color: var(--muted); }
+.tab.on { color: var(--ink); border-bottom-color: var(--accent); }
+.xch-body { padding: 10px; max-height: 60vh; overflow: auto; }
+.hdrs { display: grid; grid-template-columns: max-content 1fr; gap: 1px 10px; font-family: var(--mono); font-size: 12px; margin-bottom: 8px; }
+.hdrs span:nth-child(odd) { color: var(--muted); }
+.events { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 12px; }
+.events li { border-top: 1px solid var(--line); padding: 3px 0; display: grid; grid-template-columns: 34px 92px 1fr; gap: 8px; }
+.events li:first-child { border-top: 0; }
+.ev-name { font-weight: 600; }
+.ev-token .ev-data { color: var(--muted); }
+.preview { background: var(--code); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; max-height: 260px; overflow: auto; }
+.img-preview { max-width: 100%; border-radius: 8px; border: 1px solid var(--line); }
+
+/* call log */
+#log { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+#log > li { border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+#log summary { list-style: none; cursor: pointer; display: flex; gap: 7px; align-items: center; padding: 6px 9px; }
+#log summary::-webkit-details-marker { display: none; }
+#log .lpath { font-family: var(--mono); font-size: 12px; flex: 1; overflow-wrap: anywhere; }
+#log details[open] summary { border-bottom: 1px solid var(--line); }
+.log-tools { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.log-tools label { display: flex; gap: 5px; align-items: center; font-size: 12px; color: var(--muted); }
+
+.banner { padding: 8px 16px; background: #f3d6cb; color: #7a2c18; font-size: 13px; }
+@media (prefers-color-scheme: dark) { .banner { background: #4a231a; color: #f1b9a8; } }
+
+@media (max-width: 1250px) {
+  main { grid-template-columns: 320px minmax(0, 1fr); }
+  main > section#log-col { grid-column: 1 / -1; border-top: 1px solid var(--line); max-height: none; }
+}
+@media (max-width: 860px) {
+  main { display: block; overflow-y: auto; }
+  main > section { border-right: 0; border-bottom: 1px solid var(--line); overflow: visible; }
+  #explorer-grid { grid-template-columns: 1fr; }
+  .field { grid-template-columns: 1fr; gap: 2px; }
+  #conn { flex-basis: 100%; }
+  #conn label { width: 100%; }
+  #conn label input:not([type=checkbox]) { flex: 1; width: auto; }
+  #conn label:has(#remember) { width: auto; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">cookie<b>-web</b> console</div>
+  <form id="conn" autocomplete="off">
+    <label>Server <input id="base" placeholder="http://203.0.113.5 or http://host:8765" spellcheck="false"></label>
+    <label>API key <input id="key" type="password" placeholder="COOKIE_API_KEY" spellcheck="false"></label>
+    <label title="Only needed when cookie-web is served without nginx (the watchdog is then local to the server)">Watchdog
+      <input id="watch-url" placeholder="(same server, /watch/)" spellcheck="false"></label>
+    <label><input id="remember" type="checkbox"> remember</label>
+    <button class="primary" type="submit">Connect</button>
+  </form>
+  <span id="api-pill" class="pill" title="cookie-web's own status (live /api/status/stream)"><span class="dot"></span><span>API: —</span></span>
+  <span id="watch-pill" class="pill" title="The watchdog's view (/watch/status) — answers even when cookie-web is down"><span class="dot"></span><span>Watchdog: —</span></span>
+</header>
+<div id="banner" class="banner" hidden></div>
+
+<main>
+  <!-- ======================= live status ======================= -->
+  <section id="status-col">
+    <h2><span class="grow">Live status</span><span id="live-age" class="muted small"></span></h2>
+    <div class="card"><dl class="kv" id="svc"><dt>Server</dt><dd class="muted">not connected</dd></dl></div>
+
+    <h2><span class="grow">Queue</span><span id="queue-sum" class="muted small"></span></h2>
+    <ul class="jobs" id="jobs"><li class="empty">No active jobs</li></ul>
+
+    <h2>Recently finished</h2>
+    <ul class="jobs" id="recent"><li class="empty">—</li></ul>
+
+    <h2>Watchdog</h2>
+    <div class="card"><dl class="kv" id="watch"><dt>Status</dt><dd class="muted">—</dd></dl></div>
+
+    <h2>Search engines</h2>
+    <div class="card"><dl class="kv" id="engines"><dt>—</dt><dd></dd></dl></div>
+  </section>
+
+  <!-- ======================= explorer ======================= -->
+  <section id="explorer-col">
+    <h2>API explorer</h2>
+    <div id="explorer-grid">
+      <nav class="ep-list" id="eps"></nav>
+      <div>
+        <div id="form"></div>
+        <div id="result"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= call log ======================= -->
+  <section id="log-col">
+    <h2><span class="grow">Calls</span><button class="small" id="clear-log" type="button">Clear</button></h2>
+    <div class="log-tools">
+      <label><input type="checkbox" id="show-bg"> show background calls (live status, watchdog)</label>
+      <label><input type="checkbox" id="show-key"> show the API key in requests</label>
+    </div>
+    <ul id="log"></ul>
+  </section>
+</main>
+
+<script>
+"use strict";
+(() => {
+  const $ = (s, root = document) => root.querySelector(s);
+  const el = (tag, props = {}, ...kids) => {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) {
+      if (k === "class") n.className = v;
+      else if (k === "dataset") Object.assign(n.dataset, v);
+      else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+      else if (v !== undefined && v !== null && v !== false) n.setAttribute(k, v === true ? "" : v);
+    }
+    for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false) n.append(k instanceof Node ? k : String(k));
+    return n;
+  };
+  const store = {
+    get(k) { try { return localStorage.getItem("cwc." + k) ?? sessionStorage.getItem("cwc." + k); } catch { return null; } },
+    set(k, v, persist) {
+      try {
+        (persist ? localStorage : sessionStorage).setItem("cwc." + k, v);
+        (persist ? sessionStorage : localStorage).removeItem("cwc." + k);
+      } catch {}
+    },
+  };
+  const clock = (ms) => {
+    if (ms == null) return "—";
+    const s = Math.round(ms / 1000);
+    return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+  };
+  const ago = (iso) => iso ? clock(Date.now() - Date.parse(iso)) + " ago" : "—";
+
+  // ------------------------------------------------------------ connection
+  const cfg = { base: "", key: "", watch: "" };
+  function normalizeBase(v) {
+    v = (v || "").trim().replace(/\/+$/, "");
+    if (v && !/^https?:\/\//i.test(v)) v = "http://" + v;
+    return v;
+  }
+  function watchBase() { return normalizeBase(cfg.watch) || cfg.base; }
+
+  // ------------------------------------------------------------ the call log
+  // Every request the console makes goes through call(): what was sent and what came back is kept,
+  // so it can be shown exactly (and copied as curl).
+  let nextId = 1;
+  const calls = [];
+
+  function maskHeaders(h, reveal) {
+    const out = {};
+    for (const [k, v] of Object.entries(h)) out[k] = !reveal && /^authorization$/i.test(k) ? v.replace(/(Bearer\s+).+/, "$1•••••") : v;
+    return out;
+  }
+  function curlOf(c, reveal) {
+    const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+    const parts = ["curl", c.stream ? "-N" : "", c.method !== "GET" ? `-X ${c.method}` : "", q(c.url)];
+    for (const [k, v] of Object.entries(maskHeaders(c.reqHeaders, reveal))) parts.push("-H " + q(`${k}: ${v}`));
+    if (c.reqBody != null) parts.push("-d " + q(c.reqBody));
+    return parts.filter(Boolean).join(" ");
+  }
+
+  async function call(method, path, opts = {}) {
+    const url = (opts.base || cfg.base) + path;
+    const headers = { ...(opts.headers || {}) };
+    if (cfg.key && !opts.noAuth) headers["Authorization"] = "Bearer " + cfg.key;
+    let body;
+    if (opts.body !== undefined && opts.body !== null) {
+      body = typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body, null, 2);
+      headers["Content-Type"] = "application/json";
+    }
+    const c = {
+      id: nextId++, at: new Date(), method, url, path, reqHeaders: headers, reqBody: body ?? null,
+      background: !!opts.background, stream: !!opts.stream, status: null, statusText: "", resHeaders: {},
+      resBody: null, json: undefined, contentType: "", ms: null, error: null, events: [], done: false, listeners: new Set(),
+    };
+    calls.unshift(c);
+    // background polling mustn't push your own calls out of the log
+    if (c.background) {
+      let n = 0;
+      for (let i = 0; i < calls.length; i++) {
+        if (calls[i].background && ++n > 20 && calls[i].done) { calls.splice(i, 1); i--; }
+      }
+    }
+    if (calls.length > 300) calls.length = 300;
+    const t0 = performance.now();
+    try {
+      const resp = await fetch(url, { method, headers, body, signal: opts.signal, cache: "no-store" });
+      c.status = resp.status;
+      c.statusText = resp.statusText;
+      resp.headers.forEach((v, k) => (c.resHeaders[k] = v));
+      c.contentType = resp.headers.get("content-type") || "";
+      if (c.contentType.startsWith("text/event-stream") && resp.ok) {
+        c.ms = Math.round(performance.now() - t0);
+        notify(c);
+        await readSse(resp, c, opts.onEvent);
+      } else if (c.contentType.startsWith("image/")) {
+        const blob = await resp.blob();
+        c.resBody = `(${blob.size} bytes of ${c.contentType})`;
+        c.blobUrl = URL.createObjectURL(blob);
+      } else {
+        c.resBody = await resp.text();
+        if (c.contentType.includes("json")) { try { c.json = JSON.parse(c.resBody); } catch {} }
+      }
+    } catch (e) {
+      c.error = e.name === "AbortError" ? "stopped by you" :
+        `${e.message} — the server is unreachable, or the browser blocked the response (CORS / mixed http+https)`;
+    }
+    if (c.ms == null) c.ms = Math.round(performance.now() - t0);
+    c.done = true;
+    notify(c);
+    return c;
+  }
+
+  // views of a call (explorer, log) redraw when it changes
+  function notify(c) {
+    for (const fn of c.listeners) fn();
+    renderLogSoon(c);
+  }
+
+  async function readSse(resp, c, onEvent) {
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        let event = "message", data = "", id = null;
+        for (const line of chunk.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trimStart();
+          else if (line.startsWith("id:")) id = line.slice(3).trim();
+        }
+        if (!data) continue;
+        let parsed = data;
+        try { parsed = JSON.parse(data); } catch {}
+        const ev = { id, event, data: parsed, raw: data, at: Date.now() };
+        if (!c.background || c.events.length < 1) c.events.push(ev);
+        else c.events[0] = ev; // background streams keep only the latest
+        onEvent && onEvent(ev);
+        notify(c);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ exchange view
+  // Request + response of one call, with tabs. Live-updates while a stream runs.
+  function exchangeView(c, { stoppable } = {}) {
+    const box = el("div", { class: "xch" });
+    let tab = c.stream ? "events" : "response";
+    const reveal = () => $("#show-key").checked;
+    const head = el("div", { class: "xch-head" });
+    const tabs = el("div", { class: "tabs" });
+    const body = el("div", { class: "xch-body" });
+    box.append(head, tabs, body);
+
+    function statusChip() {
+      if (c.error) return el("span", { class: "chip c-5" }, "failed");
+      if (c.status == null) return el("span", { class: "chip" }, "sending…");
+      if (c.stream && !c.done) return el("span", { class: "chip c-sse" }, `${c.status} · streaming`);
+      return el("span", { class: `chip c-${String(c.status)[0]}` }, `${c.status} ${c.statusText || ""}`.trim());
+    }
+    function renderHead() {
+      head.replaceChildren(...[
+        el("span", { class: `verb v-${c.method}` }, c.method),
+        el("span", { class: "ep-path grow" }, c.url),
+        statusChip(),
+        el("span", { class: "muted small" }, c.ms != null ? `${c.ms} ms${c.stream ? " to first byte" : ""}` : ""),
+        stoppable && c.stream && !c.done ? el("button", { class: "small", type: "button", onclick: () => stoppable.abort() }, "Stop") : null,
+        el("button", { class: "small", type: "button", title: "Copy this request as a curl command", onclick: async (e) => {
+          try { await navigator.clipboard.writeText(curlOf(c, reveal())); e.target.textContent = "Copied ✓"; } catch { e.target.textContent = "Copy failed"; }
+          setTimeout(() => (e.target.textContent = "curl"), 1200);
+        } }, "curl"),
+      ].filter(Boolean));
+    }
+    function renderTabs() {
+      const names = c.stream ? ["events", "request", "response"] : ["response", "request"];
+      tabs.replaceChildren(...names.map((n) => el("button", { type: "button", class: "tab" + (n === tab ? " on" : ""), onclick: () => { tab = n; render(); } },
+        n === "events" ? `Events (${c.events.length})` : n[0].toUpperCase() + n.slice(1))));
+    }
+    function headersGrid(h) {
+      const g = el("div", { class: "hdrs" });
+      for (const [k, v] of Object.entries(h)) g.append(el("span", {}, k), el("span", {}, v));
+      return g;
+    }
+    function renderBody() {
+      body.replaceChildren();
+      if (tab === "request") {
+        body.append(el("div", { class: "mono small", style: "margin-bottom:6px" }, `${c.method} ${c.url}`), headersGrid(maskHeaders(c.reqHeaders, reveal())));
+        body.append(c.reqBody != null ? el("pre", { class: "preview" }, c.reqBody) : el("div", { class: "muted small" }, "(no body)"));
+        body.append(el("div", { class: "muted small" }, "curl:"), el("pre", { class: "preview" }, curlOf(c, reveal())));
+        return;
+      }
+      if (tab === "response") {
+        if (c.error) body.append(el("div", { class: "chip c-5", style: "white-space:normal" }, c.error));
+        if (Object.keys(c.resHeaders).length) body.append(headersGrid(c.resHeaders));
+        if (c.blobUrl) body.append(el("img", { class: "img-preview", src: c.blobUrl, alt: "image response" }));
+        if (c.stream) body.append(el("div", { class: "muted small" }, "A stream: see the Events tab (one entry per server-sent event)."));
+        if (c.json !== undefined) {
+          const md = c.json && typeof c.json.markdown === "string" ? c.json.markdown : null;
+          if (md) body.append(el("div", { class: "muted small" }, "markdown:"), el("pre", { class: "preview" }, md), el("div", { class: "muted small" }, "full JSON:"));
+          body.append(el("pre", {}, JSON.stringify(c.json, null, 2)));
+        } else if (c.resBody != null && !c.blobUrl) {
+          body.append(el("pre", {}, c.resBody || "(empty body)"));
+        }
+        return;
+      }
+      // events
+      const text = c.events.filter((e) => e.event === "token").map((e) => e.data.text || "").join("");
+      if (text) body.append(el("div", { class: "muted small" }, "answer so far (token events):"), el("pre", { class: "preview" }, text));
+      const done = c.events.find((e) => e.event === "done");
+      if (done && done.data.result) body.append(el("div", { class: "muted small" }, "final answer (done.result.markdown):"), el("pre", { class: "preview" }, done.data.result.markdown));
+      const list = el("ul", { class: "events" });
+      for (const e of c.events.slice(-400)) {
+        const short = e.event === "status" && e.data && e.data.queue
+          ? `queue: ${e.data.queue.running} running · ${e.data.queue.paused} paused · ${e.data.queue.queued} queued`
+          : e.raw.length > 600 ? e.raw.slice(0, 600) + " …" : e.raw;
+        list.append(el("li", { class: "ev-" + e.event }, el("span", { class: "muted" }, e.id ?? ""), el("span", { class: "ev-name" }, e.event), el("span", { class: "ev-data" }, short)));
+      }
+      if (!c.events.length) list.append(el("li", { class: "muted" }, c.done ? "no events" : "waiting for events…"));
+      body.append(list);
+    }
+    let pending = false;
+    function render() { renderHead(); renderTabs(); renderBody(); }
+    const listener = () => {
+      if (!box.isConnected && box.dataset.shown) { c.listeners.delete(listener); return; }
+      if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; render(); }); }
+    };
+    c.listeners.add(listener);
+    render();
+    requestAnimationFrame(() => (box.dataset.shown = "1"));
+    return box;
+  }
+
+  // ------------------------------------------------------------ call log list
+  // Entries are kept as DOM nodes and only their summary line is redrawn, so an open entry keeps its
+  // tab while a stream is still coming in.
+  const logNodes = new Map();
+  const logDirty = new Set();
+  let logTimer = null;
+  function renderLogSoon(c) {
+    if (c.background && !$("#show-bg").checked) return;
+    logDirty.add(c.id);
+    if (!logTimer) logTimer = setTimeout(renderLog, 200);
+  }
+  function summaryOf(c) {
+    const chip = c.error ? el("span", { class: "chip c-5" }, "ERR")
+      : c.status == null ? el("span", { class: "chip" }, "…")
+      : el("span", { class: `chip ${c.stream && !c.done ? "c-sse" : "c-" + String(c.status)[0]}` }, c.stream && !c.done ? `SSE ${c.events.length}` : c.status);
+    return [el("span", { class: `verb v-${c.method}` }, c.method), el("span", { class: "lpath" }, c.path), chip,
+      el("span", { class: "muted small" }, c.ms != null ? `${c.ms}ms` : ""), el("span", { class: "muted small" }, c.at.toLocaleTimeString())];
+  }
+  function logNode(c) {
+    let li = logNodes.get(c.id);
+    if (!li) {
+      const sum = el("summary");
+      const d = el("details", {}, sum);
+      d.addEventListener("toggle", () => { if (d.open && d.children.length === 1) d.append(exchangeView(c)); });
+      li = el("li", {}, d);
+      logNodes.set(c.id, li);
+      logDirty.add(c.id);
+    }
+    if (logDirty.has(c.id)) li.firstChild.firstChild.replaceChildren(...summaryOf(c));
+    return li;
+  }
+  function renderLog() {
+    logTimer = null;
+    const showBg = $("#show-bg").checked;
+    const visible = calls.filter((c) => showBg || !c.background).slice(0, 80);
+    const ul = $("#log");
+    ul.replaceChildren(...visible.map(logNode));
+    const keep = new Set(calls.map((c) => c.id));
+    for (const id of logNodes.keys()) if (!keep.has(id)) logNodes.delete(id);
+    if (!visible.length) ul.append(el("li", { class: "empty", style: "border:0;background:none" }, "Calls you make appear here, with the full request and response."));
+    logDirty.clear();
+  }
+
+  // ------------------------------------------------------------ endpoint catalog
+  const ID = { name: "id", in: "path", hint: "a job id", list: "jobs" };
+  const RID = { name: "id", in: "path", hint: "a report id", list: "reports" };
+  const N = { name: "n", in: "path", example: "1", hint: "source number" };
+  const RESEARCH_BODY = { query: "VisionQuest", depth: "auto", max_words: 250, save: true };
+  const EPS = [
+    { g: "Status", m: "GET", p: "/api/status", d: "Live status in one call: service, queue, jobs in queue order, model, search engines, latency, watchdog." },
+    { g: "Status", m: "GET", p: "/api/status/stream", sse: true, q: [{ name: "interval", example: "2", hint: "seconds, 1–60" }], d: "The same document pushed every few seconds as `status` events." },
+    { g: "Status", m: "GET", p: "/api/health", d: "Health: model/Ollama, search engines, settings. Without a key: only {status, version}." },
+    { g: "Status", m: "GET", p: "/api/manifest", d: "The agent card: capabilities, input/output, endpoints, and the service contract (limits, latency)." },
+    { g: "Status", m: "GET", p: "/api/tools", d: "The JSON-schema tool specs the model receives." },
+    { g: "Status", m: "GET", p: "/watch/status", watch: true, d: "The watchdog's view: online / degraded / unresponsive / offline, with the reason. Answers even when cookie-web is down (200 up, 503 down)." },
+    { g: "Research", m: "POST", p: "/api/research", body: RESEARCH_BODY, q: [{ name: "format", hint: "markdown = plain Markdown response" }], h: [{ name: "Idempotency-Key", hint: "optional" }], d: "Blocking: waits in the queue, researches, returns the ResearchResult." },
+    { g: "Research", m: "POST", p: "/api/research/stream", sse: true, body: RESEARCH_BODY, h: [{ name: "Idempotency-Key", hint: "optional" }], d: "Same, as server-sent events: triage, tool calls, sources, answer tokens, done." },
+    { g: "Jobs", m: "POST", p: "/api/jobs", body: RESEARCH_BODY, h: [{ name: "Idempotency-Key", hint: "optional; retries reattach" }], d: "Fire and forget: 202 with the job (and its place in the queue)." },
+    { g: "Jobs", m: "GET", p: "/api/jobs", d: "All jobs (newest first), with live progress." },
+    { g: "Jobs", m: "GET", p: "/api/jobs/{id}", params: [ID], d: "One job; includes `result` when done." },
+    { g: "Jobs", m: "GET", p: "/api/jobs/{id}/events", sse: true, params: [ID], q: [{ name: "from", hint: "resume after event n" }], d: "Replay + follow a job's events (safe to reconnect)." },
+    { g: "Jobs", m: "POST", p: "/api/jobs/{id}/pause", params: [ID], d: "Pause a running job: the model stops at once, the next queued job runs." },
+    { g: "Jobs", m: "POST", p: "/api/jobs/{id}/resume", params: [ID], d: "Resume: back to the front of the line, carries on where it stopped." },
+    { g: "Jobs", m: "POST", p: "/api/jobs/{id}/cancel", params: [ID], d: "Cancel a queued, running or paused job." },
+    { g: "Jobs", m: "DELETE", p: "/api/jobs/{id}", params: [ID], d: "Cancel (same as POST …/cancel)." },
+    { g: "Reports", m: "GET", p: "/api/reports", q: [{ name: "limit", example: "20" }], d: "Saved reports, newest first." },
+    { g: "Reports", m: "GET", p: "/api/reports/{id}", params: [RID], q: [{ name: "format", hint: "markdown" }], d: "A saved report (ResearchResult)." },
+    { g: "Reports", m: "GET", p: "/api/reports/{id}/markdown", params: [RID], d: "The saved .md file." },
+    { g: "Reports", m: "POST", p: "/api/reports/{id}/ask", params: [RID], body: { question: "tell me more about @1", web: "auto", max_words: 200 }, d: "A follow-up question on a report (blocking). @3 = about source 3." },
+    { g: "Reports", m: "DELETE", p: "/api/reports/{id}", params: [RID], d: "Delete a report and its stored pages." },
+    { g: "Sources", m: "GET", p: "/api/reports/{id}/sources", params: [RID], d: "A report's numbered sources (stored? images?)." },
+    { g: "Sources", m: "GET", p: "/api/reports/{id}/sources/{n}", params: [RID, N], q: [{ name: "format", hint: "json | markdown | text" }, { name: "focus", hint: "only passages about…" }, { name: "max_chars" }], d: "The full content of one source." },
+    { g: "Sources", m: "GET", p: "/api/reports/{id}/sources/{n}/images/{k}", params: [RID, N, { name: "k", in: "path", example: "1", hint: "image number" }], d: "One of the source's images (bytes)." },
+    { g: "Sources", m: "GET", p: "/api/reports/{id}/content", params: [RID], q: [{ name: "sources", hint: "e.g. 1,3" }, { name: "format", hint: "json | markdown | text" }, { name: "focus" }], d: "All cited/read sources' content in one document." },
+  ];
+  const known = { jobs: [], reports: [] };
+
+  function renderEndpointList() {
+    const nav = $("#eps");
+    nav.replaceChildren();
+    let group = "";
+    EPS.forEach((ep, i) => {
+      if (ep.g !== group) { group = ep.g; nav.append(el("div", { class: "ep-group" }, group)); }
+      nav.append(el("div", { class: "ep", dataset: { i }, onclick: () => selectEndpoint(i) },
+        el("span", { class: `verb v-${ep.m}` }, ep.m), el("span", { class: "ep-path" }, ep.p)));
+    });
+  }
+
+  let current = null;
+  let currentAbort = null;
+  function selectEndpoint(i, prefill = {}) {
+    current = EPS[i];
+    document.querySelectorAll(".ep").forEach((n) => n.classList.toggle("active", +n.dataset.i === i));
+    const ep = current;
+    const f = $("#form");
+    f.replaceChildren(
+      el("h3", {}, el("span", { class: `verb v-${ep.m}` }, ep.m), el("span", { class: "ep-path" }, ep.p), ep.sse ? el("span", { class: "chip c-sse" }, "stream") : null),
+      el("p", { class: "desc" }, ep.d),
+    );
+    const inputs = {};
+    const field = (p, where) => {
+      const id = `f-${where}-${p.name}`;
+      const input = el("input", { id, placeholder: p.hint || "", value: prefill[p.name] ?? p.example ?? "", spellcheck: "false", list: p.list ? `dl-${p.list}` : null });
+      inputs[`${where}:${p.name}`] = input;
+      input.addEventListener("input", updatePreview);
+      f.append(el("div", { class: "field" }, el("label", { for: id }, p.name, el("small", {}, where)), input));
+    };
+    (ep.params || []).forEach((p) => field(p, "path"));
+    (ep.q || []).forEach((p) => field(p, "query"));
+    (ep.h || []).forEach((p) => field(p, "header"));
+    let bodyBox = null;
+    if (ep.body) {
+      bodyBox = el("textarea", { rows: 7, spellcheck: "false" });
+      bodyBox.value = JSON.stringify({ ...ep.body, ...(prefill.body || {}) }, null, 2);
+      f.append(el("div", { class: "muted small", style: "margin-top:8px" }, "JSON body"), bodyBox);
+    }
+    const preview = el("div", { class: "url-preview" });
+    const send = el("button", { class: "primary", type: "submit" }, ep.sse ? "Open stream" : "Send");
+    f.append(el("div", { class: "send-row" }, send, preview));
+    function build() {
+      let path = ep.p;
+      for (const p of ep.params || []) path = path.replace(`{${p.name}}`, encodeURIComponent(inputs[`path:${p.name}`].value.trim()));
+      const qs = new URLSearchParams();
+      for (const p of ep.q || []) { const v = inputs[`query:${p.name}`].value.trim(); if (v) qs.set(p.name, v); }
+      const headers = {};
+      for (const p of ep.h || []) { const v = inputs[`header:${p.name}`].value.trim(); if (v) headers[p.name] = v; }
+      return { path: path + (qs.toString() ? "?" + qs : ""), headers };
+    }
+    function updatePreview() { preview.textContent = `${ep.m} ${(ep.watch ? watchBase() : cfg.base) || "<server>"}${build().path}`; }
+    updatePreview();
+    send.addEventListener("click", async (e) => {
+      e.preventDefault();
+      if (!cfg.base) { banner("Set the server address first."); return; }
+      const { path, headers } = build();
+      const missing = (ep.params || []).filter((p) => !inputs[`path:${p.name}`].value.trim()).map((p) => p.name);
+      if (missing.length) { banner(`Fill in ${missing.join(", ")} first.`); return; }
+      let body;
+      if (bodyBox) {
+        try { body = JSON.stringify(JSON.parse(bodyBox.value), null, 2); } catch (err) { banner("The JSON body isn't valid: " + err.message); return; }
+      }
+      banner();
+      if (currentAbort) currentAbort.abort();
+      const abort = (currentAbort = new AbortController());
+      const holder = $("#result");
+      const cPromise = call(ep.m, path, { body, headers, stream: ep.sse, signal: abort.signal, base: ep.watch ? watchBase() : undefined });
+      // the call object exists as soon as call() starts; show it right away
+      const c = calls[0];
+      holder.replaceChildren(exchangeView(c, { stoppable: abort }));
+      const done = await cPromise;
+      if (done.json && done.json.id && /^job_/.test(done.json.id)) addKnown("jobs", done.json.id);
+      if (done.json && done.json.report_id) addKnown("reports", done.json.report_id);
+      if (done.json && Array.isArray(done.json.reports)) done.json.reports.forEach((r) => addKnown("reports", r.id));
+      if (done.json && done.json.result && done.json.result.id) addKnown("reports", done.json.result.id);
+      if (done.json && done.json.query && done.json.markdown && done.json.id) addKnown("reports", done.json.id);
+      const fin = done.events.find((e) => e.event === "done");
+      if (fin && fin.data.result) addKnown("reports", fin.data.result.id);
+      const st = done.events.find((e) => e.event === "started");
+      if (st) addKnown("jobs", st.data.job_id);
+    });
+  }
+
+  function addKnown(kind, id) {
+    if (!id) return;
+    const list = known[kind];
+    if (!list.includes(id)) list.unshift(id);
+    list.length = Math.min(list.length, 50);
+    const dl = $(`#dl-${kind}`);
+    dl.replaceChildren(...list.map((v) => el("option", { value: v })));
+  }
+
+  function openEndpoint(method, path, prefill) {
+    const i = EPS.findIndex((e) => e.m === method && e.p === path);
+    if (i >= 0) { selectEndpoint(i, prefill); $("#explorer-col").scrollIntoView({ behavior: "smooth", block: "start" }); }
+  }
+
+  // ------------------------------------------------------------ live status
+  let liveAbort = null;
+  let lastLive = null;
+  let liveRetry = 0;
+
+  async function startLive() {
+    if (liveAbort) liveAbort.abort();
+    const abort = (liveAbort = new AbortController());
+    while (!abort.signal.aborted && cfg.base) {
+      const c = await call("GET", "/api/status/stream?interval=2", {
+        background: true, stream: true, signal: abort.signal,
+        onEvent: (ev) => { if (ev.event === "status") { liveRetry = 0; lastLive = Date.now(); renderLive(ev.data); } },
+      });
+      if (abort.signal.aborted) return;
+      if (c.status === 401) { setPill("#api-pill", "down", "API: wrong key"); banner("The server says the API key is wrong (401)."); return; }
+      if (c.status === 404) {
+        // an older cookie-web without /api/status/stream: poll /api/jobs + /api/health instead
+        await pollFallback(abort);
+        return;
+      }
+      setPill("#api-pill", "down", c.status ? `API: ${c.status}` : "API: unreachable");
+      liveRetry = Math.min(liveRetry + 1, 5);
+      await new Promise((r) => setTimeout(r, 1000 * 2 ** liveRetry));
+    }
+  }
+
+  async function pollFallback(abort) {
+    while (!abort.signal.aborted) {
+      const [h, j] = await Promise.all([call("GET", "/api/health", { background: true }), call("GET", "/api/jobs", { background: true })]);
+      if (h.json && j.json) {
+        lastLive = Date.now();
+        const jobs = j.json.jobs || [];
+        renderLive({
+          status: h.json.status, service: { version: h.json.version, uptime_secs: h.json.uptime_secs },
+          queue: { running: h.json.jobs_running, queued: h.json.jobs_queued, paused: h.json.jobs_paused || 0, max_concurrent: h.json.max_concurrent },
+          jobs: jobs.filter((x) => ["running", "paused", "queued"].includes(x.status)),
+          recent_jobs: jobs.filter((x) => !["running", "paused", "queued"].includes(x.status)).slice(0, 10),
+          model: { main: h.json.model && h.json.model.model, reachable: h.json.model && h.json.model.reachable, available: h.json.model && h.json.model.available },
+          search: h.json.search_health || [],
+        });
+      } else setPill("#api-pill", "down", "API: unreachable");
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+
+  function setPill(sel, state, text) {
+    const p = $(sel);
+    p.className = "pill s-" + state;
+    p.lastElementChild.textContent = text;
+  }
+
+  function jobItem(j) {
+    const id = j.id;
+    const acts = [];
+    const btn = (label, fn, title) => el("button", { class: "small", type: "button", title, onclick: fn }, label);
+    const act = (what) => async () => { await call("POST", `/api/jobs/${encodeURIComponent(id)}/${what}`); };
+    if (j.status === "running" && j.pause !== "pausing") acts.push(btn("Pause", act("pause"), "POST /api/jobs/{id}/pause"));
+    if (j.status === "paused" && j.pause !== "resuming") acts.push(btn("Resume", act("resume"), "POST /api/jobs/{id}/resume"));
+    if (["running", "paused", "queued"].includes(j.status)) acts.push(btn("Cancel", act("cancel"), "POST /api/jobs/{id}/cancel"));
+    acts.push(btn("Events", () => openEndpoint("GET", "/api/jobs/{id}/events", { id }), "follow its event stream in the explorer"));
+    acts.push(btn("Details", () => openEndpoint("GET", "/api/jobs/{id}", { id }), "GET /api/jobs/{id}"));
+    if (j.report_id) acts.push(btn("Report", () => openEndpoint("GET", "/api/reports/{id}", { id: j.report_id }), "GET /api/reports/{id}"));
+    const time = j.status === "queued" ? `#${j.position ?? "?"} in line · waiting ${clock(j.queued_ms)}`
+      : j.status === "paused" ? `paused · worked ${clock(j.running_ms)}`
+      : j.status === "running" ? `working ${clock(j.running_ms)}` : `took ${clock(j.running_ms)}`;
+    const stage = j.pause === "pausing" ? "pausing…" : j.pause === "resuming" ? "resuming — next in line" : j.status === "done"
+      ? `${j.sources} sources · ${j.tool_calls} tool calls${j.degraded ? " · degraded" : ""}` : (j.error || j.stage || "");
+    addKnown("jobs", id);
+    if (j.report_id) addKnown("reports", j.report_id);
+    return el("li", { class: "job " + j.status },
+      el("div", { class: "job-top" }, el("span", { class: "chip c-" + j.status }, j.status), j.depth ? el("span", { class: "chip" }, j.depth) : null,
+        el("span", { class: "mono small" }, time)),
+      el("div", { class: "job-q" }, j.query),
+      el("div", { class: "muted small" }, stage),
+      el("div", { class: "muted small mono" }, id),
+      el("div", { class: "job-acts" }, acts));
+  }
+
+  function renderLive(s) {
+    const svc = s.service || {};
+    const m = s.model || {};
+    const q = s.queue || {};
+    setPill("#api-pill", s.status === "ok" ? "ok" : "degraded", `API: ${s.status}`);
+    const kv = (k, v) => [el("dt", {}, k), el("dd", {}, v)];
+    $("#svc").replaceChildren(
+      ...kv("Server", cfg.base),
+      ...kv("Version", `${svc.version ?? "—"}${svc.pid ? ` · pid ${svc.pid}` : ""}`),
+      ...kv("Up", clock((svc.uptime_secs ?? 0) * 1000)),
+      ...kv("Model", `${m.main ?? "—"}${m.fast ? ` + fast ${m.fast}${m.fast_active === false ? " (off)" : ""}` : ""}`),
+      ...kv("Ollama", m.reachable === false ? "unreachable" : m.available === false ? (m.error || "model missing") : m.loaded ? `loaded${m.memory_bytes ? ` · ${(m.memory_bytes / 1e9).toFixed(2)} GB` : ""}` : "ok"),
+      ...(s.latency && Object.keys(s.latency).length ? kv("Latency", Object.entries(s.latency).map(([d, l]) => `${d} ~${clock(l.median_ms)}`).join(" · ")) : []),
+    );
+    $("#queue-sum").textContent = `${q.running ?? 0} running · ${q.paused ?? 0} paused · ${q.queued ?? 0} queued${q.max_concurrent ? ` · ${q.max_concurrent} at a time` : ""}`;
+    const jobs = s.jobs || [];
+    $("#jobs").replaceChildren(...(jobs.length ? jobs.map(jobItem) : [el("li", { class: "empty" }, "No active jobs — the model is idle")]));
+    const recent = s.recent_jobs || [];
+    $("#recent").replaceChildren(...(recent.length ? recent.slice(0, 6).map(jobItem) : [el("li", { class: "empty" }, "—")]));
+    const eng = s.search || [];
+    $("#engines").replaceChildren(...(eng.length ? eng.flatMap((b) => kv(b.name, b.cooldown_secs ? `resting ${clock(b.cooldown_secs * 1000)} · ${b.last_error || ""}` : `ready · ${b.ok ?? 0} ok, ${b.failures ?? 0} failed`)) : kv("—", "")));
+    if (s.watchdog && s.watchdog.status) renderWatch(s.watchdog, "via cookie-web");
+  }
+
+  // The watchdog is polled directly too, so its status shows even when cookie-web is down.
+  let watchTimer = null;
+  async function pollWatch() {
+    clearTimeout(watchTimer);
+    if (!cfg.base) return;
+    const c = await call("GET", "/watch/status", { background: true, base: watchBase() });
+    if (c.json && c.json.status) renderWatch(c.json, "direct");
+    else {
+      setPill("#watch-pill", "down", c.status === 404 ? "Watchdog: not here" : "Watchdog: unreachable");
+      $("#watch").replaceChildren(el("dt", {}, "Status"), el("dd", { class: "muted" },
+        c.status === 404 ? "no /watch/ on this server (no nginx? set the watchdog URL)" : "not reachable from here"));
+    }
+    watchTimer = setTimeout(pollWatch, 5000);
+  }
+
+  function renderWatch(w, via) {
+    const st = w.status;
+    setPill("#watch-pill", st, `Watchdog: ${st}`);
+    const d = w.detail || {};
+    const kv = (k, v) => [el("dt", {}, k), el("dd", {}, v)];
+    $("#watch").replaceChildren(
+      ...kv("Status", `${st}${w.reason ? ` — ${w.reason}` : ""}`),
+      ...kv("Since", ago(w.since)),
+      ...(d.pid ? kv("Process", `pid ${d.pid}${d.last_beat_secs_ago != null ? ` · heartbeat ${d.last_beat_secs_ago}s ago` : ""}`) : []),
+      ...(d.latency_ms != null ? kv("Health check", `${d.latency_ms} ms`) : []),
+      ...kv("Checked", `${ago(w.checked_at)} (${via})`),
+      ...((w.incidents || []).slice(0, 4).flatMap((i) => kv(new Date(i.at).toLocaleTimeString(), `→ ${i.to}: ${i.reason}`))),
+    );
+    if (st !== "online" && st !== "degraded") banner(`cookie-web is ${st}: ${w.reason || ""}`);
+    else if ($("#banner").textContent.startsWith("cookie-web is")) banner();
+  }
+
+  setInterval(() => { $("#live-age").textContent = lastLive ? `updated ${clock(Date.now() - lastLive)} ago` : ""; }, 1000);
+
+  function banner(msg) {
+    const b = $("#banner");
+    b.hidden = !msg;
+    b.textContent = msg || "";
+  }
+
+  // ------------------------------------------------------------ wiring
+  function connect() {
+    cfg.base = normalizeBase($("#base").value);
+    cfg.key = $("#key").value.trim();
+    cfg.watch = $("#watch-url").value.trim();
+    const persist = $("#remember").checked;
+    store.set("base", cfg.base, persist);
+    store.set("key", cfg.key, persist);
+    store.set("watch", cfg.watch, persist);
+    store.set("remember", persist ? "1" : "", true);
+    banner();
+    if (!cfg.base) { banner("Enter the server address (IP or domain, with :port if cookie-web is served directly)."); return; }
+    if (location.protocol === "https:" && cfg.base.startsWith("http:")) banner("This page is https but the server is http: the browser will block the calls. Open the console over http or from the file.");
+    lastLive = null;
+    startLive();
+    pollWatch();
+    if (current) selectEndpoint(EPS.indexOf(current));
+  }
+
+  $("#conn").addEventListener("submit", (e) => { e.preventDefault(); connect(); });
+  $("#clear-log").addEventListener("click", () => { calls.length = 0; logNodes.clear(); renderLog(); });
+  $("#show-bg").addEventListener("change", renderLog);
+  $("#show-key").addEventListener("change", () => { logNodes.clear(); renderLog(); });
+  document.body.append(el("datalist", { id: "dl-jobs" }), el("datalist", { id: "dl-reports" }));
+
+  renderEndpointList();
+  selectEndpoint(0);
+  renderLog();
+  $("#remember").checked = store.get("remember") === "1";
+  $("#base").value = store.get("base") || "";
+  $("#key").value = store.get("key") || "";
+  $("#watch-url").value = store.get("watch") || "";
+  if ($("#base").value) connect();
+})();
+</script>
+</body>
+</html>

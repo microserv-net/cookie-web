@@ -26,7 +26,7 @@ use crate::{
     sources::{SourceRegistry, normalize_url},
     tools::{
         ToolCtx,
-        extract::{Page, focus_excerpt, without_images},
+        extract::{Page, focus_excerpt, for_model},
     },
 };
 
@@ -130,6 +130,7 @@ pub async fn run(
     started: Instant,
     created_at: DateTime<Utc>,
     today: String,
+    control: std::sync::Arc<crate::control::Control>,
 ) -> anyhow::Result<ResearchResult> {
     let report_id = req.report.clone().unwrap_or_default();
     let parent = engine
@@ -184,7 +185,7 @@ pub async fn run(
         "follow-up on the earlier report".into()
     };
     triage.decided_by = if forced.is_some() { "user".into() } else { "follow-up".into() };
-    let profile = triage.depth.profile().fit_to_context(engine.cfg.num_ctx);
+    let profile = triage.depth.profile().limit_words(req.max_words).fit_to_context(engine.cfg.num_ctx);
     let gather = Duration::from_secs_f64(profile.gather_secs as f64 * engine.cfg.time_scale)
         .min(engine.cfg.job_timeout.mul_f64(0.6));
 
@@ -206,6 +207,7 @@ pub async fn run(
             parent.query.replace('"', "'")
         )),
         title: Some(query.trim().to_string()),
+        control,
     };
     if !named || web_mode == WebMode::Always {
         triage.search_query = standalone_query(&run, &parent.query, &question).await;
@@ -235,7 +237,7 @@ pub async fn run(
         let src = parent.sources.iter().find(|s| s.n == n).expect("validated above");
         match page {
             Ok(p) => {
-                let excerpt = focus_excerpt(&without_images(&p.markdown), Some(&focus), profile.page_chars);
+                let excerpt = focus_excerpt(&for_model(&p.markdown, false), Some(&focus), profile.page_chars);
                 if !topic.is_empty() && overlap(&excerpt, &topic) * 2 >= topic.len() {
                     covered = true;
                 }

@@ -30,8 +30,10 @@
   <main>
     <header id="topbar">
       <button id="menu-btn" class="ghost icon" aria-label="Menu">☰</button>
-      <div id="status" class="pill"><span class="dot"></span><span id="status-text">checking…</span></div>
+      <button id="status" class="pill" type="button" title="Status: server, jobs, search engines">
+        <span class="dot"></span><span id="status-text">checking…</span><span id="status-jobs" class="pill-jobs" hidden></span></button>
       <button id="settings-btn" class="ghost icon" aria-label="Settings">⚙</button>
+      <a id="logout-btn" class="ghost btn" href="/logout" hidden>Sign out</a>
     </header>
 
     <section id="welcome">
@@ -78,15 +80,38 @@
         <input type="checkbox" id="follow" checked> ↳ Follow up on this answer</label>
       <div class="input-row">
         <textarea id="q" rows="1" placeholder="Ask anything… (Enter to send, Shift+Enter for a new line)" autofocus></textarea>
+        <button id="pause" type="button" class="ghost" hidden title="Pause this research: the model stops and the next queued job can run. Resume carries on where it stopped.">Pause</button>
         <button id="go" type="submit">Search</button>
       </div>
     </form>
   </main>
 
+  <dialog id="status-panel" class="panel">
+    <header class="panel-head"><h3>Status</h3>
+      <span id="st-updated" class="muted small"></span>
+      <button id="status-close" class="ghost icon" aria-label="Close">✕</button></header>
+    <section>
+      <h4>Jobs</h4>
+      <ul id="st-jobs" class="st-jobs"><li class="muted">No jobs yet</li></ul>
+    </section>
+    <section id="st-watch-wrap" hidden>
+      <h4>Watchdog</h4>
+      <dl id="st-watch" class="st-grid"></dl>
+    </section>
+    <section>
+      <h4>Server &amp; model</h4>
+      <dl id="st-server" class="st-grid"></dl>
+    </section>
+    <section>
+      <h4>Search engines</h4>
+      <table id="st-search" class="st-table"></table>
+    </section>
+  </dialog>
+
   <dialog id="settings">
     <form method="dialog">
       <h3>Settings</h3>
-      <label>API key <small class="muted">(only if the server sets COOKIE_API_KEY)</small>
+      <label>API key <small class="muted">(not needed when you are signed in)</small>
         <input id="api-key" type="password" autocomplete="off"></label>
       <label>Model override <small class="muted">(blank = server default)</small>
         <input id="model" list="models" autocomplete="off"><datalist id="models"></datalist></label>

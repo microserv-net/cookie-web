@@ -16,16 +16,22 @@ pub enum SearchMode {
 /// How the model participates in gathering information (quick/standard requests).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentMode {
-    /// The model drives extra tool calls (native tool calling, or the JSON protocol as fallback).
+    /// `agent`: after code has searched and read, the main model may run more tool rounds
+    /// (native tool calling, or the JSON protocol as fallback). Slower: each round re-reads everything.
     Auto,
-    /// No model-driven tool rounds: code searches and reads the top results, the model only
-    /// triages and writes. Fastest and most robust on tiny models / slow CPUs.
+    /// `pipeline` (default): code searches, rescues, reads and assembles the evidence; the main model
+    /// is called once, to write. The fast model only answers small structured questions.
     Pipeline,
 }
 
 /// The default model: the smallest model that still does reliable tool calling and cited
 /// synthesis. Non-thinking (no wasted tokens), 2.5 GB at Q4_K_M. See docs/HARDWARE.md.
 pub const DEFAULT_MODEL: &str = "qwen3:4b-instruct";
+
+/// The default fast model, for the small structured jobs (triage, query rewriting, fact-check verdicts,
+/// deep-mode notes): same family as the main model, ~1.4 GB, ~2.5x faster per token. When it isn't
+/// pulled, or Ollama can't keep both loaded, the main model does those jobs instead.
+pub const DEFAULT_FAST_MODEL: &str = "qwen3:1.7b";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -34,8 +40,11 @@ pub struct Config {
 
     pub ollama_host: String,
     pub model: String,
-    /// Optional smaller/faster model used for triage, planning and note-taking.
+    /// Smaller/faster model for triage, query rewriting, fact-check verdicts and note-taking.
+    /// `None` = the main model does everything.
     pub fast_model: Option<String>,
+    /// Context window for the fast model (its jobs are small; a smaller cache saves memory).
+    pub fast_num_ctx: u32,
     pub think: bool,
     pub num_ctx: u32,
     /// CPU threads Ollama may use for this model (`None` = Ollama's default: all physical cores).
@@ -57,7 +66,13 @@ pub struct Config {
 
     pub reports_dir: PathBuf,
     pub api_key: Option<String>,
+    /// Password for the website (defaults to the API key). Also accepted by the API.
+    pub password: Option<String>,
     pub max_concurrent: usize,
+    /// Most jobs allowed to wait in the queue; past it new requests get 503 + Retry-After.
+    pub max_queue: usize,
+    /// The watchdog (`cookie-watch`) to send heartbeats to, e.g. `http://127.0.0.1:8790`.
+    pub watch_url: Option<String>,
     pub allow_private_urls: bool,
     pub user_agent: String,
     pub fetch_timeout: Duration,
@@ -106,15 +121,20 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             model: var("COOKIE_MODEL").unwrap_or_else(|| DEFAULT_MODEL.into()),
-            fast_model: var("COOKIE_FAST_MODEL"),
+            fast_model: match var("COOKIE_FAST_MODEL") {
+                None => Some(DEFAULT_FAST_MODEL.into()),
+                Some(v) if matches!(v.to_ascii_lowercase().as_str(), "none" | "off" | "same" | "main") => None,
+                Some(v) => Some(v),
+            },
+            fast_num_ctx: parse("COOKIE_FAST_NUM_CTX", 4096u32).clamp(2048, 262_144),
             think: flag("COOKIE_THINK", false),
             num_ctx: parse("COOKIE_NUM_CTX", 8192u32).clamp(4096, 262_144),
             num_thread: var("COOKIE_NUM_THREAD").and_then(|v| v.parse::<u32>().ok()).filter(|n| *n > 0),
             temperature: parse("COOKIE_TEMPERATURE", 0.3),
             keep_alive: var("COOKIE_KEEP_ALIVE").unwrap_or_else(|| "-1".into()),
             agent_mode: match var("COOKIE_AGENT_MODE").map(|v| v.to_ascii_lowercase()).as_deref() {
-                Some("pipeline") => AgentMode::Pipeline,
-                _ => AgentMode::Auto,
+                Some("agent" | "auto") => AgentMode::Auto,
+                _ => AgentMode::Pipeline,
             },
             warmup: flag("COOKIE_WARMUP", true),
             search_mode,
@@ -125,8 +145,11 @@ impl Config {
             disable_duckduckgo: flag("COOKIE_DISABLE_SCRAPERS", false) || flag("COOKIE_DISABLE_DUCKDUCKGO", false),
             reports_dir: PathBuf::from(var("COOKIE_REPORTS_DIR").unwrap_or_else(|| "reports".into())),
             api_key: var("COOKIE_API_KEY"),
+            password: var("COOKIE_PASSWORD"),
             // One model instance serves one request at a time on small boxes; queue the rest.
             max_concurrent: parse("COOKIE_MAX_CONCURRENT", 1usize).max(1),
+            max_queue: parse("COOKIE_MAX_QUEUE", 25usize),
+            watch_url: var("COOKIE_WATCH_URL").map(|u| u.trim_end_matches('/').to_string()),
             allow_private_urls: flag("COOKIE_ALLOW_PRIVATE_URLS", false),
             user_agent: var("COOKIE_USER_AGENT").unwrap_or_else(|| {
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
@@ -148,6 +171,11 @@ impl Config {
     /// The model used for cheap structured steps (triage, planning, notes).
     pub fn fast_model(&self) -> &str {
         self.fast_model.as_deref().unwrap_or(&self.model)
+    }
+
+    /// Is a separate fast model configured?
+    pub fn has_fast_model(&self) -> bool {
+        self.fast_model.as_deref().is_some_and(|f| f != self.model)
     }
 
     /// `keep_alive` as Ollama expects it: a number of seconds (negative = forever) or a duration string.
@@ -172,6 +200,7 @@ impl Config {
             ollama_host: "http://127.0.0.1:11434".into(),
             model: "test-model".into(),
             fast_model: None,
+            fast_num_ctx: 4096,
             think: false,
             num_ctx: 8192,
             num_thread: None,
@@ -187,7 +216,10 @@ impl Config {
             disable_duckduckgo: true,
             reports_dir: PathBuf::from("reports"),
             api_key: None,
+            password: None,
             max_concurrent: 2,
+            max_queue: 25,
+            watch_url: None,
             allow_private_urls: false,
             user_agent: "cookie-web-test".into(),
             fetch_timeout: Duration::from_secs(5),

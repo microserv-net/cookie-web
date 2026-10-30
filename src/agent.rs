@@ -45,6 +45,18 @@ const REQUEST_WORDS: &[&str] = &[
     "curious",
     "thanks",
     "help",
+    "her",
+    "him",
+    "his",
+    "she",
+    "he",
+    "they",
+    "them",
+    "their",
+    "its",
+    "plays",
+    "play",
+    "played",
 ];
 
 /// The distinctive words of a request, used to judge whether results are about it.
@@ -95,6 +107,22 @@ fn on_topic_hits(run: &Run<'_>, out: &ToolOutput, topic: &[String]) -> Option<St
     }
     let header = out.text.lines().next().unwrap_or("Results:");
     (kept > 0).then(|| format!("{header} (off-topic results removed)\n{text}"))
+}
+
+/// Is `text` about the request? Checked against each topic separately (the request's own words, the
+/// search query's), so a search query that added or changed words can't make everything look off-topic.
+/// `share` is the fraction of a topic's distinctive words that must appear (at least one).
+pub fn about(text: &str, topics: &[&[String]], share: f64) -> bool {
+    topics.iter().all(|t| t.is_empty())
+        || topics
+            .iter()
+            .filter(|t| !t.is_empty())
+            .any(|t| overlap(text, t) >= ((t.len() as f64 * share).ceil() as usize).max(1))
+}
+
+/// The two descriptions of what the request is about: its own words and the search query's.
+pub fn topics_of(run: &Run<'_>, t: &Triage) -> (Vec<String>, Vec<String>) {
+    (topic_terms(&run.query), topic_terms(&t.search_query))
 }
 
 /// Search hits in a tool result that look relevant to the request (0 for non-search tools or failures).
@@ -199,6 +227,17 @@ pub fn readable(url: &str) -> bool {
 
 fn seeds(t: &Triage, p: &Profile) -> Vec<(&'static str, Value)> {
     let q = t.search_query.clone();
+    let mut calls = base_seeds(t, p, q);
+    // the other parts of a multi-part request get their own searches (not for quick answers)
+    if t.depth != Depth::Quick {
+        for extra in t.extra_queries.iter().take(2) {
+            calls.push(("web_search", json!({ "query": extra, "max_results": p.results_per_search.min(6) })));
+        }
+    }
+    calls
+}
+
+fn base_seeds(t: &Triage, p: &Profile, q: String) -> Vec<(&'static str, Value)> {
     match t.intent {
         Intent::News => {
             vec![("news_search", json!({ "query": q, "time_range": "month" })), ("web_search", json!({ "query": q }))]
@@ -212,13 +251,11 @@ fn seeds(t: &Triage, p: &Profile) -> Vec<(&'static str, Value)> {
 fn agent_system(run: &Run<'_>, t: &Triage, p: &Profile, native: bool) -> String {
     let reading = match t.depth {
         Depth::Quick => {
-            "This is a QUICK request: only read a page if the snippets are not enough to answer confidently."
+            "This is a QUICK request: only read another page if what you have is not enough to answer confidently."
                 .to_string()
         }
-        _ => format!(
-            "Read (fetch_page with a `focus`) the {} most promising results — snippets alone are rarely enough.",
-            p.max_fetches.min(3)
-        ),
+        _ => "Read more pages (fetch_page with a `focus`) only for parts of the request the pages below don't cover."
+            .to_string(),
     };
     let protocol = if native {
         "Call tools to gather information. When you have enough, reply with the single word DONE and no tool call."
@@ -250,7 +287,9 @@ fn agent_system(run: &Run<'_>, t: &Triage, p: &Profile, native: bool) -> String 
          so do not write the answer yourself.\n\n\
          Budget: at most {steps} tool rounds and {fetches} page reads.\n\
          Strategy:\n\
-         - Initial search results are already provided below.\n\
+         - The search results and the most promising pages have already been read for you (below).\n\
+         - First decide: is this enough to answer the request fully and correctly? If yes, stop now.\n\
+         - If not, call the tools that fill the gaps. Call several at once when they don't depend on each other.\n\
          - {reading}\n\
          - If results are off-topic, ambiguous or missing something, search again with different, more specific keywords.\n\
          - Use news_search for recent events, wikipedia for definitions/people/places, extract_links or crawl_site to find specific resources on a site.\n\
@@ -286,8 +325,9 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
     if hits < 2 && !wiki_found && !run.out_of_time() {
         run.events.status("Results look thin or off-topic — trying other phrasings");
         let alts = rephrase(run, std::slice::from_ref(&t.search_query)).await;
+        // ask every search engine this time: one engine misreading the query shouldn't sink it
         let extra: Vec<(&'static str, Value)> =
-            alts.into_iter().map(|q| ("web_search", json!({ "query": q }))).collect();
+            alts.into_iter().map(|q| ("web_search", json!({ "query": q, "broad": true }))).collect();
         let extra_results =
             futures::future::join_all(extra.iter().map(|(name, args)| run.tool(name, args.clone()))).await;
         let more: usize = extra_results.iter().map(|(ok, out)| relevant_hits(*ok, out, &topic)).sum();
@@ -339,12 +379,54 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
         messages.push(Message::user(seed_dump.clone()));
     }
 
+    // 1c. Read the most promising pages right away, in parallel. Code can pick on-topic pages from the
+    // snippets as well as the model can, and the model then judges with the pages in front of it —
+    // usually saving it a whole round (each round re-reads the conversation, the slow part on a CPU).
+    let want = match (t.depth, t.intent) {
+        // a Wikipedia summary + snippets is enough to identify a name; otherwise read one page
+        (Depth::Quick, Intent::Entity | Intent::Links) if wiki_found => 0,
+        (Depth::Quick, _) => 1,
+        // one more page when the request has several parts
+        _ => p.max_fetches.min(2 + t.extra_queries.len().min(1)),
+    };
+    let reads = read_top(run, t, want).await;
+    if !reads.is_empty() {
+        let mut call_msg = Message::assistant("");
+        let mut dump = String::new();
+        let mut tool_msgs = vec![];
+        for ((name, args), (ok, out)) in &reads {
+            done.insert(format!("{name}{args}"));
+            call_msg.tool_calls.push(ToolCall::new(name, args.clone()));
+            if *ok {
+                let url = args["url"].as_str().unwrap_or("");
+                evidence.push(Evidence { label: format!("fetch_page: {url}"), text: out.text.clone() });
+            }
+            // The planner only judges coverage, so it gets a shorter excerpt; the writer gets the full one.
+            let short = truncate_chars(&out.text, p.page_chars.min(PLANNER_PAGE_CHARS));
+            tool_msgs.push(Message::tool(name, short.clone()));
+            dump.push_str(&format!("Result of {name} {args}:\n{short}\n\n"));
+        }
+        seed_dump.push_str(&dump);
+        if native {
+            messages.push(call_msg);
+            messages.extend(tool_msgs);
+        } else {
+            messages.push(Message::user(dump));
+        }
+    }
+
     // 2. Model-driven rounds (skipped in pipeline mode).
     let mut use_native = native;
     let mut switched = false;
     // Everything gathered so far as plain text, used if we must switch to the JSON protocol mid-way.
     let mut all_dump = seed_dump.clone();
-    let rounds = if run.engine.cfg.agent_mode == AgentMode::Pipeline { 0 } else { p.max_steps };
+    let pages_read = run.ctx.sources.lock().unwrap().pages_read();
+    // A quick request with an on-topic page or Wikipedia article in hand needs no model round at all.
+    let quick_enough = t.depth == Depth::Quick && (wiki_found || pages_read > 0);
+    let rounds = if run.engine.cfg.agent_mode == AgentMode::Pipeline || quick_enough { 0 } else { p.max_steps };
+    if rounds > 0 {
+        run.events.status("Deciding whether more research is needed");
+    }
     // Prompt budget for the loop: context minus the reply, tool specs and a safety margin.
     let loop_budget =
         (run.engine.cfg.num_ctx.saturating_sub(700 + 1_100) as f64 * crate::depth::CHARS_PER_TOKEN) as usize;
@@ -454,47 +536,163 @@ pub async fn gather(run: &Run<'_>, t: &Triage, p: &Profile) -> anyhow::Result<Ve
         }
     }
 
-    // 3. Deterministic floor: make sure some pages were actually read.
-    let want = match (t.depth, t.intent) {
-        // a Wikipedia summary + snippets is enough to identify a name; otherwise read one page
-        (Depth::Quick, Intent::Entity | Intent::Links) if wiki_found => 0,
-        (Depth::Quick, _) => 1,
-        _ => p.max_fetches.min(2),
-    };
+    // 3. Deterministic floor: if reads failed (dead links, bot walls), read the next on-topic results.
     let read = run.ctx.sources.lock().unwrap().pages_read();
-    if read < want {
-        let topic = topic_terms(&run.query);
-        let candidates: Vec<String> = {
-            let reg = run.ctx.sources.lock().unwrap();
-            let mut c: Vec<(usize, &crate::sources::Source)> = reg
-                .all()
-                .iter()
-                .filter(|s| !s.read && matches!(s.kind, SourceKind::Search | SourceKind::News) && readable(&s.url))
-                .map(|s| (overlap(&format!("{} {} {}", s.title, s.snippet, s.url), &topic), s))
-                .collect();
-            // most on-topic first; search rank breaks ties (the sort is stable)
-            c.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-            c.into_iter().map(|(_, s)| s.url.clone()).take((want - read) + 4).collect()
-        };
-        if !candidates.is_empty() {
-            run.events.status("Reading the top results");
-        }
-        let mut got = read;
-        for url in candidates {
-            if got >= want || run.ctx.fetches_left() == 0 {
-                break;
-            }
-            let (ok, out) = run.tool("fetch_page", json!({ "url": url, "focus": run.query })).await;
-            if ok && !out.summary.contains("budget") {
+    if read < want && !run.out_of_time() {
+        for ((_, args), (ok, out)) in read_top(run, t, want - read).await {
+            if ok {
+                let url = args["url"].as_str().unwrap_or("");
                 evidence.push(Evidence { label: format!("fetch_page: {url}"), text: out.text });
-                got += 1;
             }
         }
+        let got = run.ctx.sources.lock().unwrap().pages_read();
         if got < want {
             run.warn(format!("could only read {got} of the {want} pages wanted; the answer leans on search snippets"));
         }
     }
-    Ok(evidence)
+    let (asked, searched) = topics_of(run, t);
+    Ok(consolidate(run, &[&asked, &searched], evidence, p.results_per_search + p.results_per_search / 2))
+}
+
+/// How much of each pre-read page the planner sees (enough to judge what is covered).
+const PLANNER_PAGE_CHARS: usize = 1_800;
+
+/// Read up to `n` of the most on-topic unread search results, in parallel; when some fail (dead link,
+/// bot wall), one more wave reads the next ones. Off-topic results are never read.
+async fn read_top(run: &Run<'_>, t: &Triage, n: usize) -> Vec<((String, Value), (bool, crate::tools::ToolOutput))> {
+    if n == 0 || run.ctx.fetches_left() == 0 {
+        return vec![];
+    }
+    let (asked, searched) = topics_of(run, t);
+    let topic = topic_terms(&format!("{} {}", run.query, t.search_query));
+    // One ranking per part of the request (the main query, then any extra ones); picking from them in
+    // turn makes sure every part gets a page, not just the one the search engines liked best.
+    let mut parts: Vec<Vec<String>> = vec![topic.clone()];
+    parts.extend(t.extra_queries.iter().map(|q| topic_terms(q)).filter(|p| !p.is_empty()));
+    let mut candidates: Vec<String> = {
+        let reg = run.ctx.sources.lock().unwrap();
+        let pool: Vec<&crate::sources::Source> = reg
+            .all()
+            .iter()
+            .filter(|s| !s.read && matches!(s.kind, SourceKind::Search | SourceKind::News) && readable(&s.url))
+            .filter(|s| {
+                let text = format!("{} {} {}", s.title, s.snippet, s.url);
+                about(&text, &[&asked, &searched], 0.25) || parts[1..].iter().any(|p| about(&text, &[p], 0.34))
+            })
+            .collect();
+        let ranked: Vec<Vec<&crate::sources::Source>> = parts
+            .iter()
+            .map(|part| {
+                let mut c: Vec<(usize, &crate::sources::Source)> = pool
+                    .iter()
+                    .map(|s| (overlap(&format!("{} {} {}", s.title, s.snippet, s.url), part), *s))
+                    .filter(|(score, _)| *score > 0)
+                    .collect();
+                // most on-topic first; search rank breaks ties (the sort is stable)
+                c.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+                c.into_iter().map(|(_, s)| s).collect()
+            })
+            .collect();
+        let mut picked: Vec<String> = vec![];
+        let longest = ranked.iter().map(Vec::len).max().unwrap_or(0);
+        for i in 0..longest {
+            for list in &ranked {
+                if let Some(s) = list.get(i)
+                    && !picked.contains(&s.url)
+                {
+                    picked.push(s.url.clone());
+                }
+            }
+        }
+        picked.truncate(n + 4);
+        picked
+    };
+    if candidates.is_empty() {
+        return vec![];
+    }
+    run.events.status(format!("Reading the top {} result{}", n.min(candidates.len()), if n == 1 { "" } else { "s" }));
+    let focus = focus_for(run, t);
+    let mut out = vec![];
+    let mut got = 0;
+    for _wave in 0..2 {
+        let take = (n - got).min(candidates.len()).min(run.ctx.fetches_left() as usize);
+        if take == 0 {
+            break;
+        }
+        let batch: Vec<(String, Value)> =
+            candidates.drain(..take).map(|u| ("fetch_page".to_string(), json!({ "url": u, "focus": focus }))).collect();
+        let results = futures::future::join_all(batch.iter().map(|(name, args)| run.tool(name, args.clone()))).await;
+        for (call, (ok, o)) in batch.into_iter().zip(results) {
+            let ok = ok && !o.summary.contains("budget");
+            got += ok as usize;
+            out.push((call, (ok, o)));
+        }
+        if got >= n {
+            break;
+        }
+    }
+    out
+}
+
+/// What to look for on a page: the request's keywords (not its conversational wording).
+pub fn focus_for(run: &Run<'_>, t: &Triage) -> String {
+    let kw = crate::depth::search_keywords(&run.query);
+    if kw.to_lowercase().contains(&t.search_query.to_lowercase()) { kw } else { format!("{kw} {}", t.search_query) }
+}
+
+/// The evidence the writer gets from a quick/standard gather:
+/// 1. one de-duplicated list of the search results shown during research — only the on-topic ones when
+///    there are any, at most `max_hits`, without results whose page was read in full;
+/// 2. the other material (Wikipedia, link lists, …);
+/// 3. the pages read, last, so the most detailed material sits right before the question.
+///
+/// Repeated result blocks and off-topic hits cost prompt tokens (CPU time) and invite wrong citations.
+pub fn consolidate(run: &Run<'_>, topics: &[&[String]], evidence: Vec<Evidence>, max_hits: usize) -> Vec<Evidence> {
+    static NUM: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?m)^\[(\d+)\] ").unwrap());
+    let is_search = |e: &Evidence| e.label.starts_with("web_search:") || e.label.starts_with("news_search:");
+    let (searches, rest): (Vec<Evidence>, Vec<Evidence>) = evidence.into_iter().partition(|e| is_search(e));
+    let mut out = vec![];
+    if !searches.is_empty() {
+        let mut shown: Vec<usize> = vec![];
+        for e in &searches {
+            for c in NUM.captures_iter(&e.text) {
+                if let Ok(n) = c[1].parse::<usize>()
+                    && !shown.contains(&n)
+                {
+                    shown.push(n);
+                }
+            }
+        }
+        let reg = run.ctx.sources.lock().unwrap();
+        let hits: Vec<&crate::sources::Source> = shown
+            .iter()
+            .filter_map(|n| reg.get(*n))
+            .filter(|s| matches!(s.kind, SourceKind::Search | SourceKind::News | SourceKind::Page))
+            .collect();
+        let on_topic =
+            |s: &&crate::sources::Source| about(&format!("{} {} {}", s.title, s.snippet, s.url), topics, 0.25);
+        // Only fall back to off-topic hits when nothing at all was on topic (they may still help).
+        let any_on = hits.iter().any(on_topic);
+        let list: Vec<&crate::sources::Source> =
+            hits.into_iter().filter(|s| !s.read).filter(|s| !any_on || on_topic(s)).collect();
+        let mut text = String::new();
+        for s in list.into_iter().take(max_hits) {
+            let date = s.date.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
+            text.push_str(&format!("[{}] {} — {}{date}\n    URL: {}\n", s.n, s.title, s.domain, s.url));
+            if !s.snippet.is_empty() {
+                text.push_str(&format!("    {}\n", s.snippet.chars().take(300).collect::<String>()));
+            }
+        }
+        if !text.is_empty() {
+            out.push(Evidence { label: "Search results".into(), text });
+        }
+    }
+    let (pages, other): (Vec<Evidence>, Vec<Evidence>) =
+        rest.into_iter().partition(|e| e.label.starts_with("fetch_page:") || e.label.starts_with("crawl_site:"));
+    out.extend(other);
+    out.extend(pages);
+    out
 }
 
 /// Keep the conversation inside the context window: shorten the oldest tool results first
@@ -558,6 +756,13 @@ mod tests {
     fn judges_relevance_by_distinctive_words() {
         let topic = topic_terms("what can you tell me about \"stares motherfuckingly\", hint: samuel l jackson");
         assert_eq!(topic, vec!["stares", "motherfuckingly", "samuel", "jackson"]);
+        // a page about one of two subjects counts; one sharing a single generic word doesn't
+        let fw = topic_terms("how do foxes and wolves live in the wild");
+        assert!(about("All about foxes", &[&fw], 0.25));
+        let fr = topic_terms("what can you tell me about Friday from Iron Man and who plays her in VisionQuest");
+        assert_eq!(fr, vec!["friday", "iron", "man", "visionquest"]);
+        assert!(!about("Friday (1995 film) - Wikipedia", &[&fr], 0.34));
+        assert!(about("Who plays Friday in VisionQuest? Tony Stark's AIs explained", &[&fr], 0.25));
         assert!(!relevant("Canva: Visual Suite for Everyone — design anything", &topic));
         assert!(!relevant("CAN | meaning in the Cambridge English Dictionary", &topic));
         assert!(relevant("Samuel L. Jackson's legendary stare in Pulp Fiction", &topic));

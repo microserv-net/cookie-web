@@ -40,6 +40,12 @@ pub struct FakeLlm {
     pub answer: Mutex<String>,
     /// Fact-check prompts received (passage + statement).
     pub judged: Mutex<Vec<String>>,
+    /// The last prompt the writer received (system prompt, user prompt, max_tokens).
+    pub write_prompt: Mutex<String>,
+    pub write_system: Mutex<String>,
+    pub write_max_tokens: Mutex<Option<u32>>,
+    /// Overrides the triage reply.
+    pub triage_reply: Mutex<Option<String>>,
 }
 
 impl FakeLlm {
@@ -55,6 +61,10 @@ impl FakeLlm {
             write_delay: Mutex::new(Duration::ZERO),
             answer: Mutex::new(ANSWER.to_string()),
             judged: Mutex::new(vec![]),
+            write_prompt: Mutex::new(String::new()),
+            write_system: Mutex::new(String::new()),
+            write_max_tokens: Mutex::new(None),
+            triage_reply: Mutex::new(None),
         }
     }
     fn note(&self, s: &str) {
@@ -91,6 +101,9 @@ impl ChatModel for FakeLlm {
         }
         if sys.contains("You triage") {
             self.note("triage");
+            if let Some(r) = self.triage_reply.lock().unwrap().clone() {
+                return Ok(Message::assistant(r));
+            }
             return Ok(Message::assistant(
                 r#"{"depth":"standard","intent":"fact","search_query":"fake query","reason":"test"}"#,
             ));
@@ -108,10 +121,9 @@ impl ChatModel for FakeLlm {
             return Ok(Message::assistant("- a concrete fact\n- another fact"));
         }
         if sys.contains("research planner") {
-            let fetched = req
-                .messages
-                .iter()
-                .any(|m| m.content.contains("Result of fetch_page") || m.tool_name.as_deref() == Some("fetch_page"));
+            // A model that wants one specific page (a for native calls, b for JSON) and is done once it saw it.
+            let want = if req.tools.is_empty() { "https://example.com/b" } else { "https://example.com/a" };
+            let fetched = req.messages.iter().any(|m| m.content.contains(&format!("URL: {want}")));
             if !req.tools.is_empty() {
                 self.note("agent-native");
                 if self.native_broken.load(Ordering::SeqCst) {
@@ -159,6 +171,9 @@ impl ChatModel for FakeLlm {
         // Like a real writer, cite the numbers the evidence actually shows: [1][2][3] in the scripted
         // answer stand for the first three numbers in the prompt.
         let prompt = req.messages.last().map(|m| m.content.clone()).unwrap_or_default();
+        *self.write_prompt.lock().unwrap() = prompt.clone();
+        *self.write_system.lock().unwrap() = req.messages.first().map(|m| m.content.clone()).unwrap_or_default();
+        *self.write_max_tokens.lock().unwrap() = req.max_tokens;
         let mut shown: Vec<String> = vec![];
         for cap in prompt.split('[').skip(1) {
             if let Some(n) = cap.split(']').next().filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))

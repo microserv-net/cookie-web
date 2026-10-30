@@ -53,6 +53,9 @@ enum Cmd {
         /// With --follow: auto | never | always search the web
         #[arg(long)]
         web: Option<String>,
+        /// Upper limit on the answer's length in words
+        #[arg(long)]
+        max_words: Option<u32>,
     },
     /// Print the full content of source N of a saved report (read and stored on first use).
     Source {
@@ -143,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Ask { query, depth, model, out, json, no_save, follow, sources, web } => {
+        Cmd::Ask { query, depth, model, out, json, no_save, follow, sources, web, max_words } => {
             let q = query.join(" ");
             if q.trim().is_empty() {
                 anyhow::bail!("usage: cookie-web ask <question>");
@@ -174,8 +177,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             });
-            let req =
-                ResearchRequest { query: q, depth: Some(depth), model, save: !no_save, report: follow, sources, web };
+            let req = ResearchRequest {
+                query: q,
+                depth: Some(depth),
+                model,
+                save: !no_save,
+                report: follow,
+                sources,
+                web,
+                max_words,
+            };
             let result = engine.run(req, Events::new(tx)).await;
             let _ = printer.await;
             let result = result?;
@@ -231,6 +242,11 @@ async fn doctor(cfg: Config) -> anyhow::Result<()> {
     println!("  {} reachable", mark(info.reachable));
     println!("  {} model {} pulled", mark(info.available), info.model);
     println!("  {} native tool calling", mark(info.supports_tools));
+    match &info.fast_model {
+        Some(f) if info.fast_active => println!("  ✓ fast model {f} for small jobs (context {})", cfg.fast_num_ctx),
+        Some(f) => println!("  ✗ fast model {f} not used: {}", info.fast_note.as_deref().unwrap_or("not available")),
+        None => println!("  · no fast model: the main model does every job (set COOKIE_FAST_MODEL)"),
+    }
     println!("  context {} tokens · keep_alive {} · agent mode {:?}", cfg.num_ctx, cfg.keep_alive, cfg.agent_mode);
     match (info.loaded, info.memory_bytes) {
         (true, Some(b)) => println!("  ✓ loaded — {:.2} GB in memory (weights + KV cache)", b as f64 / 1e9),
@@ -251,6 +267,7 @@ async fn doctor(cfg: Config) -> anyhow::Result<()> {
             max: 3,
             time_range: None,
             kind: cookie_web::tools::search::Kind::Web,
+            broad: false,
         };
         match b.search(&web, &q).await {
             Ok(h) if !h.is_empty() => println!("  ✓ {:<10} {} results (e.g. {})", b.name(), h.len(), h[0].url),

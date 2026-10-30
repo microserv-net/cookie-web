@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cookie-web · status</title>
+<style>
+  :root {
+    --bg: #f7f1e8; --panel: #fffaf2; --ink: #2b1d14; --muted: #7b6656; --line: #e6d8c5;
+    --accent: #b5652a; --ok: #4f8a3c; --warn: #c58a1d; --err: #b8412f;
+    --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17110d; --panel: #201813; --ink: #f1e6d8; --muted: #a8927f; --line: #3a2c22; --accent: #e0914d; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.6 var(--sans); }
+  main { max-width: 720px; margin: 0 auto; padding: 40px 16px 60px; }
+  .brand { font: 600 20px Georgia, serif; margin-bottom: 24px; }
+  .brand b { color: var(--accent); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px 24px; margin-bottom: 18px; }
+  .state { display: flex; align-items: center; gap: 14px; }
+  .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--muted); flex: none; }
+  .online .dot { background: var(--ok); box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 20%, transparent); }
+  .degraded .dot { background: var(--warn); }
+  .unresponsive .dot, .offline .dot { background: var(--err); }
+  h1 { margin: 0; font-size: 26px; font-weight: 600; }
+  .reason { color: var(--muted); margin: 6px 0 0 28px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: var(--mono); font-size: 13.5px; overflow-wrap: anywhere; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { padding: 6px 0; border-top: 1px solid var(--line); display: grid; grid-template-columns: 150px 1fr; gap: 12px; }
+  li:first-child { border-top: 0; }
+  .when { color: var(--muted); font-size: 13px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  a { color: var(--accent); }
+  .back { display: inline-block; margin-top: 14px; }
+  @media (max-width: 520px) { li { grid-template-columns: 1fr; gap: 0; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="brand">cookie<b>-web</b> · status</div>
+  <section class="card" id="card">
+    <div class="state"><span class="dot"></span><h1 id="title">Checking…</h1></div>
+    <p class="reason" id="reason"></p>
+    <a class="back" id="back" href="/" hidden>Open cookie-web →</a>
+  </section>
+  <section class="card" id="details" hidden>
+    <h2>Service</h2>
+    <dl id="dl"></dl>
+  </section>
+  <section class="card" id="log" hidden>
+    <h2>Recent changes</h2>
+    <ul id="incidents"></ul>
+  </section>
+  <p class="muted" id="foot">This page is served by the watchdog, which keeps running when cookie-web is down.</p>
+</main>
+<script>
+const TITLES = { online: "Online", degraded: "Degraded", unresponsive: "Not responding", offline: "Offline", unknown: "Unknown" };
+const from = new URLSearchParams(location.search).get("from");
+const safeFrom = from && from.startsWith("/") && !from.startsWith("//") && !from.startsWith("/watch") ? from : "/";
+let wasDown = false;
+
+function ago(iso) {
+  if (!iso) return "—";
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " days ago";
+}
+function dur(secs) {
+  if (secs == null) return "—";
+  const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${secs % 60}s` : `${secs}s`;
+}
+function row(k, v) {
+  const dt = document.createElement("dt"); dt.textContent = k;
+  const dd = document.createElement("dd"); dd.textContent = v;
+  return [dt, dd];
+}
+
+async function refresh() {
+  let v;
+  try {
+    v = await (await fetch("/watch/status", { cache: "no-store", credentials: "same-origin" })).json();
+  } catch {
+    document.getElementById("title").textContent = "Watchdog unreachable";
+    document.getElementById("reason").textContent = "The status service itself isn't answering.";
+    document.getElementById("card").className = "card offline";
+    return;
+  }
+  const card = document.getElementById("card");
+  card.className = "card " + v.status;
+  document.getElementById("title").textContent = TITLES[v.status] || v.status;
+  document.getElementById("reason").textContent =
+    (v.reason ? v.reason + " · " : "") + "since " + ago(v.since);
+  const back = document.getElementById("back");
+  back.hidden = v.api !== "up";
+  back.href = safeFrom;
+  if (v.api !== "up") wasDown = true;
+  // came here because cookie-web was down: go back once it's up again
+  if (from && wasDown && v.api === "up") setTimeout(() => location.replace(safeFrom), 1500);
+  if (from && !wasDown && v.api === "up") location.replace(safeFrom);
+
+  const d = v.detail;
+  document.getElementById("details").hidden = !d;
+  document.getElementById("log").hidden = !(v.incidents && v.incidents.length);
+  const dl = document.getElementById("dl");
+  dl.replaceChildren();
+  if (d) {
+    const items = [
+      ["Process", d.pid ? `pid ${d.pid}` + (d.pid_alive === false ? " (gone)" : "") : "not registered"],
+      ["Version", d.version || "—"],
+      ["Running for", d.started_at ? dur(Math.round((Date.now() - Date.parse(d.started_at)) / 1000)) : "—"],
+      ["Last heartbeat", d.last_beat_secs_ago == null ? "—" : d.last_beat_secs_ago + "s ago"],
+      ["Health check", d.error ? d.error : (d.latency_ms != null ? `${d.health || "ok"} in ${d.latency_ms} ms` : "—")],
+      ["Jobs", d.jobs_running == null ? "—" : `${d.jobs_running} running · ${d.jobs_queued} queued · ${d.jobs_paused} paused`],
+      ["Last OK", ago(v.last_ok_at)],
+      ["Watchdog up", dur(v.watchdog.uptime_secs) + ` · checks every ${v.watchdog.interval_secs}s`],
+    ];
+    for (const [k, val] of items) dl.append(...row(k, val));
+  }
+  const ul = document.getElementById("incidents");
+  ul.replaceChildren();
+  for (const i of (v.incidents || []).slice(0, 15)) {
+    const li = document.createElement("li");
+    const w = document.createElement("span"); w.className = "when"; w.textContent = new Date(i.at).toLocaleString();
+    const t = document.createElement("span"); t.textContent = `${TITLES[i.to] || i.to} — ${i.reason}`;
+    li.append(w, t);
+    ul.append(li);
+  }
+  document.getElementById("foot").textContent = d
+    ? "This page is served by the watchdog, which keeps running when cookie-web is down."
+    : "Sign in to cookie-web to see the details. This page is served by the watchdog, which keeps running when cookie-web is down.";
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

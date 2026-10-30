@@ -1,13 +1,16 @@
 # cookie-web HTTP API
 
-Base URL: `http://<server>:<COOKIE_PORT>` — cookie-web listens on all interfaces (`COOKIE_HOST=0.0.0.0`, port 8765)
-by default, so other machines reach it at `http://<its IP>:8765`.
+Base URL: behind nginx (what `scripts/setup-ubuntu.sh` sets up) it is `http(s)://<server>/`; run on its own,
+`http://<server>:<COOKIE_PORT>` (port 8765). The always-on status endpoint of the watchdog is `/watch/status`
+([below](#service-status-the-watchdog)).
 All request/response bodies are JSON (UTF-8) unless noted. The GUI at `/` uses exactly these endpoints.
 
 - [Authentication](#authentication)
 - [The request object](#the-request-object)
 - [The result object](#the-result-object)
 - [Endpoints](#endpoints)
+- [The queue: pause, resume, cancel](#the-queue-pause-resume-cancel)
+- [Service status (the watchdog)](#service-status-the-watchdog)
 - [Follow-ups and source content](#follow-ups-and-source-content)
 - [Streaming events (SSE)](#streaming-events-sse)
 - [Errors](#errors)
@@ -19,16 +22,31 @@ All request/response bodies are JSON (UTF-8) unless noted. The GUI at `/` uses e
 
 ## Authentication
 
-Off by default. Set `COOKIE_API_KEY=<secret>` to require a key on every `/api/*` route except
-`/api/health` and `/api/manifest`. Send it as any of:
+Off by default. Set `COOKIE_API_KEY` (for programs) and optionally `COOKIE_PASSWORD` (for people) to turn it on:
+
+| | without signing in | how to get in |
+|---|---|---|
+| **website** (`/`, reports, …) | redirected to `/login` | the password: `COOKIE_PASSWORD`, or the API key if no password is set |
+| **API** (`/api/*`) | `401 {"error": …}` | the API key or the password, as below — or the website's session cookie |
+| `/login`, `/api/manifest`, page assets | open | — |
+| `/api/health` | open, but only `{"status","version","auth_required"}` | full details once authorized |
 
 ```
-Authorization: Bearer <secret>
-X-API-Key: <secret>
-?api_key=<secret>          # query param, for EventSource clients that can't set headers
+Authorization: Bearer <key>
+X-API-Key: <key>
+?api_key=<key>             # query param, for EventSource clients that can't set headers
 ```
 
-Missing/wrong key → `401 {"error":"missing or invalid API key"}`.
+Signing in (`POST /login`, form field `password`, or JSON `{"password": "…"}`) sets an HttpOnly,
+`SameSite=Strict` session cookie valid for 30 days. Sessions are signed with a key derived from the secrets, so
+they survive restarts, and changing the password or API key signs everyone out. `GET /logout` signs out.
+After 5 wrong passwords from one client in 15 minutes, sign-in is refused for the rest of that window
+(`429` for JSON, `/login?error=locked` for the form). Behind the local reverse proxy the client address is taken from
+`X-Real-IP` / `X-Forwarded-For` — only when the connection comes from this machine, so remote clients can't fake it —
+and the cookie gets `Secure` when `X-Forwarded-Proto: https`.
+
+> Over plain `http://` the password travels unencrypted. On a VPS, use HTTPS: `scripts/setup-nginx.sh --domain …`
+> (Let's Encrypt), or reach it over a VPN / SSH tunnel.
 
 ## The request object
 
@@ -43,6 +61,7 @@ Missing/wrong key → `401 {"error":"missing or invalid API key"}`.
 | `report` | string | — | Make this a **follow-up** on that saved report (its `id`). See [Follow-ups](#follow-ups-and-source-content). |
 | `sources` | [int] | — | With `report`: only use these sources of the report. `@3` in the query does the same. |
 | `web` | string | `auto` | With `report`: `auto` (search the web only if the report's sources don't cover the question; never when sources are named), `never` or `always`. |
+| `max_words` | int | — | Upper limit on the answer's length (20–5000). Shorter answers are faster: the writer's output budget shrinks with it. |
 
 ```json
 { "query": "VisionQuest", "depth": "auto" }
@@ -154,13 +173,29 @@ Returns `202 Accepted` with a `Location` header:
 
 ### `GET /api/jobs` · `GET /api/jobs/{id}`
 
-Job snapshot: `status` is `queued` → `running` → `done` | `error` | `cancelled`. When `done`, the snapshot includes `result`
-(a `ResearchResult`); when `error` or `cancelled`, it includes `error`. Finished jobs are kept in memory for ~1 hour.
+Job snapshot: `status` is `queued` → `running` (⇄ `paused`) → `done` | `error` | `cancelled`. When `done`, the snapshot includes `result`
+(a `ResearchResult`, single-job view only) and `report_id`; when `error` or `cancelled`, it includes `error`. Finished jobs
+are kept in memory for ~1 hour. Live progress fields (what the website's status view shows):
 
-### `DELETE /api/jobs/{id}` — cancel
+| field | |
+|---|---|
+| `stage` | what it is doing now ("Reading the top 2 results", "Writing the answer", …) |
+| `depth` | quick / standard / deep, once decided |
+| `queued_ms`, `running_ms`, `paused_ms` | time spent waiting for a slot, working (pauses excluded), and paused |
+| `position` | place in line (1 = next), while `queued` |
+| `pause` | `active`, `pausing` (asked, stops at the next step), `paused`, `resuming` (waiting at the front of the line) |
+| `tool_calls`, `sources` | work done so far |
+| `report_id`, `warnings`, `degraded` | when done |
 
-Stops a queued or running job and frees its slot; returns the job snapshot (`status: "cancelled"`). Streams of the
-job end with `error` `{"message":"cancelled"}`. Deleting a finished job changes nothing.
+### `DELETE /api/jobs/{id}` (or `POST /api/jobs/{id}/cancel`) — cancel
+
+Stops a queued, running or paused job at once and frees its slot; returns the job snapshot (`status: "cancelled"`).
+Streams of the job end with `error` `{"message":"cancelled"}`. Cancelling a finished job changes nothing.
+
+### `POST /api/jobs/{id}/pause` · `POST /api/jobs/{id}/resume`
+
+See [the queue](#the-queue-pause-resume-cancel). Both return the job snapshot; `409` if the job is queued (pause)
+or already finished.
 
 ### `GET /api/jobs/{id}/events` — SSE replay & resume
 
@@ -186,9 +221,68 @@ sends automatically on reconnect) resumes after event `N`.
 
 | method & path | returns |
 |---------------|---------|
-| `GET /api/health` | `status` (`ok`/`degraded`), Ollama reachability, model availability & capabilities, installed models, tools, search backends with their health (`search_health`: successes, failures, `cooldown_secs`, `last_error`), running and queued jobs |
-| `GET /api/manifest` | machine-readable agent card (name, capabilities, input/output, endpoints) for orchestrators |
+| `GET /api/health` | `status` (`ok`/`degraded`), Ollama reachability, model availability & capabilities, installed models, tools, search backends with their health (`search_health`: successes, failures, `cooldown_secs`, `last_error`), running / queued / paused jobs, settings, `uptime_secs` |
+| `GET /api/status` | **live status in one call**: `service` (version, pid, uptime), `queue` (slots in use, running / paused / queued counts, limits), `jobs` (active jobs in queue order: running, paused, then queued by `position`), `recent_jobs` (last 10 finished), `model` (main, fast, loaded, memory), `search` (engine health), `latency`, and `watchdog` (its view, if configured) |
+| `GET /api/status/stream?interval=2` | the same document pushed every `interval` seconds (1–60) as SSE `status` events — for dashboards |
+| `GET /api/manifest` | machine-readable agent card (name, capabilities, input/output, endpoints) and its `contract`: queue and concurrency limits, `job_timeout_secs`, the pause/cancel semantics, and observed `latency` per depth (median and 90th percentile of the last 20 jobs on this machine) |
 | `GET /api/tools` | the JSON-schema tool specs the model receives |
+
+## The queue: pause, resume, cancel
+
+One small model serves one request at a time (`COOKIE_MAX_CONCURRENT=1`), so jobs take turns:
+
+- **First come, first served.** A new job waits in line (`status: "queued"`, `position: 1` = next) and starts the
+  moment the current one finishes, is cancelled or is paused. Every request type (blocking, stream, job, follow-up)
+  goes through the same line.
+- **The line has a limit** (`COOKIE_MAX_QUEUE`, default 25). Past it, new requests get `503` with `Retry-After: 30`
+  instead of waiting forever.
+- **Pause** (`POST /api/jobs/{id}/pause`) a running job: a model call in progress is stopped at once (the request to
+  Ollama is dropped, so the CPU is free immediately); other steps stop at their next checkpoint. The job gives up
+  its slot, so the next queued job runs meanwhile. `pause` reads `pausing` until it has stopped, then `status`
+  is `paused` and a `status` event `"Paused"` is sent.
+- **Resume** (`POST /api/jobs/{id}/resume`) puts it at the **front** of the line; it carries on where it stopped.
+  A model call that was interrupted is made again — if the answer was being written, a `reset` event tells
+  clients to discard the partial text, then it streams again. Time spent paused doesn't count against the job's
+  time limits, and `running_ms` / `stats.duration_ms` are working time.
+- **Cancel** works in any state, including paused.
+
+The GUI has the same controls: **Pause/Resume** next to Stop while a search runs, and Pause/Resume/Stop for every
+job in the status view, with each queued job's place in line.
+
+## Service status (the watchdog)
+
+`cookie-watch` is a separate small service (installed next to cookie-web) whose only job is to know whether
+cookie-web is up — so it can answer when cookie-web can't:
+
+- cookie-web **registers** with it on start (pid, version, port; `COOKIE_WATCH_URL`), sends a **heartbeat** every
+  5 s, and says **bye** on a clean shutdown;
+- the watchdog **checks on its own** every 5 s: does that process still exist (`/proc/<pid>`, and is it still
+  cookie-web), and does `/api/health` answer? A process that exists but doesn't answer is *unresponsive*.
+
+`GET /watch/status` (through nginx, or `http://127.0.0.1:8790/watch/status` on the box) — always answers:
+
+```json
+{ "service": "cookie-web", "status": "online", "ok": true, "api": "up", "reason": "",
+  "since": "2026-10-30T09:12:03Z", "checked_at": "…", "last_ok_at": "…",
+  "watchdog": { "uptime_secs": 86400, "interval_secs": 5 } }
+```
+
+| `status` | meaning | HTTP |
+|---|---|---|
+| `online` | running and healthy | 200 |
+| `degraded` | answering, but the model isn't ready (Ollama down, model not pulled) | 200 |
+| `unresponsive` | the process exists but `/api/health` fails twice in a row | 503 |
+| `offline` | not running: exited, crashed, or stopped (`reason` says which) | 503 |
+| `unknown` | nothing checked yet (the first seconds after the watchdog starts) | 503 |
+
+So a plain uptime monitor can watch `/watch/status` by status code. Signed in (session cookie) or with the API key,
+the response adds `detail` (pid, version, start time, last heartbeat, health-check latency, running/queued/paused
+jobs) and `incidents` (the last 50 status changes with their reasons). `/watch/` is a status page for people; when
+cookie-web is down, nginx sends browsers there (and returns `503 {"error":"cookie-web is offline"}` to API calls)
+instead of a bare 502. The page returns to where you were once cookie-web is back.
+
+On top of that, systemd itself restarts cookie-web if it crashes (`Restart=always`) **or hangs**: the unit is
+`Type=notify` with `WatchdogSec=60`, and cookie-web pings systemd only while its own HTTP server answers.
 
 ## Follow-ups and source content
 
@@ -276,7 +370,7 @@ Keep-alive comments are sent every 15 s.
 |------|-------------|-------|
 | `started` | `job_id`, `query` | always first |
 | `triage` | `depth`, `intent`, `search_query`, `reason`, `decided_by` | |
-| `status` | `message` | human-readable progress |
+| `status` | `message` | human-readable progress (`"Paused"` / `"Resumed"` when the job is paused and resumed) |
 | `tool_call` | `call_id`, `tool`, `args` | `call_id` pairs with `tool_result` |
 | `tool_result` | `call_id`, `tool`, `ok`, `summary` | |
 | `source` | `source` (a source object) | sent whenever a source is added/updated; upsert by `source.n` |
@@ -290,7 +384,8 @@ Keep-alive comments are sent every 15 s.
 
 ## Errors
 
-Every error body is `{"error": "<message>"}`. Unknown routes → `404`.
+Every error body is `{"error": "<message>"}`. Unknown routes → `404`. `409`: pause/resume not possible in the job's
+state. `503` + `Retry-After`: the queue is full (or, through nginx, cookie-web is down — see `/watch/status`).
 
 ## Reliability guarantees
 
@@ -373,17 +468,23 @@ curl -s localhost:8765/api/jobs/$JOB | jq -r .result.markdown
 
 cookie-web is designed to be one specialist in a larger system:
 
-1. **Discover** — `GET /api/manifest` describes what it does, its input and output, and its endpoints.
-2. **Check** — `GET /api/health` → route elsewhere if `status != "ok"`.
+1. **Discover** — `GET /api/manifest` describes what it does, its input and output, its endpoints, and its
+   `contract` (limits, queueing, time bound, typical latency per depth on this box — use it to set your own timeouts).
+2. **Check** — `GET /watch/status` (always answers, cheap) → route elsewhere if `api != "up"`; `GET /api/health`
+   for the details.
 3. **Delegate** — `POST /api/jobs` for long work, or `/api/research` when the caller can block.
    Pass `depth` explicitly when the supervisor already knows how much it needs, and an `Idempotency-Key`
    (e.g. the supervisor's task id) so retries never start duplicate work.
 4. **Observe** — subscribe to `/api/jobs/{id}/events` to relay progress; resume with `?from=` after a disconnect.
-   `DELETE /api/jobs/{id}` when the answer is no longer needed.
+   `DELETE /api/jobs/{id}` when the answer is no longer needed; `POST …/pause` to make room for something urgent,
+   `…/resume` afterwards.
 5. **Consume** — use `result.markdown` for humans and `result.sources` (structured, numbered) for machines.
    Check `result.degraded` (and `warnings`) if the supervisor wants to retry later or ask another agent.
 6. **Come back** — counter-questions go to `POST /api/reports/{id}/ask` (with `@n` for a specific source), and the
    raw material is at `/api/reports/{id}/sources/{n}` and `/content`. No need to search again or to ask another agent
    to fetch a link cookie-web already read.
 
-Concurrency: at most `COOKIE_MAX_CONCURRENT` jobs run at once (default 1 — one small model serves one request at a time); others wait in `queued`.
+Concurrency: at most `COOKIE_MAX_CONCURRENT` jobs run at once (default 1 — one small model serves one request at a
+time); others wait in `queued`, first come first served, up to `COOKIE_MAX_QUEUE`. Treat cookie-web as a service with
+a contract, not an agent to babysit: give it a request with the depth you need, and get back one result (or one error)
+within the stated time bound.

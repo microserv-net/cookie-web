@@ -24,18 +24,22 @@
 //! ```
 
 pub mod agent;
+pub mod auth;
 pub mod config;
+pub mod control;
 pub mod depth;
 pub mod engine;
 pub mod events;
 pub mod followup;
 pub mod llm;
+pub mod queue;
 pub mod report;
 pub mod research;
 pub mod server;
 pub mod sources;
 pub mod tools;
 pub mod verify;
+pub mod watch;
 
 use std::sync::Arc;
 

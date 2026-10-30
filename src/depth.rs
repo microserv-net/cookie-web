@@ -46,6 +46,7 @@ impl Depth {
                 page_chars: 4_000,
                 evidence_chars: 9_000,
                 write_tokens: 600,
+                max_words: None,
                 gather_secs: 120,
                 target: "A direct answer in one or two short paragraphs (roughly 60-180 words). \
                          Then a `**Links**` list with the 3-5 most useful links as `- [Title](url) — why it's useful`. \
@@ -55,12 +56,13 @@ impl Depth {
                 max_steps: 6,
                 max_fetches: 4,
                 results_per_search: 8,
-                page_chars: 6_000,
-                evidence_chars: 22_000,
-                write_tokens: 1_500,
+                page_chars: 4_500,
+                evidence_chars: 14_000,
+                write_tokens: 1_100,
+                max_words: None,
                 gather_secs: 300,
-                target: "A well-structured answer of roughly 300-700 words: start with a one-paragraph direct answer, \
-                         then a few `##` sections with bullets where they help. Inline citations throughout.",
+                target: "A focused answer of roughly 200-450 words: start with a short paragraph that answers directly, \
+                         then short `##` sections or bullets only where they help. Inline citations throughout.",
             },
             Self::Deep => Profile {
                 max_steps: 10,
@@ -69,6 +71,7 @@ impl Depth {
                 page_chars: 8_000,
                 evidence_chars: 40_000,
                 write_tokens: 3_500,
+                max_words: None,
                 gather_secs: 900,
                 target: "A full research report of roughly 1000-2000 words. Start with `# <Title>`, then a \
                          `## TL;DR` of 3-5 bullets, then thematic `##` sections, a comparison table if \
@@ -85,6 +88,16 @@ pub const CHARS_PER_TOKEN: f64 = 3.2;
 impl Profile {
     /// Shrink budgets so prompt + answer fit the model's context window (`num_ctx`).
     /// Ollama silently drops the *start* of an over-long prompt (the instructions!), so this matters.
+    /// Apply the caller's word limit: a shorter answer is faster to write.
+    pub fn limit_words(mut self, max_words: Option<u32>) -> Self {
+        if let Some(n) = max_words {
+            // ~1.4 tokens per English word, plus room for Markdown and citations
+            self.write_tokens = self.write_tokens.min((n as f32 * 1.6) as u32 + 60);
+            self.max_words = Some(n);
+        }
+        self
+    }
+
     pub fn fit_to_context(mut self, num_ctx: u32) -> Self {
         self.write_tokens = self.write_tokens.min(num_ctx / 2);
         let room = num_ctx.saturating_sub(self.write_tokens + 1_000) as f64 * CHARS_PER_TOKEN;
@@ -112,6 +125,8 @@ pub struct Profile {
     pub gather_secs: u64,
     /// Formatting brief for the writer.
     pub target: &'static str,
+    /// The caller's word limit (`max_words`), if any.
+    pub max_words: Option<u32>,
 }
 
 /// What kind of request this is; shapes the output format.
@@ -182,6 +197,9 @@ pub struct Triage {
     pub reason: String,
     /// "user", "heuristic" or "model".
     pub decided_by: String,
+    /// More queries for the other parts of a multi-part request (searched alongside `search_query`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_queries: Vec<String>,
 }
 
 /// Unmistakable requests for a long answer.
@@ -376,6 +394,7 @@ pub fn heuristic(query: &str) -> (Triage, bool) {
         search_query: search_keywords(query),
         reason: reason.to_string(),
         decided_by: "heuristic".into(),
+        extra_queries: vec![],
     };
 
     if has_any(&q, DEEP_MARKERS) {
@@ -417,9 +436,10 @@ pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> (Triage, c
             "depth": { "type": "string", "enum": ["quick", "standard", "deep"] },
             "intent": { "type": "string", "enum": ["entity", "fact", "news", "howto", "compare", "research", "links"] },
             "search_query": { "type": "string" },
+            "extra_queries": { "type": "array", "items": { "type": "string" } },
             "reason": { "type": "string" }
         },
-        "required": ["depth", "intent", "search_query", "reason"]
+        "required": ["depth", "intent", "search_query", "extra_queries", "reason"]
     });
     let sys = format!(
         "You triage requests for a web research assistant. Today is {today}.\n\
@@ -429,13 +449,15 @@ pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> (Triage, c
          - deep: the user explicitly wants a report/analysis, or the topic needs many sources to answer well.\n\
          Never inflate: short inputs get short answers.\n\
          Also give the intent and a concise web search query (keywords, no quotes, keep names exact).\n\
+         If the request asks several different things, put one query per extra part in extra_queries (at most 2); \
+         otherwise leave it empty.\n\
          Reply with JSON only."
     );
     let req = ChatRequest::new(vec![Message::system(sys), Message::user(clean.clone())])
         .tier(Tier::Fast)
         .json(schema)
         .temperature(0.0)
-        .max_tokens(200);
+        .max_tokens(260);
     let reply = llm.chat(req).await.ok();
     let usage = reply.as_ref().map(|m| m.usage).unwrap_or_default();
     let t = match reply.and_then(|m| parse_json_loose(&m.content)) {
@@ -448,6 +470,14 @@ pub async fn triage(llm: &dyn ChatModel, query: &str, today: &str) -> (Triage, c
                 search_query: sq.map(String::from).unwrap_or(h.search_query),
                 reason: v["reason"].as_str().unwrap_or("model decision").chars().take(240).collect(),
                 decided_by: "model".into(),
+                extra_queries: v["extra_queries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|q| q.as_str().map(|s| s.trim().trim_matches('"').to_string()))
+                    .filter(|q| !q.is_empty() && q.len() < 200 && !q.eq_ignore_ascii_case(sq.unwrap_or("")))
+                    .take(2)
+                    .collect(),
             }
         }
         None => h,

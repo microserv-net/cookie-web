@@ -259,3 +259,268 @@ async fn health_reports_search_backend_state() {
     assert!(v["search_health"].is_array());
     assert!(v["jobs_queued"].is_number());
 }
+
+// ------------------------------------------------------------ website login
+
+fn locked_app(password: Option<&str>) -> axum::Router {
+    let mut cfg = Config::for_tests(common::tmp_dir("login"));
+    cfg.api_key = Some("k3y".into());
+    cfg.password = password.map(String::from);
+    app_with(cfg)
+}
+
+fn form(password: &str, next: &str) -> Request<Body> {
+    Request::post("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!("password={password}&next={next}")))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn website_requires_sign_in() {
+    let a = locked_app(Some("open sesame"));
+    // the app redirects to the sign-in page; its assets and the sign-in page load
+    let r = a.clone().oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()[header::LOCATION], "/login?next=%2F");
+    for path in ["/login", "/style.css", "/app.js", "/vendor/marked.min.js"] {
+        let r = a.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{path}");
+    }
+    // health says little without signing in
+    let r = a.clone().oneshot(Request::get("/api/health").body(Body::empty()).unwrap()).await.unwrap();
+    let v: Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["auth_required"], true);
+    assert!(v.get("model").is_none() && v.get("search_backends").is_none(), "{v}");
+
+    // wrong password → back to the form
+    let r = a.clone().oneshot(form("nope", "%2Fapi%2Freports")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(r.headers()[header::LOCATION].to_str().unwrap().starts_with("/login?error=1"));
+    assert!(r.headers().get(header::SET_COOKIE).is_none());
+
+    // right password → session cookie, back to where we were going
+    let r = a.clone().oneshot(form("open%20sesame", "%2Fapi%2Freports")).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()[header::LOCATION], "/api/reports");
+    let cookie = r.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+    assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"), "{cookie}");
+    let session = cookie.split(';').next().unwrap().to_string();
+
+    // the cookie opens both the website and the API
+    let mut req = Request::get("/").body(Body::empty()).unwrap();
+    req.headers_mut().insert(header::COOKIE, session.parse().unwrap());
+    assert_eq!(a.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let mut req = post("/api/research", json!({ "query": "VisionQuest" }));
+    req.headers_mut().insert(header::COOKIE, session.parse().unwrap());
+    assert_eq!(a.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let mut req = Request::get("/api/health").body(Body::empty()).unwrap();
+    req.headers_mut().insert(header::COOKIE, session.parse().unwrap());
+    let v: Value = serde_json::from_str(&body_string(a.clone().oneshot(req).await.unwrap()).await).unwrap();
+    assert!(v["model"].is_object(), "full health when signed in");
+
+    // a forged cookie doesn't
+    let mut req = Request::get("/api/reports").body(Body::empty()).unwrap();
+    req.headers_mut().insert(header::COOKIE, "cw_session=v1.9999999999.forged".parse().unwrap());
+    assert_eq!(a.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // the API key still works for programs; and so does the password
+    let mut req = Request::get("/api/reports").body(Body::empty()).unwrap();
+    req.headers_mut().insert(header::AUTHORIZATION, "Bearer k3y".parse().unwrap());
+    assert_eq!(a.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // sign out clears the cookie
+    let r = a.oneshot(Request::post("/logout").body(Body::empty()).unwrap()).await.unwrap();
+    assert!(r.headers()[header::SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
+}
+
+#[tokio::test]
+async fn the_api_key_is_the_password_when_none_is_set() {
+    let a = locked_app(None);
+    let r = a.clone().oneshot(form("k3y", "%2F")).await.unwrap();
+    assert!(r.headers().contains_key(header::SET_COOKIE));
+}
+
+#[tokio::test]
+async fn wrong_passwords_are_rate_limited_and_redirects_stay_on_site() {
+    let a = locked_app(Some("pw"));
+    for _ in 0..5 {
+        a.clone().oneshot(form("nope", "%2F")).await.unwrap();
+    }
+    let r = a.clone().oneshot(form("pw", "%2F")).await.unwrap();
+    assert_eq!(r.headers()[header::LOCATION], "/login?error=locked", "locked even with the right password");
+    assert!(r.headers().get(header::SET_COOKIE).is_none());
+
+    let b = locked_app(Some("pw"));
+    let r = b.oneshot(form("pw", "https%3A%2F%2Fevil.example")).await.unwrap();
+    assert_eq!(r.headers()[header::LOCATION], "/", "no open redirect");
+}
+
+#[tokio::test]
+async fn no_login_page_without_a_password() {
+    let r = app().oneshot(Request::get("/login").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    let r = app().oneshot(Request::get("/").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn jobs_report_live_progress() {
+    let (a, _) = slow_app(400, 1);
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": "VisionQuest" }))).await.unwrap();
+    let id = serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string();
+    let running = wait_status(&a, &id, "running").await;
+    assert!(running["stage"].is_string(), "{running}");
+    let done = wait_status(&a, &id, "done").await;
+    assert_eq!(done["depth"], "quick");
+    assert!(done["running_ms"].as_u64().unwrap() >= 400, "{done}");
+    assert!(done["report_id"].as_str().unwrap().contains("visionquest"));
+    assert!(done["sources"].as_u64().unwrap() > 0 && done["tool_calls"].as_u64().unwrap() > 0);
+    let v = get_json(&a, "/api/jobs").await;
+    assert_eq!(v["jobs"][0]["id"], id.as_str());
+    assert!(get_json(&a, "/api/health").await["uptime_secs"].is_number());
+}
+
+// ------------------------------------------------------------ queue, pause, resume
+
+fn queue_app(delay_ms: u64, max_queue: usize) -> (axum::Router, std::sync::Arc<common::FakeLlm>) {
+    let mut cfg = Config::for_tests(common::tmp_dir("queue"));
+    cfg.max_concurrent = 1;
+    cfg.max_queue = max_queue;
+    let llm = std::sync::Arc::new(common::FakeLlm::new(true));
+    *llm.write_delay.lock().unwrap() = std::time::Duration::from_millis(delay_ms);
+    let engine = common::engine_custom(llm.clone(), common::fake_registry(), cfg);
+    (server::router(server::AppState::new(engine)), llm)
+}
+
+async fn submit(a: &axum::Router, q: &str) -> String {
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": q }))).await.unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    serde_json::from_str::<Value>(&body_string(r).await).unwrap()["id"].as_str().unwrap().to_string()
+}
+
+async fn act(a: &axum::Router, id: &str, what: &str) -> (StatusCode, Value) {
+    let r = a.clone().oneshot(post(&format!("/api/jobs/{id}/{what}"), json!({}))).await.unwrap();
+    let code = r.status();
+    (code, serde_json::from_str(&body_string(r).await).unwrap())
+}
+
+async fn wait_for(a: &axum::Router, id: &str, f: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..500 {
+        let v = get_json(a, &format!("/api/jobs/{id}")).await;
+        if f(&v) {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("job {id} never got there: {}", get_json(a, &format!("/api/jobs/{id}")).await);
+}
+
+#[tokio::test]
+async fn a_paused_job_lets_the_next_one_run_and_then_carries_on() {
+    let (a, llm) = queue_app(400, 25);
+    let first = submit(&a, "VisionQuest").await;
+    wait_for(&a, &first, |v| v["stage"] == "Writing the answer").await;
+    let second = submit(&a, "VisionQuest").await;
+    let v = get_json(&a, &format!("/api/jobs/{second}")).await;
+    assert_eq!((v["status"].as_str(), v["position"].as_u64()), (Some("queued"), Some(1)));
+    // a queued job can't be paused
+    assert_eq!(act(&a, &second, "pause").await.0, StatusCode::CONFLICT);
+
+    let (code, _) = act(&a, &first, "pause").await;
+    assert_eq!(code, StatusCode::OK);
+    let v = wait_status(&a, &first, "paused").await;
+    assert_eq!(v["pause"], "paused");
+    // its slot went to the second job, which finishes while the first is paused
+    wait_for(&a, &second, |v| v["status"] == "done").await;
+    assert_eq!(get_json(&a, &format!("/api/jobs/{first}")).await["status"], "paused");
+
+    act(&a, &first, "resume").await;
+    let v = wait_for(&a, &first, |v| v["status"] == "done").await;
+    assert!(v["paused_ms"].as_u64().unwrap() > 0);
+    assert!(v["running_ms"].as_u64().unwrap() >= 400);
+    // the interrupted answer was written again: 3 writes for 2 answers
+    assert_eq!(llm.log.lock().unwrap().iter().filter(|l| *l == "write").count(), 3);
+    // the restart is visible to clients
+    let events = body_string(
+        a.clone()
+            .oneshot(Request::get(format!("/api/jobs/{first}/events")).body(Body::empty()).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(events.contains("Paused") && events.contains("Resumed"), "{events}");
+    // a finished job can't be paused
+    assert_eq!(act(&a, &first, "pause").await.0, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_paused_job_can_be_cancelled() {
+    let (a, _) = queue_app(10_000, 25);
+    let id = submit(&a, "VisionQuest").await;
+    wait_for(&a, &id, |v| v["stage"] == "Writing the answer").await;
+    act(&a, &id, "pause").await;
+    wait_status(&a, &id, "paused").await;
+    let (code, _) = act(&a, &id, "cancel").await;
+    assert_eq!(code, StatusCode::OK);
+    wait_status(&a, &id, "cancelled").await;
+    // nothing is left holding the slot
+    let next = submit(&a, "VisionQuest").await;
+    wait_status(&a, &next, "running").await;
+    act(&a, &next, "cancel").await;
+}
+
+#[tokio::test]
+async fn a_full_queue_says_come_back_later() {
+    let (a, _) = queue_app(10_000, 1);
+    let running = submit(&a, "VisionQuest").await;
+    wait_status(&a, &running, "running").await;
+    let waiting = submit(&a, "VisionQuest").await;
+    let r = a.clone().oneshot(post("/api/jobs", json!({ "query": "VisionQuest" }))).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(r.headers().contains_key(header::RETRY_AFTER));
+    assert!(body_string(r).await.contains("queue is full"));
+    // cancelling the waiting one makes room
+    act(&a, &waiting, "cancel").await;
+    let again = submit(&a, "VisionQuest").await;
+    assert_eq!(get_json(&a, &format!("/api/jobs/{again}")).await["position"], 1);
+    act(&a, &again, "cancel").await;
+    act(&a, &running, "cancel").await;
+}
+
+#[tokio::test]
+async fn the_manifest_states_the_contract() {
+    let v = get_json(&app(), "/api/manifest").await;
+    let c = &v["contract"];
+    assert_eq!(c["max_queue"], 25);
+    assert!(c["job_timeout_secs"].as_u64().unwrap() > 0);
+    assert!(v["endpoints"]["pause_job"]["path"].as_str().unwrap().ends_with("/pause"));
+}
+
+#[tokio::test]
+async fn live_status_shows_the_queue_in_order() {
+    let (a, _) = queue_app(10_000, 25);
+    let first = submit(&a, "VisionQuest").await;
+    wait_status(&a, &first, "running").await;
+    let second = submit(&a, "VisionQuest").await;
+    let third = submit(&a, "VisionQuest").await;
+    let v = get_json(&a, "/api/status").await;
+    assert_eq!(v["queue"]["running"], 1);
+    assert_eq!(v["queue"]["queued"], 2);
+    let order: Vec<&str> = v["jobs"].as_array().unwrap().iter().map(|j| j["id"].as_str().unwrap()).collect();
+    assert_eq!(order, [first.as_str(), second.as_str(), third.as_str()]);
+    assert_eq!(v["jobs"][2]["position"], 2);
+    assert!(v["model"]["main"].is_string() && v["service"]["uptime_secs"].is_number());
+
+    // the stream pushes the same document
+    let r =
+        a.clone().oneshot(Request::get("/api/status/stream?interval=1").body(Body::empty()).unwrap()).await.unwrap();
+    assert!(r.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/event-stream"));
+    let mut body = r.into_body();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame()).await.unwrap().unwrap().unwrap();
+    let text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+    assert!(text.starts_with("event: status") && text.contains("\"queue\""), "{text}");
+    for id in [&first, &second, &third] {
+        act(&a, id, "cancel").await;
+    }
+}

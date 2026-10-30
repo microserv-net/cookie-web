@@ -50,6 +50,9 @@ pub struct Query {
     /// day | week | month | year
     pub time_range: Option<String>,
     pub kind: Kind,
+    /// Ask every backend and merge (instead of stopping at the first that answers): used when a first
+    /// search came back off-topic, so one engine misreading the query can't sink the request.
+    pub broad: bool,
 }
 
 #[async_trait]
@@ -655,7 +658,7 @@ impl SearchEngine {
         if self.backends.is_empty() {
             bail!("no search backends configured");
         }
-        let key = format!("{:?}|{:?}|{}|{}", q.kind, q.time_range, q.max, q.text.to_lowercase());
+        let key = format!("{:?}|{:?}|{}|{}|{}", q.kind, q.time_range, q.max, q.broad, q.text.to_lowercase());
         if let Some(h) = web.search_cache.get(&key) {
             return Ok(h);
         }
@@ -667,8 +670,8 @@ impl SearchEngine {
             }
             errors.clear();
             let (lists, had_answer) = match self.mode {
-                SearchMode::Fallback => self.fallback(web, q, pass == 1, &mut errors).await,
-                SearchMode::Fusion => self.fusion(web, q, pass == 1, &mut errors).await,
+                SearchMode::Fallback if !q.broad => self.fallback(web, q, pass == 1, &mut errors).await,
+                _ => self.fusion(web, q, pass == 1, &mut errors).await,
             };
             hits = fuse(lists, q.max);
             // Retry only when every backend *failed*; "no results" is an answer.
@@ -857,7 +860,8 @@ impl Tool for WebSearchTool {
             );
         }
         let max = args["max_results"].as_u64().map(|n| n.clamp(1, 10) as usize).unwrap_or(ctx.results_per_search);
-        let mut q = Query { text: text.clone(), max, time_range: time_range_arg(&args), kind: self.kind };
+        let broad = args["broad"].as_bool().unwrap_or(false);
+        let mut q = Query { text: text.clone(), max, time_range: time_range_arg(&args), kind: self.kind, broad };
         let mut hits = self.engine.search(&self.web, &q).await?;
         let mut header = format!("Results for \"{text}\":");
         // Exact phrases and odd punctuation often match nothing: retry once with plain keywords,
@@ -992,7 +996,7 @@ mod tests {
     }
 
     fn q(text: &str) -> Query {
-        Query { text: text.into(), max: 8, time_range: None, kind: Kind::Web }
+        Query { text: text.into(), max: 8, time_range: None, kind: Kind::Web, broad: false }
     }
 
     #[tokio::test]
@@ -1047,6 +1051,19 @@ mod tests {
         assert_eq!(e.search(&w, &q("x")).await.unwrap().len(), 3, "asked again, not served an empty cache entry");
         assert_eq!(e.search(&w, &q("x")).await.unwrap().len(), 3);
         assert_eq!(a_calls.load(Ordering::SeqCst), 2, "non-empty result was cached");
+    }
+
+    #[tokio::test]
+    async fn broad_queries_ask_every_backend() {
+        let (a, _) = scripted("a", vec![Some(5)]);
+        let (b, b_calls) = scripted("b", vec![Some(5)]);
+        let e = SearchEngine::new(vec![a, b], SearchMode::Fallback);
+        let w = web();
+        e.search(&w, &q("x")).await.unwrap();
+        assert_eq!(b_calls.load(Ordering::SeqCst), 0, "fallback stops at the first good answer");
+        let hits = e.search(&w, &Query { broad: true, ..q("x") }).await.unwrap();
+        assert_eq!(b_calls.load(Ordering::SeqCst), 1, "broad asks everyone");
+        assert!(hits.iter().any(|h| h.engine == "a") && hits.iter().any(|h| h.engine == "b"));
     }
 
     #[test]

@@ -97,6 +97,45 @@ pub fn extract_images(full_html: &str, content_html: Option<&str>, base: &str) -
     out
 }
 
+/// Page Markdown as the model should see it: images as `(image: alt)` notes; links reduced to their text
+/// (URLs and in-page anchors cost many tokens and the model cites by `[n]` anyway); footnote markers,
+/// "edit" links and other anchor-only links removed. With `keep_urls`, links keep their URL (for
+/// requests that want links, e.g. downloads).
+pub fn for_model(md: &str, keep_urls: bool) -> String {
+    static ANCHOR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        // [Y](#cite-note-1 "…"), \[[c](#fn-c)\], [edit](#…), [^1]
+        regex::Regex::new(r#"\\?\[?\[[^\]\n]{0,40}\]\(#[^)\s]*(?:\s+"[^"]*")?\)\\?\]?|\[\^\d+\]"#).unwrap()
+    });
+    static LINK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?:^|[^!])(\[([^\]\n]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\))"#).unwrap()
+    });
+    static EMPTY_PARENS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\(\s*\)|\\\[\s*\\\]").unwrap());
+    let md = without_images(md);
+    let md = ANCHOR.replace_all(&md, "");
+    let md = if keep_urls {
+        md.into_owned()
+    } else {
+        LINK.replace_all(&md, |c: &regex::Captures| {
+            let whole = &c[0];
+            let prefix = &whole[..whole.len() - c[1].len()];
+            let text = c[2].trim();
+            format!("{prefix}{text}")
+        })
+        .into_owned()
+    };
+    let md = EMPTY_PARENS.replace_all(&md, "");
+    // squeeze the spaces left behind, line by line (keep indentation)
+    md.lines()
+        .map(|l| {
+            let indent = l.len() - l.trim_start().len();
+            let body = l.trim_start().split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
+            format!("{}{body}", &l[..indent])
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Markdown for the model: images become a short `(image: alt)` note (or vanish) — their URLs
 /// cost context and a text model can't look at them anyway.
 pub fn without_images(md: &str) -> String {
@@ -426,6 +465,21 @@ mod tests {
         );
         assert_eq!(imgs[1].alt, "The real one");
         assert_eq!(without_images("a ![x y](https://i/1.png \"t\") b ![](https://i/2.png) c"), "a (image: x y) b  c");
+    }
+
+    #[test]
+    fn model_view_drops_link_noise() {
+        let md = "Hannah prayed.([Y](#cen-NIV-7228Y \"See cross-reference Y\")) She left.\\[[c](#fen-NIV-7235c \"See footnote c\")\\]\n\
+                  See [the WireGuard docs](https://www.wireguard.com/quickstart/ \"Quick\") and ![logo](https://x/l.png).\n\
+                  - [Download](https://example.com/file.zip)\n    code  stays  indented";
+        let m = for_model(md, false);
+        assert_eq!(
+            m,
+            "Hannah prayed. She left.\nSee the WireGuard docs and (image: logo).\n- Download\n    code stays indented"
+        );
+        let k = for_model(md, true);
+        assert!(k.contains("[Download](https://example.com/file.zip)"));
+        assert!(!k.contains("#cen-NIV"));
     }
 
     #[test]

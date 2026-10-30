@@ -23,6 +23,8 @@ pub struct Ollama {
     caps: Mutex<HashMap<String, Caps>>,
     /// Waits between retries of a failed call (its length is the retry count).
     backoff: Vec<Duration>,
+    /// Why the fast model is not used (not pulled, or evicted when both are loaded); `None` = in use.
+    fast_off: std::sync::Mutex<Option<String>>,
 }
 
 impl Ollama {
@@ -37,7 +39,7 @@ impl Ollama {
         }
         let http = b.build().expect("http client");
         let backoff = [1, 3, 6].map(Duration::from_secs).to_vec();
-        Self { http, cfg, caps: Mutex::new(HashMap::new()), backoff }
+        Self { http, cfg, caps: Mutex::new(HashMap::new()), backoff, fast_off: std::sync::Mutex::new(None) }
     }
 
     fn url(&self, path: &str) -> String {
@@ -49,9 +51,31 @@ impl Ollama {
             return m.clone();
         }
         match req.tier {
-            Tier::Main => self.cfg.model.clone(),
-            Tier::Fast => self.cfg.fast_model().to_string(),
+            Tier::Fast if self.fast_in_use() => self.cfg.fast_model().to_string(),
+            _ => self.cfg.model.clone(),
         }
+    }
+
+    fn fast_in_use(&self) -> bool {
+        self.cfg.has_fast_model() && self.fast_off.lock().unwrap().is_none()
+    }
+
+    /// Stop using the fast model (the main model takes over its jobs), saying why once.
+    fn disable_fast(&self, why: String) {
+        let mut off = self.fast_off.lock().unwrap();
+        if off.is_none() {
+            tracing::warn!("not using the fast model {}: {why}; the main model does its jobs", self.cfg.fast_model());
+            *off = Some(why);
+        }
+    }
+
+    fn is_fast(&self, model: &str) -> bool {
+        self.cfg.has_fast_model() && model == self.cfg.fast_model()
+    }
+
+    /// Context window for a model: the fast model's jobs are small, so it gets its own smaller one.
+    fn ctx_for(&self, model: &str) -> u32 {
+        if self.is_fast(model) { self.cfg.fast_num_ctx } else { self.cfg.num_ctx }
     }
 
     async fn caps(&self, model: &str) -> Caps {
@@ -81,7 +105,7 @@ impl Ollama {
         let caps = self.caps(&model).await;
         let mut options = json!({
             "temperature": req.temperature.unwrap_or(self.cfg.temperature),
-            "num_ctx": self.cfg.num_ctx,
+            "num_ctx": self.ctx_for(&model),
         });
         if let Some(n) = req.max_tokens {
             options["num_predict"] = json!(n);
@@ -145,10 +169,41 @@ fn status_failure(status: reqwest::StatusCode, err: &str, model: &str) -> Failur
     }
 }
 
+/// "qwen3:4b" and "qwen3:4b:latest"-style names refer to the same model.
+fn same_model(a: &str, b: &str) -> bool {
+    let norm = |m: &str| if m.contains(':') { m.to_string() } else { format!("{m}:latest") };
+    norm(a) == norm(b)
+}
+
 impl Ollama {
+    async fn load(&self, model: &str) -> anyhow::Result<()> {
+        let body = json!({
+            "model": model,
+            "messages": [],
+            "keep_alive": self.cfg.keep_alive_json(),
+            // same options as real requests, or Ollama would reload the model on the first one
+            "options": self.load_options(model),
+        });
+        let r = self.http.post(self.url("/api/chat")).json(&body).send().await?;
+        if !r.status().is_success() {
+            let v: Value = r.json().await.unwrap_or_default();
+            bail!("could not load {model}: {}", v["error"].as_str().unwrap_or("unknown error"));
+        }
+        Ok(())
+    }
+
+    /// Names of the models Ollama has in memory right now.
+    async fn loaded_models(&self) -> Vec<String> {
+        let Ok(r) = self.http.get(self.url("/api/ps")).timeout(Duration::from_secs(5)).send().await else {
+            return vec![];
+        };
+        let v: Value = r.json().await.unwrap_or_default();
+        v["models"].as_array().into_iter().flatten().filter_map(|m| m["name"].as_str().map(String::from)).collect()
+    }
+
     /// Options that decide how Ollama loads the model (they must match across requests).
-    fn load_options(&self) -> Value {
-        let mut o = json!({ "num_ctx": self.cfg.num_ctx });
+    fn load_options(&self, model: &str) -> Value {
+        let mut o = json!({ "num_ctx": self.ctx_for(model) });
         if let Some(t) = self.cfg.num_thread {
             o["num_thread"] = json!(t);
         }
@@ -271,11 +326,16 @@ impl ChatModel for Ollama {
     }
 
     async fn chat(&self, req: ChatRequest) -> anyhow::Result<Message> {
-        let (model, body) = self.body(&req, false).await;
+        let (mut model, mut body) = self.body(&req, false).await;
         let mut attempt = 0;
         loop {
             match self.chat_once(&model, &body).await {
                 Ok(m) => return Ok(m),
+                // The fast model isn't pulled: hand its jobs to the main model from now on.
+                Err(Failure::Fatal(e)) if self.is_fast(&model) && format!("{e}").contains("not available") => {
+                    self.disable_fast(format!("it is not pulled (run: ollama pull {})", self.cfg.fast_model()));
+                    (model, body) = self.body(&req, false).await;
+                }
                 Err(Failure::Fatal(e)) => return Err(e),
                 Err(Failure::Retry(e)) => {
                     let Some(wait) = self.backoff.get(attempt) else { return Err(e) };
@@ -310,24 +370,27 @@ impl ChatModel for Ollama {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        // An empty chat loads the model with *our* num_ctx, so the first real request doesn't reload it.
-        let mut models = vec![self.cfg.model.clone()];
-        if self.cfg.fast_model() != self.cfg.model {
-            models.push(self.cfg.fast_model().to_string());
+        // An empty chat loads a model with *our* options, so the first real request doesn't reload it.
+        self.load(&self.cfg.model.clone()).await?;
+        if !self.fast_in_use() {
+            return Ok(());
         }
-        for model in models {
-            let body = json!({
-                "model": model,
-                "messages": [],
-                "keep_alive": self.cfg.keep_alive_json(),
-                // same options as real requests, or Ollama would reload the model on the first one
-                "options": self.load_options(),
-            });
-            let r = self.http.post(self.url("/api/chat")).json(&body).send().await?;
-            if !r.status().is_success() {
-                let v: Value = r.json().await.unwrap_or_default();
-                bail!("could not load {model}: {}", v["error"].as_str().unwrap_or("unknown error"));
-            }
+        let fast = self.cfg.fast_model().to_string();
+        if let Err(e) = self.load(&fast).await {
+            self.disable_fast(format!("{e:#}"));
+            return Ok(());
+        }
+        // Ollama unloads a model to make room for another when it may keep only one
+        // (OLLAMA_MAX_LOADED_MODELS=1) or memory is short. Swapping on every call would be far slower
+        // than doing everything with the main model, so check that both stayed loaded.
+        let loaded = self.loaded_models().await;
+        if !loaded.is_empty() && !loaded.iter().any(|m| same_model(m, &self.cfg.model)) {
+            self.disable_fast(
+                "Ollama can't keep both models loaded (set OLLAMA_MAX_LOADED_MODELS=2 — scripts/install-ollama.sh \
+                 does — or add memory)"
+                    .into(),
+            );
+            self.load(&self.cfg.model.clone()).await?;
         }
         Ok(())
     }
@@ -372,6 +435,23 @@ impl ChatModel for Ollama {
             }
             Ok(r) => info.error = Some(format!("Ollama returned {}", r.status())),
             Err(e) => info.error = Some(format!("cannot reach Ollama at {}: {e}", self.cfg.ollama_host)),
+        }
+        if self.cfg.has_fast_model() {
+            let fast = self.cfg.fast_model().to_string();
+            info.fast_available = info.installed.iter().any(|m| same_model(m, &fast));
+            if info.reachable && !info.fast_available {
+                self.disable_fast(format!("it is not pulled (run: ollama pull {fast})"));
+            } else if info.fast_available {
+                // pulled since: use it again
+                let mut off = self.fast_off.lock().unwrap();
+                if off.as_deref().is_some_and(|w| w.starts_with("it is not pulled")) {
+                    tracing::info!("fast model {fast} is now available; using it for small jobs");
+                    *off = None;
+                }
+            }
+            info.fast_active = self.fast_in_use();
+            info.fast_note = self.fast_off.lock().unwrap().clone();
+            info.fast_model = Some(fast);
         }
         info
     }
